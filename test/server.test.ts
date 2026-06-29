@@ -9,6 +9,15 @@ function requireTool<T>(tool: T | undefined, name: string): T {
   return tool
 }
 
+async function waitFor(predicate: () => boolean) {
+  const deadline = Date.now() + 500
+  while (Date.now() < deadline) {
+    if (predicate()) return
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+  expect(predicate()).toBe(true)
+}
+
 let dir = ""
 
 beforeEach(async () => {
@@ -423,6 +432,172 @@ test("session status idle event auto-continues active goals", async () => {
 
   await requireTool(tools.create_goal, "create_goal").execute({ objective: "keep going" }, { sessionID: "ses_1" } as never)
   await hooks.event!({ event: { type: "session.status", properties: { sessionID: "ses_1", status: { type: "idle" } } } as never })
+
+  expect(calls).toHaveLength(1)
+})
+
+test("running task defers idle auto-continue", async () => {
+  const calls: unknown[] = []
+  const hooks = await plugin.server(
+    {
+      client: {
+        session: {
+          promptAsync: async (input: unknown) => {
+            calls.push(input)
+          },
+        },
+      },
+    } as never,
+    { auto_continue: true, max_auto_turns: 1, min_continue_interval_seconds: 0 },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "keep going" }, { sessionID: "ses_1" } as never)
+  await hooks["tool.execute.before"]?.(
+    { tool: "Task", sessionID: "ses_1", callID: "call_1" } as never,
+    { args: { subagent_type: "fixer", background: true } } as never,
+  )
+  await hooks["tool.execute.after"]?.(
+    { tool: "Task", sessionID: "ses_1", callID: "call_1", args: {} } as never,
+    { title: "Task", output: "task_id: task_1\nstate: running", metadata: {} } as never,
+  )
+  await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_1" } } as never })
+
+  expect(calls).toHaveLength(0)
+})
+
+test("terminal task waits for orchestrator assistant turn before goal continuation", async () => {
+  const calls: unknown[] = []
+  const hooks = await plugin.server(
+    {
+      client: {
+        session: {
+          promptAsync: async (input: unknown) => {
+            calls.push(input)
+          },
+        },
+      },
+    } as never,
+    { auto_continue: true, max_auto_turns: 1, min_continue_interval_seconds: 0 },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "keep going" }, { sessionID: "ses_1" } as never)
+  await hooks["tool.execute.after"]?.(
+    { tool: "Task", sessionID: "ses_1", callID: "call_1", args: {} } as never,
+    { title: "Task", output: "task_id: task_1\nstate: running", metadata: {} } as never,
+  )
+  await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "task_1" } } as never })
+  await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_1" } } as never })
+  expect(calls).toHaveLength(0)
+
+  await hooks.event!({
+    event: {
+      type: "message.updated",
+      properties: {
+        info: {
+          id: "msg_after_task",
+          role: "assistant",
+          sessionID: "ses_1",
+          time: { created: Date.now(), completed: Date.now() + 1 },
+        },
+      },
+    } as never,
+  })
+  await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_1" } } as never })
+
+  await waitFor(() => calls.length === 1)
+  expect(JSON.stringify(calls[0])).toContain("Continue working toward the active session goal")
+})
+
+test("synthetic terminal task message defers until orchestrator reconciles it", async () => {
+  const calls: unknown[] = []
+  const hooks = await plugin.server(
+    {
+      client: {
+        session: {
+          promptAsync: async (input: unknown) => {
+            calls.push(input)
+          },
+        },
+      },
+    } as never,
+    { auto_continue: true, max_auto_turns: 1, min_continue_interval_seconds: 0 },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "keep going" }, { sessionID: "ses_1" } as never)
+  await hooks["tool.execute.after"]?.(
+    { tool: "Task", sessionID: "ses_1", callID: "call_1", args: {} } as never,
+    { title: "Task", output: '<task id="task_1" state="running"></task>', metadata: {} } as never,
+  )
+  await hooks["experimental.chat.messages.transform"]!(
+    {},
+    {
+      messages: [
+        {
+          info: { id: "msg_task_done", role: "user", sessionID: "ses_1", agent: "orchestrator" },
+          parts: [{ type: "text", synthetic: true, text: "task_id: task_1\nstate: completed\n\n<task_result>\ndone\n</task_result>" }],
+        },
+      ],
+    } as never,
+  )
+  await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_1" } } as never })
+
+  expect(calls).toHaveLength(0)
+})
+
+test("live child session status blocks goal continuation when task launch was missed", async () => {
+  const calls: unknown[] = []
+  const hooks = await plugin.server(
+    {
+      client: {
+        session: {
+          children: async () => ({ data: [{ id: "task_1" }] }),
+          status: async () => ({ data: { task_1: { type: "busy" } } }),
+          promptAsync: async (input: unknown) => {
+            calls.push(input)
+          },
+        },
+      },
+    } as never,
+    { auto_continue: true, max_auto_turns: 1, min_continue_interval_seconds: 0 },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "keep going" }, { sessionID: "ses_1" } as never)
+  await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_1" } } as never })
+
+  expect(calls).toHaveLength(0)
+})
+
+test("task deferral can be disabled with config", async () => {
+  const calls: unknown[] = []
+  const hooks = await plugin.server(
+    {
+      client: {
+        session: {
+          promptAsync: async (input: unknown) => {
+            calls.push(input)
+          },
+        },
+      },
+    } as never,
+    { auto_continue: true, defer_while_tasks_active: false, max_auto_turns: 1, min_continue_interval_seconds: 0 },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "keep going" }, { sessionID: "ses_1" } as never)
+  await hooks["tool.execute.after"]?.(
+    { tool: "Task", sessionID: "ses_1", callID: "call_1", args: {} } as never,
+    { title: "Task", output: "task_id: task_1\nstate: running", metadata: {} } as never,
+  )
+  await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_1" } } as never })
 
   expect(calls).toHaveLength(1)
 })

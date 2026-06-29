@@ -701,6 +701,8 @@ var DEFAULT_CONTINUE_INTERVAL_SECONDS = 3;
 var DEFAULT_MAX_PROMPT_FAILURES = 3;
 var DEFAULT_COMMAND_NAME = "goal";
 var GOAL_SYSTEM_MARKER = "OpenCode goal mode";
+var TASK_SETTLE_DELAY_MS = 25;
+var TASK_TERMINAL_STATES = new Set(["completed", "error", "cancelled"]);
 var activeContinuations = new Set;
 function goalCommandTemplate(commandName) {
   return `OpenCode goal mode command "/${commandName}" was invoked.
@@ -757,6 +759,16 @@ function textFromMessage(message) {
   return (message.parts ?? []).map(textFromPart).filter(Boolean).join(`
 `).trim();
 }
+function isRecord(value) {
+  return typeof value === "object" && value !== null;
+}
+function sessionIDFromMessage(message) {
+  if (typeof message.sessionID === "string")
+    return message.sessionID;
+  if (isRecord(message.info) && typeof message.info.sessionID === "string")
+    return message.info.sessionID;
+  return;
+}
 function estimateMessages(messages) {
   return messages.reduce((sum, message) => sum + estimateTokensFromText(textFromMessage(message)), 0);
 }
@@ -810,6 +822,52 @@ function tokensFromMessages(messages) {
   const exactTotal = messages.reduce((sum, message) => sum + (exactTokensFromMessage(message) ?? 0), 0);
   return exactTotal > 0 ? exactTotal : estimateMessages(messages);
 }
+function taskHeader(output) {
+  const resultIndex = output.search(/<task_(?:result|error)>/);
+  return resultIndex === -1 ? output : output.slice(0, resultIndex);
+}
+function parseTaskID(output) {
+  const xmlMatch = /<task\s+[^>]*\bid=["']([^"']+)["'][^>]*>/i.exec(output);
+  if (xmlMatch?.[1])
+    return xmlMatch[1];
+  for (const line of output.split(/\r?\n/)) {
+    const match = /^task_id:\s*([^\s()]+)(?:\s*\(.*)?$/i.exec(line.trim());
+    if (match?.[1])
+      return match[1];
+  }
+  return;
+}
+function parseTaskState(output) {
+  const xmlMatch = /<task\s+[^>]*\bstate=["'](running|completed|error|cancelled)["'][^>]*>/i.exec(output);
+  if (xmlMatch?.[1])
+    return xmlMatch[1].toLowerCase();
+  for (const line of taskHeader(output).split(/\r?\n/)) {
+    const match = /^state:\s*(running|completed|error|cancelled)\s*$/i.exec(line.trim());
+    if (match?.[1])
+      return match[1].toLowerCase();
+  }
+  return;
+}
+function parseTaskStatus(output) {
+  if (typeof output !== "string")
+    return;
+  const taskID = parseTaskID(output);
+  const state = parseTaskState(output);
+  return taskID && state ? { taskID, state } : undefined;
+}
+function messageCompletedAt(message) {
+  const time = isRecord(message.time) ? message.time : isRecord(message.info) && isRecord(message.info.time) ? message.info.time : undefined;
+  const completed = time?.completed;
+  return typeof completed === "number" && Number.isFinite(completed) ? completed : null;
+}
+function assistantMarker(message) {
+  if (messageRole(message) !== "assistant")
+    return;
+  return {
+    id: messageID(message) ?? null,
+    completedAt: messageCompletedAt(message)
+  };
+}
 async function sendContinuation(client, sessionID, prompt) {
   await client.session.promptAsync({
     path: { id: sessionID },
@@ -861,6 +919,169 @@ async function fetchLatestAssistant(client, sessionID) {
   const data = Array.isArray(result.data) ? result.data : [];
   return latestAssistantMessage(data);
 }
+
+class TaskTracker {
+  tasks = new Map;
+  pendingTaskCalls = new Map;
+  latestAssistantBySession = new Map;
+  noteTaskCall(input) {
+    if (typeof input.tool !== "string" || input.tool.toLowerCase() !== "task")
+      return;
+    if (typeof input.sessionID !== "string")
+      return;
+    if (typeof input.callID === "string")
+      this.pendingTaskCalls.set(input.callID, input.sessionID);
+  }
+  noteTaskOutput(input, output) {
+    if (typeof input.tool !== "string" || input.tool.toLowerCase() !== "task")
+      return;
+    const parentSessionID = typeof input.callID === "string" ? this.pendingTaskCalls.get(input.callID) ?? input.sessionID : input.sessionID;
+    if (typeof input.callID === "string")
+      this.pendingTaskCalls.delete(input.callID);
+    if (typeof parentSessionID !== "string")
+      return;
+    const status = parseTaskStatus(output.output);
+    if (!status)
+      return;
+    if (status.state === "running") {
+      this.markRunning(parentSessionID, status.taskID);
+      return;
+    }
+    this.markTerminal(status.taskID, status.state);
+  }
+  observeSessionCreated(event) {
+    const info = event.properties?.info;
+    if (!isRecord(info) || typeof info.id !== "string" || typeof info.parentID !== "string")
+      return;
+    this.markRunning(info.parentID, info.id);
+  }
+  observeSessionStatus(sessionID, status) {
+    const task = this.tasks.get(sessionID);
+    if (!task)
+      return;
+    if (status === "busy") {
+      this.markRunning(task.parentSessionID, sessionID);
+      return;
+    }
+    if (status === "idle")
+      this.markTerminal(sessionID, "completed");
+  }
+  observeSessionDeleted(sessionID) {
+    this.tasks.delete(sessionID);
+    for (const task of this.tasks.values()) {
+      if (task.parentSessionID === sessionID)
+        this.tasks.delete(task.taskID);
+    }
+    this.latestAssistantBySession.delete(sessionID);
+  }
+  observeMessages(messages) {
+    for (const message of messages) {
+      const sessionID = sessionIDFromMessage(message);
+      if (!sessionID)
+        continue;
+      const marker = assistantMarker(message);
+      if (marker) {
+        this.observeAssistant(sessionID, marker);
+        continue;
+      }
+      for (const part of message.parts ?? []) {
+        const status = parseTaskStatus(textFromPart(part));
+        if (!status)
+          continue;
+        if (status.state === "running")
+          this.markRunning(sessionID, status.taskID);
+        else
+          this.markTerminal(status.taskID, status.state);
+      }
+    }
+  }
+  observeAssistantMessage(sessionID, message) {
+    const marker = message ? assistantMarker(message) : undefined;
+    if (marker)
+      this.observeAssistant(sessionID, marker);
+  }
+  hasBlockingTasks(parentSessionID) {
+    for (const task of this.tasks.values()) {
+      if (task.parentSessionID !== parentSessionID)
+        continue;
+      if (task.state === "running" || task.terminalUnreconciled)
+        return true;
+    }
+    return false;
+  }
+  async refreshLiveChildren(client, parentSessionID) {
+    const session = client.session;
+    if (!session.children || !session.status)
+      return;
+    let childIDs;
+    try {
+      const result = await session.children({ path: { id: parentSessionID } });
+      const data = Array.isArray(result) ? result : Array.isArray(result.data) ? result.data : [];
+      childIDs = data.flatMap((child) => isRecord(child) && typeof child.id === "string" ? [child.id] : []);
+    } catch {
+      return;
+    }
+    if (childIDs.length === 0)
+      return;
+    let statuses;
+    try {
+      const result = await session.status();
+      statuses = isRecord(result) && isRecord(result.data) ? result.data : isRecord(result) ? result : {};
+    } catch {
+      return;
+    }
+    for (const childID of childIDs) {
+      const status = statuses[childID];
+      const statusType = isRecord(status) && typeof status.type === "string" ? status.type : undefined;
+      if (statusType === "busy")
+        this.markRunning(parentSessionID, childID);
+      else if (statusType === "idle" && this.tasks.has(childID))
+        this.markTerminal(childID, "completed");
+    }
+  }
+  markRunning(parentSessionID, taskID) {
+    const existing = this.tasks.get(taskID);
+    this.tasks.set(taskID, {
+      taskID,
+      parentSessionID,
+      state: "running",
+      terminalUnreconciled: false,
+      terminalAt: null,
+      lastAssistantMessageIDAtTerminal: existing?.lastAssistantMessageIDAtTerminal ?? null
+    });
+  }
+  markTerminal(taskID, state) {
+    if (!TASK_TERMINAL_STATES.has(state))
+      return;
+    const existing = this.tasks.get(taskID);
+    if (!existing)
+      return;
+    this.tasks.set(taskID, {
+      ...existing,
+      state,
+      terminalUnreconciled: true,
+      terminalAt: Date.now(),
+      lastAssistantMessageIDAtTerminal: this.latestAssistantBySession.get(existing.parentSessionID)?.id ?? null
+    });
+  }
+  observeAssistant(sessionID, marker) {
+    this.latestAssistantBySession.set(sessionID, marker);
+    for (const task of this.tasks.values()) {
+      if (task.parentSessionID !== sessionID || !task.terminalUnreconciled)
+        continue;
+      if (this.assistantReconcilesTask(task, marker)) {
+        this.tasks.set(task.taskID, { ...task, terminalUnreconciled: false });
+      }
+    }
+  }
+  assistantReconcilesTask(task, marker) {
+    if (marker.id && task.lastAssistantMessageIDAtTerminal && marker.id !== task.lastAssistantMessageIDAtTerminal)
+      return true;
+    if (marker.completedAt != null && task.terminalAt != null && marker.completedAt >= task.terminalAt)
+      return true;
+    return false;
+  }
+}
 async function recordAssistantMessage(sessionID, message, options) {
   if (!message)
     return;
@@ -887,12 +1108,75 @@ ${reminder}`;
 }
 var server = async ({ client }, options) => {
   const autoContinue = options?.auto_continue ?? true;
+  const deferWhileTasksActive = options?.defer_while_tasks_active ?? true;
   const maxAutoTurns = positiveIntegerOrNull2(options?.max_auto_turns) ?? DEFAULT_MAX_AUTO_TURNS;
   const minInterval = positiveIntegerOrNull2(options?.min_continue_interval_seconds) ?? DEFAULT_CONTINUE_INTERVAL_SECONDS;
   const maxPromptFailures = positiveIntegerOrNull2(options?.max_prompt_failures) ?? DEFAULT_MAX_PROMPT_FAILURES;
   const registerCommand = options?.register_command ?? true;
   const commandName = commandNameFromOptions(options);
+  const taskTracker = new TaskTracker;
+  const taskDeferredSessions = new Set;
+  const scheduledContinuations = new Map;
+  async function tasksBlockContinuation(sessionID) {
+    if (!deferWhileTasksActive)
+      return false;
+    await taskTracker.refreshLiveChildren(client, sessionID);
+    return taskTracker.hasBlockingTasks(sessionID);
+  }
+  function scheduleSettledContinuation(sessionID) {
+    if (scheduledContinuations.has(sessionID))
+      return;
+    const timer = setTimeout(() => {
+      scheduledContinuations.delete(sessionID);
+      runAutoContinue(sessionID, true);
+    }, TASK_SETTLE_DELAY_MS);
+    const maybeUnref = timer;
+    if (typeof maybeUnref.unref === "function")
+      maybeUnref.unref();
+    scheduledContinuations.set(sessionID, timer);
+  }
+  async function runAutoContinue(sessionID, fromTaskDeferral = false) {
+    if (activeContinuations.has(sessionID))
+      return;
+    activeContinuations.add(sessionID);
+    try {
+      const latestAssistant = await fetchLatestAssistant(client, sessionID);
+      taskTracker.observeAssistantMessage(sessionID, latestAssistant);
+      await recordAssistantMessage(sessionID, latestAssistant, options ?? {});
+      if (await tasksBlockContinuation(sessionID)) {
+        taskDeferredSessions.add(sessionID);
+        return;
+      }
+      if (!fromTaskDeferral && taskDeferredSessions.has(sessionID)) {
+        scheduleSettledContinuation(sessionID);
+        return;
+      }
+      taskDeferredSessions.delete(sessionID);
+      const goal = await reserveContinuation(sessionID, maxAutoTurns, minInterval);
+      if (!goal)
+        return;
+      await sendContinuation(client, sessionID, goal.status === "active" ? continuationPrompt(goal) : limitPrompt(goal));
+      await recordContinuationResult(sessionID, "success", maxPromptFailures);
+    } catch (error) {
+      await recordContinuationResult(sessionID, "failure", maxPromptFailures);
+      await client.app?.log?.({
+        body: {
+          service: "opencode-goal-plugin",
+          level: "error",
+          message: "Auto-continue failed",
+          extra: { error: error instanceof Error ? error.message : String(error) }
+        }
+      });
+    } finally {
+      activeContinuations.delete(sessionID);
+    }
+  }
   return {
+    async dispose() {
+      for (const timer of scheduledContinuations.values())
+        clearTimeout(timer);
+      scheduledContinuations.clear();
+    },
     async config(config) {
       if (!registerCommand)
         return;
@@ -1005,7 +1289,14 @@ var server = async ({ client }, options) => {
         }
       }
     },
+    async "tool.execute.before"(input) {
+      taskTracker.noteTaskCall(input);
+    },
+    async "tool.execute.after"(input, output) {
+      taskTracker.noteTaskOutput(input, output);
+    },
     async "experimental.chat.messages.transform"(input, output) {
+      taskTracker.observeMessages(output.messages);
       const sessionID = "sessionID" in input && typeof input.sessionID === "string" ? input.sessionID : output.messages.find((message) => typeof message.info.sessionID === "string")?.info.sessionID;
       if (!sessionID)
         return;
@@ -1030,38 +1321,30 @@ var server = async ({ client }, options) => {
     },
     async event({ event }) {
       const sessionID = sessionIDFromEvent(event);
+      const eventType = event.type;
+      if (eventType === "session.created") {
+        taskTracker.observeSessionCreated(event);
+      }
+      if (sessionID && eventType === "session.status") {
+        const status = event.properties?.status;
+        if (isRecord(status) && typeof status.type === "string")
+          taskTracker.observeSessionStatus(sessionID, status.type);
+      }
+      if (sessionID && eventType === "session.idle")
+        taskTracker.observeSessionStatus(sessionID, "idle");
+      if (sessionID && eventType === "session.deleted")
+        taskTracker.observeSessionDeleted(sessionID);
       if (sessionID && event.type === "message.updated") {
         const props = event.properties ?? {};
         const message = [props.info, props.message].find((value) => value && typeof value === "object");
+        taskTracker.observeAssistantMessage(sessionID, message);
         await recordAssistantMessage(sessionID, message, options ?? {});
       }
       if (!autoContinue || !isIdleEvent(event))
         return;
       if (!sessionID)
         return;
-      if (activeContinuations.has(sessionID))
-        return;
-      activeContinuations.add(sessionID);
-      try {
-        await recordAssistantMessage(sessionID, await fetchLatestAssistant(client, sessionID), options ?? {});
-        const goal = await reserveContinuation(sessionID, maxAutoTurns, minInterval);
-        if (!goal)
-          return;
-        await sendContinuation(client, sessionID, goal.status === "active" ? continuationPrompt(goal) : limitPrompt(goal));
-        await recordContinuationResult(sessionID, "success", maxPromptFailures);
-      } catch (error) {
-        await recordContinuationResult(sessionID, "failure", maxPromptFailures);
-        await client.app?.log?.({
-          body: {
-            service: "opencode-goal-plugin",
-            level: "error",
-            message: "Auto-continue failed",
-            extra: { error: error instanceof Error ? error.message : String(error) }
-          }
-        });
-      } finally {
-        activeContinuations.delete(sessionID);
-      }
+      await runAutoContinue(sessionID);
     }
   };
 };
