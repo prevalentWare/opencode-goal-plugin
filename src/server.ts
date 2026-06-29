@@ -438,7 +438,7 @@ class TaskTracker {
       children?: (input: { path: { id: string } }) => Promise<{ data?: unknown } | unknown[]>
       status?: () => Promise<{ data?: unknown } | Record<string, unknown>>
     }
-    if (!session.children || !session.status) return
+    if (!session.children) return
     let childIDs: string[]
     try {
       const result = await session.children({ path: { id: parentSessionID } })
@@ -447,7 +447,8 @@ class TaskTracker {
     } catch {
       return
     }
-    if (childIDs.length === 0) return
+    this.markAbsentRunningChildren(parentSessionID, new Set(childIDs))
+    if (childIDs.length === 0 || !session.status) return
     let statuses: Record<string, unknown>
     try {
       const result = await session.status()
@@ -540,6 +541,15 @@ class TaskTracker {
       if (hold.expiresAt > now) continue
       this.snapshotIdleHolds.delete(key)
       this.settledSnapshotIdleTasks.add(key)
+      const task = this.tasks.get(hold.taskID)
+      if (task?.parentSessionID === hold.parentSessionID && task.state === "running") this.tasks.delete(hold.taskID)
+    }
+  }
+
+  private markAbsentRunningChildren(parentSessionID: string, liveChildIDs: Set<string>) {
+    for (const task of this.tasks.values()) {
+      if (task.parentSessionID !== parentSessionID || task.state !== "running" || liveChildIDs.has(task.taskID)) continue
+      this.markSnapshotIdle(parentSessionID, task.taskID)
     }
   }
 

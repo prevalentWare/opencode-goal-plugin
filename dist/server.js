@@ -1144,7 +1144,7 @@ class TaskTracker {
   }
   async refreshLiveChildren(client, parentSessionID) {
     const session = client.session;
-    if (!session.children || !session.status)
+    if (!session.children)
       return;
     let childIDs;
     try {
@@ -1154,7 +1154,8 @@ class TaskTracker {
     } catch {
       return;
     }
-    if (childIDs.length === 0)
+    this.markAbsentRunningChildren(parentSessionID, new Set(childIDs));
+    if (childIDs.length === 0 || !session.status)
       return;
     let statuses;
     try {
@@ -1240,6 +1241,16 @@ class TaskTracker {
         continue;
       this.snapshotIdleHolds.delete(key);
       this.settledSnapshotIdleTasks.add(key);
+      const task = this.tasks.get(hold.taskID);
+      if (task?.parentSessionID === hold.parentSessionID && task.state === "running")
+        this.tasks.delete(hold.taskID);
+    }
+  }
+  markAbsentRunningChildren(parentSessionID, liveChildIDs) {
+    for (const task of this.tasks.values()) {
+      if (task.parentSessionID !== parentSessionID || task.state !== "running" || liveChildIDs.has(task.taskID))
+        continue;
+      this.markSnapshotIdle(parentSessionID, task.taskID);
     }
   }
   snapshotIdleKey(parentSessionID, taskID) {

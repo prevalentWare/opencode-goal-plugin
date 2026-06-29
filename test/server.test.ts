@@ -839,6 +839,38 @@ test("idle live child bounded retry does not inject while parent session is busy
   expect(JSON.stringify(calls[0])).toContain("Continue working toward the active session goal")
 })
 
+test("tracked running child absent from live children stops blocking after grace period", async () => {
+  const calls: unknown[] = []
+  let children = [{ id: "task_1" }]
+  const hooks = await plugin.server(
+    {
+      client: {
+        session: {
+          children: async () => ({ data: children }),
+          status: async () => ({ data: { task_1: { type: "busy" } } }),
+          promptAsync: async (input: unknown) => {
+            calls.push(input)
+          },
+        },
+      },
+    } as never,
+    { auto_continue: true, max_auto_turns: 1, min_continue_interval_seconds: 0 },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "keep going" }, { sessionID: "ses_1" } as never)
+  await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_1" } } as never })
+  expect(calls).toHaveLength(0)
+
+  children = []
+  await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_1" } } as never })
+
+  expect(calls).toHaveLength(0)
+  await waitForContinuation(calls)
+  expect(JSON.stringify(calls[0])).toContain("Continue working toward the active session goal")
+})
+
 test("task deferral can be disabled with config", async () => {
   const calls: unknown[] = []
   const hooks = await plugin.server(
