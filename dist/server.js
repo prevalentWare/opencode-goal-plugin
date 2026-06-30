@@ -1375,6 +1375,8 @@ var server = async ({ client }, options) => {
           await pauseGoalForPlanMode(sessionID);
         return;
       }
+      if (busySessions.has(sessionID))
+        return;
       if (!fromTaskDeferral && taskDeferredSessions.has(sessionID)) {
         scheduleSettledContinuation(sessionID);
         return;
