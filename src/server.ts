@@ -56,6 +56,7 @@ const DEFAULT_MAX_PROMPT_FAILURES = 3
 const DEFAULT_COMMAND_NAME = "goal"
 const GOAL_SYSTEM_MARKER = "OpenCode goal mode"
 const TASK_SETTLE_DELAY_MS = 25
+const SNAPSHOT_IDLE_HOLD_MS = 250
 const TASK_TERMINAL_STATES = new Set<TaskState>(["completed", "error", "cancelled"])
 const activeContinuations = new Set<string>()
 
@@ -78,6 +79,12 @@ type TaskRecord = {
   terminalUnreconciled: boolean
   terminalAt: number | null
   lastAssistantMessageIDAtTerminal: string | null
+}
+
+type SnapshotIdleHold = {
+  taskID: string
+  parentSessionID: string
+  expiresAt: number
 }
 
 function goalCommandTemplate(commandName: string) {
@@ -301,6 +308,8 @@ class TaskTracker {
   private readonly tasks = new Map<string, TaskRecord>()
   private readonly pendingTaskCalls = new Map<string, string>()
   private readonly latestAssistantBySession = new Map<string, AssistantMarker>()
+  private readonly snapshotIdleHolds = new Map<string, SnapshotIdleHold>()
+  private readonly settledSnapshotIdleTasks = new Set<string>()
 
   noteTaskCall(input: { tool?: unknown; sessionID?: unknown; callID?: unknown }) {
     if (typeof input.tool !== "string" || input.tool.toLowerCase() !== "task") return
@@ -320,7 +329,7 @@ class TaskTracker {
       this.markRunning(parentSessionID, status.taskID)
       return
     }
-    this.markTerminal(status.taskID, status.state)
+    this.markTerminal(status.taskID, status.state, parentSessionID, { resetReconciled: true })
   }
 
   observeSessionCreated(event: { properties?: Record<string, unknown> }) {
@@ -336,7 +345,7 @@ class TaskTracker {
       this.markRunning(task.parentSessionID, sessionID)
       return
     }
-    if (status === "idle") this.markTerminal(sessionID, "completed")
+    if (status === "idle") this.markTerminal(sessionID, "completed", task.parentSessionID)
   }
 
   observeSessionDeleted(sessionID: string) {
@@ -345,6 +354,7 @@ class TaskTracker {
       if (task.parentSessionID === sessionID) this.tasks.delete(task.taskID)
     }
     this.latestAssistantBySession.delete(sessionID)
+    this.clearSnapshotIdleForSession(sessionID)
   }
 
   observeMessages(messages: { info?: unknown; role?: unknown; id?: unknown; time?: unknown; parts?: unknown[] }[]) {
@@ -360,7 +370,7 @@ class TaskTracker {
         const status = parseTaskStatus(textFromPart(part))
         if (!status) continue
         if (status.state === "running") this.markRunning(sessionID, status.taskID)
-        else this.markTerminal(status.taskID, status.state)
+        else this.markTerminal(status.taskID, status.state, sessionID, { resetReconciled: true })
       }
     }
   }
@@ -374,11 +384,25 @@ class TaskTracker {
   }
 
   hasBlockingTasks(parentSessionID: string) {
+    this.pruneExpiredSnapshotIdleHolds()
     for (const task of this.tasks.values()) {
       if (task.parentSessionID !== parentSessionID) continue
       if (task.state === "running" || task.terminalUnreconciled) return true
     }
+    for (const hold of this.snapshotIdleHolds.values()) {
+      if (hold.parentSessionID === parentSessionID) return true
+    }
     return false
+  }
+
+  nextSnapshotIdleRetryAt(parentSessionID: string) {
+    this.pruneExpiredSnapshotIdleHolds()
+    let next: number | null = null
+    for (const hold of this.snapshotIdleHolds.values()) {
+      if (hold.parentSessionID !== parentSessionID) continue
+      next = next == null ? hold.expiresAt : Math.min(next, hold.expiresAt)
+    }
+    return next
   }
 
   async refreshLiveChildren(client: Parameters<Plugin>[0]["client"], parentSessionID: string) {
@@ -407,12 +431,16 @@ class TaskTracker {
       const status = statuses[childID]
       const statusType = isRecord(status) && typeof status.type === "string" ? status.type : undefined
       if (statusType === "busy") this.markRunning(parentSessionID, childID)
-      else if (statusType === "idle" && this.tasks.has(childID)) this.markTerminal(childID, "completed")
+      else if (statusType === "idle") {
+        if (this.tasks.has(childID)) this.markTerminal(childID, "completed", parentSessionID)
+        else this.markSnapshotIdle(parentSessionID, childID)
+      }
     }
   }
 
   private markRunning(parentSessionID: string, taskID: string) {
     const existing = this.tasks.get(taskID)
+    this.clearSnapshotIdle(parentSessionID, taskID)
     this.tasks.set(taskID, {
       taskID,
       parentSessionID,
@@ -423,17 +451,72 @@ class TaskTracker {
     })
   }
 
-  private markTerminal(taskID: string, state: TaskState) {
+  private markTerminal(
+    taskID: string,
+    state: TaskState,
+    parentSessionID?: string,
+    options: { resetReconciled?: boolean } = {},
+  ) {
     if (!TASK_TERMINAL_STATES.has(state)) return
     const existing = this.tasks.get(taskID)
-    if (!existing) return
+    const resolvedParentSessionID = existing?.parentSessionID ?? parentSessionID
+    if (!resolvedParentSessionID) return
+    this.clearSnapshotIdle(resolvedParentSessionID, taskID)
+    if (
+      existing &&
+      TASK_TERMINAL_STATES.has(existing.state) &&
+      !existing.terminalUnreconciled &&
+      !options.resetReconciled
+    ) {
+      return
+    }
     this.tasks.set(taskID, {
-      ...existing,
+      taskID,
+      parentSessionID: resolvedParentSessionID,
       state,
       terminalUnreconciled: true,
       terminalAt: Date.now(),
-      lastAssistantMessageIDAtTerminal: this.latestAssistantBySession.get(existing.parentSessionID)?.id ?? null,
+      lastAssistantMessageIDAtTerminal: this.latestAssistantBySession.get(resolvedParentSessionID)?.id ?? null,
     })
+  }
+
+  private markSnapshotIdle(parentSessionID: string, taskID: string) {
+    const key = this.snapshotIdleKey(parentSessionID, taskID)
+    if (this.settledSnapshotIdleTasks.has(key) || this.snapshotIdleHolds.has(key)) return
+    this.snapshotIdleHolds.set(key, {
+      taskID,
+      parentSessionID,
+      expiresAt: Date.now() + SNAPSHOT_IDLE_HOLD_MS,
+    })
+  }
+
+  private clearSnapshotIdle(parentSessionID: string, taskID: string) {
+    const key = this.snapshotIdleKey(parentSessionID, taskID)
+    this.snapshotIdleHolds.delete(key)
+    this.settledSnapshotIdleTasks.delete(key)
+  }
+
+  private clearSnapshotIdleForSession(sessionID: string) {
+    for (const [key, hold] of this.snapshotIdleHolds) {
+      if (hold.taskID === sessionID || hold.parentSessionID === sessionID) this.snapshotIdleHolds.delete(key)
+    }
+    for (const key of this.settledSnapshotIdleTasks) {
+      if (key.startsWith(`${sessionID}\0`) || key.endsWith(`\0${sessionID}`)) {
+        this.settledSnapshotIdleTasks.delete(key)
+      }
+    }
+  }
+
+  private pruneExpiredSnapshotIdleHolds(now = Date.now()) {
+    for (const [key, hold] of this.snapshotIdleHolds) {
+      if (hold.expiresAt > now) continue
+      this.snapshotIdleHolds.delete(key)
+      this.settledSnapshotIdleTasks.add(key)
+    }
+  }
+
+  private snapshotIdleKey(parentSessionID: string, taskID: string) {
+    return `${parentSessionID}\0${taskID}`
   }
 
   private observeAssistant(sessionID: string, marker: AssistantMarker) {
@@ -489,35 +572,43 @@ const server: Plugin = async ({ client }, options?: Options) => {
   const taskTracker = new TaskTracker()
   const taskDeferredSessions = new Set<string>()
   const scheduledContinuations = new Map<string, ReturnType<typeof setTimeout>>()
+  const busySessions = new Set<string>()
 
-  async function tasksBlockContinuation(sessionID: string) {
+  async function taskBlockStatus(sessionID: string) {
     if (!deferWhileTasksActive) return false
     await taskTracker.refreshLiveChildren(client, sessionID)
-    return taskTracker.hasBlockingTasks(sessionID)
+    return {
+      blocked: taskTracker.hasBlockingTasks(sessionID),
+      retryAt: taskTracker.nextSnapshotIdleRetryAt(sessionID),
+    }
   }
 
-  function scheduleSettledContinuation(sessionID: string) {
+  function scheduleSettledContinuation(sessionID: string, delayMs = TASK_SETTLE_DELAY_MS) {
     if (scheduledContinuations.has(sessionID)) return
     const timer = setTimeout(() => {
       scheduledContinuations.delete(sessionID)
       void runAutoContinue(sessionID, true)
-    }, TASK_SETTLE_DELAY_MS)
+    }, Math.max(0, delayMs))
     const maybeUnref = timer as { unref?: () => void }
     if (typeof maybeUnref.unref === "function") maybeUnref.unref()
     scheduledContinuations.set(sessionID, timer)
   }
 
   async function runAutoContinue(sessionID: string, fromTaskDeferral = false) {
+    if (busySessions.has(sessionID)) return
     if (activeContinuations.has(sessionID)) return
     activeContinuations.add(sessionID)
     try {
       const latestAssistant = await fetchLatestAssistant(client, sessionID)
       taskTracker.observeAssistantMessage(sessionID, latestAssistant)
-      await recordAssistantMessage(sessionID, latestAssistant, options ?? {})
-      if (await tasksBlockContinuation(sessionID)) {
+      const taskStatus = await taskBlockStatus(sessionID)
+      if (taskStatus && taskStatus.blocked) {
         taskDeferredSessions.add(sessionID)
+        if (taskStatus.retryAt != null) scheduleSettledContinuation(sessionID, taskStatus.retryAt - Date.now())
         return
       }
+      if (busySessions.has(sessionID)) return
+      await recordAssistantMessage(sessionID, latestAssistant, options ?? {})
       if (!fromTaskDeferral && taskDeferredSessions.has(sessionID)) {
         scheduleSettledContinuation(sessionID)
         return
@@ -712,10 +803,20 @@ const server: Plugin = async ({ client }, options?: Options) => {
       }
       if (sessionID && eventType === "session.status") {
         const status = (event as { properties?: Record<string, unknown> }).properties?.status
-        if (isRecord(status) && typeof status.type === "string") taskTracker.observeSessionStatus(sessionID, status.type)
+        if (isRecord(status) && typeof status.type === "string") {
+          if (status.type === "busy") busySessions.add(sessionID)
+          if (status.type === "idle") busySessions.delete(sessionID)
+          taskTracker.observeSessionStatus(sessionID, status.type)
+        }
       }
-      if (sessionID && eventType === "session.idle") taskTracker.observeSessionStatus(sessionID, "idle")
-      if (sessionID && eventType === "session.deleted") taskTracker.observeSessionDeleted(sessionID)
+      if (sessionID && eventType === "session.idle") {
+        busySessions.delete(sessionID)
+        taskTracker.observeSessionStatus(sessionID, "idle")
+      }
+      if (sessionID && eventType === "session.deleted") {
+        busySessions.delete(sessionID)
+        taskTracker.observeSessionDeleted(sessionID)
+      }
       if (sessionID && (event as { type?: string }).type === "message.updated") {
         const props = (event as { properties?: Record<string, unknown> }).properties ?? {}
         const message = [props.info, props.message].find((value) => value && typeof value === "object") as

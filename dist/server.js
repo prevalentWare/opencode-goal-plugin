@@ -702,6 +702,7 @@ var DEFAULT_MAX_PROMPT_FAILURES = 3;
 var DEFAULT_COMMAND_NAME = "goal";
 var GOAL_SYSTEM_MARKER = "OpenCode goal mode";
 var TASK_SETTLE_DELAY_MS = 25;
+var SNAPSHOT_IDLE_HOLD_MS = 250;
 var TASK_TERMINAL_STATES = new Set(["completed", "error", "cancelled"]);
 var activeContinuations = new Set;
 function goalCommandTemplate(commandName) {
@@ -924,6 +925,8 @@ class TaskTracker {
   tasks = new Map;
   pendingTaskCalls = new Map;
   latestAssistantBySession = new Map;
+  snapshotIdleHolds = new Map;
+  settledSnapshotIdleTasks = new Set;
   noteTaskCall(input) {
     if (typeof input.tool !== "string" || input.tool.toLowerCase() !== "task")
       return;
@@ -947,7 +950,7 @@ class TaskTracker {
       this.markRunning(parentSessionID, status.taskID);
       return;
     }
-    this.markTerminal(status.taskID, status.state);
+    this.markTerminal(status.taskID, status.state, parentSessionID, { resetReconciled: true });
   }
   observeSessionCreated(event) {
     const info = event.properties?.info;
@@ -964,7 +967,7 @@ class TaskTracker {
       return;
     }
     if (status === "idle")
-      this.markTerminal(sessionID, "completed");
+      this.markTerminal(sessionID, "completed", task.parentSessionID);
   }
   observeSessionDeleted(sessionID) {
     this.tasks.delete(sessionID);
@@ -973,6 +976,7 @@ class TaskTracker {
         this.tasks.delete(task.taskID);
     }
     this.latestAssistantBySession.delete(sessionID);
+    this.clearSnapshotIdleForSession(sessionID);
   }
   observeMessages(messages) {
     for (const message of messages) {
@@ -991,7 +995,7 @@ class TaskTracker {
         if (status.state === "running")
           this.markRunning(sessionID, status.taskID);
         else
-          this.markTerminal(status.taskID, status.state);
+          this.markTerminal(status.taskID, status.state, sessionID, { resetReconciled: true });
       }
     }
   }
@@ -1001,13 +1005,28 @@ class TaskTracker {
       this.observeAssistant(sessionID, marker);
   }
   hasBlockingTasks(parentSessionID) {
+    this.pruneExpiredSnapshotIdleHolds();
     for (const task of this.tasks.values()) {
       if (task.parentSessionID !== parentSessionID)
         continue;
       if (task.state === "running" || task.terminalUnreconciled)
         return true;
     }
+    for (const hold of this.snapshotIdleHolds.values()) {
+      if (hold.parentSessionID === parentSessionID)
+        return true;
+    }
     return false;
+  }
+  nextSnapshotIdleRetryAt(parentSessionID) {
+    this.pruneExpiredSnapshotIdleHolds();
+    let next = null;
+    for (const hold of this.snapshotIdleHolds.values()) {
+      if (hold.parentSessionID !== parentSessionID)
+        continue;
+      next = next == null ? hold.expiresAt : Math.min(next, hold.expiresAt);
+    }
+    return next;
   }
   async refreshLiveChildren(client, parentSessionID) {
     const session = client.session;
@@ -1035,12 +1054,17 @@ class TaskTracker {
       const statusType = isRecord(status) && typeof status.type === "string" ? status.type : undefined;
       if (statusType === "busy")
         this.markRunning(parentSessionID, childID);
-      else if (statusType === "idle" && this.tasks.has(childID))
-        this.markTerminal(childID, "completed");
+      else if (statusType === "idle") {
+        if (this.tasks.has(childID))
+          this.markTerminal(childID, "completed", parentSessionID);
+        else
+          this.markSnapshotIdle(parentSessionID, childID);
+      }
     }
   }
   markRunning(parentSessionID, taskID) {
     const existing = this.tasks.get(taskID);
+    this.clearSnapshotIdle(parentSessionID, taskID);
     this.tasks.set(taskID, {
       taskID,
       parentSessionID,
@@ -1050,19 +1074,62 @@ class TaskTracker {
       lastAssistantMessageIDAtTerminal: existing?.lastAssistantMessageIDAtTerminal ?? null
     });
   }
-  markTerminal(taskID, state) {
+  markTerminal(taskID, state, parentSessionID, options = {}) {
     if (!TASK_TERMINAL_STATES.has(state))
       return;
     const existing = this.tasks.get(taskID);
-    if (!existing)
+    const resolvedParentSessionID = existing?.parentSessionID ?? parentSessionID;
+    if (!resolvedParentSessionID)
       return;
+    this.clearSnapshotIdle(resolvedParentSessionID, taskID);
+    if (existing && TASK_TERMINAL_STATES.has(existing.state) && !existing.terminalUnreconciled && !options.resetReconciled) {
+      return;
+    }
     this.tasks.set(taskID, {
-      ...existing,
+      taskID,
+      parentSessionID: resolvedParentSessionID,
       state,
       terminalUnreconciled: true,
       terminalAt: Date.now(),
-      lastAssistantMessageIDAtTerminal: this.latestAssistantBySession.get(existing.parentSessionID)?.id ?? null
+      lastAssistantMessageIDAtTerminal: this.latestAssistantBySession.get(resolvedParentSessionID)?.id ?? null
     });
+  }
+  markSnapshotIdle(parentSessionID, taskID) {
+    const key = this.snapshotIdleKey(parentSessionID, taskID);
+    if (this.settledSnapshotIdleTasks.has(key) || this.snapshotIdleHolds.has(key))
+      return;
+    this.snapshotIdleHolds.set(key, {
+      taskID,
+      parentSessionID,
+      expiresAt: Date.now() + SNAPSHOT_IDLE_HOLD_MS
+    });
+  }
+  clearSnapshotIdle(parentSessionID, taskID) {
+    const key = this.snapshotIdleKey(parentSessionID, taskID);
+    this.snapshotIdleHolds.delete(key);
+    this.settledSnapshotIdleTasks.delete(key);
+  }
+  clearSnapshotIdleForSession(sessionID) {
+    for (const [key, hold] of this.snapshotIdleHolds) {
+      if (hold.taskID === sessionID || hold.parentSessionID === sessionID)
+        this.snapshotIdleHolds.delete(key);
+    }
+    for (const key of this.settledSnapshotIdleTasks) {
+      if (key.startsWith(`${sessionID}\x00`) || key.endsWith(`\x00${sessionID}`)) {
+        this.settledSnapshotIdleTasks.delete(key);
+      }
+    }
+  }
+  pruneExpiredSnapshotIdleHolds(now = Date.now()) {
+    for (const [key, hold] of this.snapshotIdleHolds) {
+      if (hold.expiresAt > now)
+        continue;
+      this.snapshotIdleHolds.delete(key);
+      this.settledSnapshotIdleTasks.add(key);
+    }
+  }
+  snapshotIdleKey(parentSessionID, taskID) {
+    return `${parentSessionID}\x00${taskID}`;
   }
   observeAssistant(sessionID, marker) {
     this.latestAssistantBySession.set(sessionID, marker);
@@ -1117,36 +1184,47 @@ var server = async ({ client }, options) => {
   const taskTracker = new TaskTracker;
   const taskDeferredSessions = new Set;
   const scheduledContinuations = new Map;
-  async function tasksBlockContinuation(sessionID) {
+  const busySessions = new Set;
+  async function taskBlockStatus(sessionID) {
     if (!deferWhileTasksActive)
       return false;
     await taskTracker.refreshLiveChildren(client, sessionID);
-    return taskTracker.hasBlockingTasks(sessionID);
+    return {
+      blocked: taskTracker.hasBlockingTasks(sessionID),
+      retryAt: taskTracker.nextSnapshotIdleRetryAt(sessionID)
+    };
   }
-  function scheduleSettledContinuation(sessionID) {
+  function scheduleSettledContinuation(sessionID, delayMs = TASK_SETTLE_DELAY_MS) {
     if (scheduledContinuations.has(sessionID))
       return;
     const timer = setTimeout(() => {
       scheduledContinuations.delete(sessionID);
       runAutoContinue(sessionID, true);
-    }, TASK_SETTLE_DELAY_MS);
+    }, Math.max(0, delayMs));
     const maybeUnref = timer;
     if (typeof maybeUnref.unref === "function")
       maybeUnref.unref();
     scheduledContinuations.set(sessionID, timer);
   }
   async function runAutoContinue(sessionID, fromTaskDeferral = false) {
+    if (busySessions.has(sessionID))
+      return;
     if (activeContinuations.has(sessionID))
       return;
     activeContinuations.add(sessionID);
     try {
       const latestAssistant = await fetchLatestAssistant(client, sessionID);
       taskTracker.observeAssistantMessage(sessionID, latestAssistant);
-      await recordAssistantMessage(sessionID, latestAssistant, options ?? {});
-      if (await tasksBlockContinuation(sessionID)) {
+      const taskStatus = await taskBlockStatus(sessionID);
+      if (taskStatus && taskStatus.blocked) {
         taskDeferredSessions.add(sessionID);
+        if (taskStatus.retryAt != null)
+          scheduleSettledContinuation(sessionID, taskStatus.retryAt - Date.now());
         return;
       }
+      if (busySessions.has(sessionID))
+        return;
+      await recordAssistantMessage(sessionID, latestAssistant, options ?? {});
       if (!fromTaskDeferral && taskDeferredSessions.has(sessionID)) {
         scheduleSettledContinuation(sessionID);
         return;
@@ -1327,13 +1405,22 @@ var server = async ({ client }, options) => {
       }
       if (sessionID && eventType === "session.status") {
         const status = event.properties?.status;
-        if (isRecord(status) && typeof status.type === "string")
+        if (isRecord(status) && typeof status.type === "string") {
+          if (status.type === "busy")
+            busySessions.add(sessionID);
+          if (status.type === "idle")
+            busySessions.delete(sessionID);
           taskTracker.observeSessionStatus(sessionID, status.type);
+        }
       }
-      if (sessionID && eventType === "session.idle")
+      if (sessionID && eventType === "session.idle") {
+        busySessions.delete(sessionID);
         taskTracker.observeSessionStatus(sessionID, "idle");
-      if (sessionID && eventType === "session.deleted")
+      }
+      if (sessionID && eventType === "session.deleted") {
+        busySessions.delete(sessionID);
         taskTracker.observeSessionDeleted(sessionID);
+      }
       if (sessionID && event.type === "message.updated") {
         const props = event.properties ?? {};
         const message = [props.info, props.message].find((value) => value && typeof value === "object");
