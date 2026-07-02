@@ -908,6 +908,79 @@ test("update_goal_objective cannot activate a goal from the plan agent", async (
 
   expect(String(edited)).toContain('"status": "paused"')
   expect(String(edited)).toContain('"plan_mode_notice"')
+  expect(String(edited)).toContain('"stopReason": "plan mode"')
+  expect(String(edited)).toContain("Switch to Build mode")
+})
+
+test("idle continuation is blocked when the latest assistant turn ran under plan", async () => {
+  const calls: unknown[] = []
+  const hooks = await plugin.server(
+    {
+      client: {
+        session: {
+          promptAsync: async (input: unknown) => {
+            calls.push(input)
+          },
+          messages: async () => ({
+            data: [
+              {
+                info: { id: "msg_plan", role: "assistant", sessionID: "ses_1", mode: "plan" },
+                parts: [{ type: "text", text: "Planning analysis only." }],
+              },
+            ],
+          }),
+        },
+      },
+    } as never,
+    { auto_continue: true, max_auto_turns: 5, min_continue_interval_seconds: 0 },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+
+  await requireTool(tools.create_goal, "create_goal").execute(
+    { objective: "keep going" },
+    { sessionID: "ses_1", agent: "build" } as never,
+  )
+  await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_1" } } as never })
+
+  expect(calls).toHaveLength(0)
+  const read = await requireTool(tools.get_goal, "get_goal").execute({}, { sessionID: "ses_1" } as never)
+  expect(String(read)).toContain('"status": "paused"')
+  expect(String(read)).toContain('"stopReason": "plan mode"')
+})
+
+test("build resume of a plan-created goal restores auto-continue pinned to build", async () => {
+  const calls: { body?: { agent?: string } }[] = []
+  const hooks = await plugin.server(
+    {
+      client: {
+        session: {
+          promptAsync: async (input: unknown) => {
+            calls.push(input as { body?: { agent?: string } })
+          },
+        },
+      },
+    } as never,
+    { auto_continue: true, max_auto_turns: 5, min_continue_interval_seconds: 0 },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+
+  await requireTool(tools.set_goal, "set_goal").execute(
+    { objective: "implement the feature" },
+    { sessionID: "ses_1", agent: "plan" } as never,
+  )
+  const resumed = await requireTool(tools.update_goal_status, "update_goal_status").execute(
+    { status: "active" },
+    { sessionID: "ses_1", agent: "build" } as never,
+  )
+  expect(String(resumed)).toContain('"status": "active"')
+  expect(String(resumed)).toContain('"lastPromptAgent": "build"')
+
+  await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_1" } } as never })
+
+  expect(calls).toHaveLength(1)
+  expect(calls[0]?.body?.agent).toBe("build")
 })
 
 test("idle continuation is suppressed and pauses the goal after a plan-mode prompt", async () => {

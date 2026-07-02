@@ -459,23 +459,36 @@ export async function createGoal(sessionID: string, objective: string, options?:
   })
 }
 
-export async function updateGoalObjective(sessionID: string, objective: string, status: MutableGoalStatus = "active") {
+export async function updateGoalObjective(
+  sessionID: string,
+  objective: string,
+  status: MutableGoalStatus = "active",
+  options?: { agent?: string | null; planModePause?: boolean },
+) {
   const value = validateObjective(objective)
+  const agent = typeof options?.agent === "string" && options.agent.trim() ? options.agent.trim() : null
+  const planModePause = options?.planModePause === true
   return mutate((state) => {
     const goal = state.goals[sessionID]
     if (!goal) throw new Error("cannot update goal because this session has no goal")
     accountWallClock(goal)
     goal.objective = value
-    goal.status = status
+    goal.status = planModePause ? "paused" : status
     goal.updatedAt = nowSeconds()
-    goal.lastAccountedAt = status === "active" ? goal.updatedAt : null
+    goal.lastAccountedAt = goal.status === "active" ? goal.updatedAt : null
     goal.completionEvidence = null
-    goal.blocker = null
+    goal.blocker = planModePause ? PLAN_MODE_BLOCKER : null
     goal.closedAt = null
-    goal.stopReason = null
+    goal.stopReason = planModePause ? PLAN_MODE_STOP_REASON : null
     goal.budgetWrapupSent = false
-    goal.lastStatus = status === "active" ? "Goal objective updated and resumed." : "Goal objective updated and paused."
+    if (agent) goal.lastPromptAgent = agent
+    goal.lastStatus = planModePause
+      ? "Goal objective updated; execution paused while the session is in Plan mode."
+      : goal.status === "active"
+        ? "Goal objective updated and resumed."
+        : "Goal objective updated and paused."
     pushHistory(goal, "updated", `Goal objective updated: ${summarizeText(value, 400)}`)
+    if (planModePause) pushHistory(goal, "paused", goal.lastStatus)
     return snapshot(goal)
   })
 }
@@ -509,7 +522,8 @@ export async function pauseGoalForPlanMode(sessionID: string) {
   })
 }
 
-export async function setGoalStatus(sessionID: string, status: MutableGoalStatus) {
+export async function setGoalStatus(sessionID: string, status: MutableGoalStatus, agent?: string | null) {
+  const agentValue = typeof agent === "string" && agent.trim() ? agent.trim() : null
   return mutate((state) => {
     const goal = state.goals[sessionID]
     if (!goal) throw new Error("cannot update goal because this session has no goal")
@@ -522,6 +536,7 @@ export async function setGoalStatus(sessionID: string, status: MutableGoalStatus
     goal.stopReason = status === "active" ? null : "paused"
     goal.budgetWrapupSent = status === "active" ? false : goal.budgetWrapupSent
     goal.blocker = status === "active" ? null : goal.blocker
+    if (agentValue) goal.lastPromptAgent = agentValue
     goal.lastStatus = status === "active" ? "Goal resumed." : "Goal paused."
     pushHistory(goal, status === "active" ? "resumed" : "paused", goal.lastStatus)
     return snapshot(goal)

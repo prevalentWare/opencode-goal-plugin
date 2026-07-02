@@ -14,6 +14,7 @@ import {
   recordPromptAgent,
   reserveContinuation,
   setGoalStatus,
+  updateGoalObjective,
 } from "../src/state"
 
 let dir = ""
@@ -107,9 +108,23 @@ test("creates a paused planning goal and records the prompting agent", async () 
   expect(created.blocker).toContain("Build mode")
   expect(created.history.some((entry) => entry.type === "paused")).toBe(true)
 
-  const resumed = await setGoalStatus("ses_1", "active")
+  const resumed = await setGoalStatus("ses_1", "active", "build")
   expect(resumed.status).toBe("active")
   expect(resumed.stopReason).toBeNull()
+  expect(resumed.lastPromptAgent).toBe("build")
+})
+
+test("plan-mode pause via objective update keeps the plan-mode reason", async () => {
+  await createGoal("ses_1", "implement the feature", { agent: "plan", initialStatus: "paused" })
+  const updated = await updateGoalObjective("ses_1", "implement the feature safely", "paused", {
+    agent: "plan",
+    planModePause: true,
+  })
+
+  expect(updated.status).toBe("paused")
+  expect(updated.stopReason).toBe("plan mode")
+  expect(updated.blocker).toContain("Build mode")
+  expect(updated.lastPromptAgent).toBe("plan")
 })
 
 test("records the last prompting agent and pauses active goals for plan mode", async () => {

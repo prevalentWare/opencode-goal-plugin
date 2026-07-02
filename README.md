@@ -147,8 +147,8 @@ When a safety limit is reached, the plugin sends one wrap-up prompt asking for a
 OpenCode Plan mode is a user-controlled safety boundary, and goal mode must not become an escape hatch out of it. The plugin enforces that boundary in several layers:
 
 - Goals created with `create_goal` or `set_goal` from the `plan` agent are recorded as `paused` with stop reason `plan mode`, never as active implementation goals. The tool response tells the agent to ask the user to switch to Build mode and resume the goal.
-- Automatic idle continuation is suppressed while the last user prompt came from a restricted agent. If a previously active goal idles under Plan mode, it is paused visibly instead of continuing autonomously.
-- Resuming a goal (`update_goal_status` with `active`, or `update_goal_objective` with `status: "active"`) is refused from Plan mode, so a prompt-injected instruction inside repository content cannot self-escalate a planning session into Build-mode execution. Switching to Build mode and resuming is an explicit user action.
+- Automatic idle continuation is suppressed while the last user prompt or the latest assistant turn came from a restricted agent. If a previously active goal idles under Plan mode, it is paused visibly instead of continuing autonomously.
+- Resuming a goal (`update_goal_status` with `active`, or `update_goal_objective` with `status: "active"`) is refused from Plan mode, so a prompt-injected instruction inside repository content cannot self-escalate a planning session into Build-mode execution. Switching to Build mode and resuming is an explicit user action; resuming from Build updates the tracked agent so continuation restarts pinned to Build.
 - Continuation prompts are pinned to the agent recorded from the last user prompt (`body.agent`), so auto-continue never silently switches the session to a different agent or mode.
 - The goal system reminder becomes planning-only after a Plan-mode prompt: it shows goal state but instructs the agent not to perform implementation work.
 

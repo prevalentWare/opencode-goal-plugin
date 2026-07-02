@@ -306,24 +306,30 @@ async function createGoal(sessionID, objective, options) {
     return snapshot(goal);
   });
 }
-async function updateGoalObjective(sessionID, objective, status = "active") {
+async function updateGoalObjective(sessionID, objective, status = "active", options) {
   const value = validateObjective(objective);
+  const agent = typeof options?.agent === "string" && options.agent.trim() ? options.agent.trim() : null;
+  const planModePause = options?.planModePause === true;
   return mutate((state) => {
     const goal = state.goals[sessionID];
     if (!goal)
       throw new Error("cannot update goal because this session has no goal");
     accountWallClock(goal);
     goal.objective = value;
-    goal.status = status;
+    goal.status = planModePause ? "paused" : status;
     goal.updatedAt = nowSeconds();
-    goal.lastAccountedAt = status === "active" ? goal.updatedAt : null;
+    goal.lastAccountedAt = goal.status === "active" ? goal.updatedAt : null;
     goal.completionEvidence = null;
-    goal.blocker = null;
+    goal.blocker = planModePause ? PLAN_MODE_BLOCKER : null;
     goal.closedAt = null;
-    goal.stopReason = null;
+    goal.stopReason = planModePause ? PLAN_MODE_STOP_REASON : null;
     goal.budgetWrapupSent = false;
-    goal.lastStatus = status === "active" ? "Goal objective updated and resumed." : "Goal objective updated and paused.";
+    if (agent)
+      goal.lastPromptAgent = agent;
+    goal.lastStatus = planModePause ? "Goal objective updated; execution paused while the session is in Plan mode." : goal.status === "active" ? "Goal objective updated and resumed." : "Goal objective updated and paused.";
     pushHistory(goal, "updated", `Goal objective updated: ${summarizeText(value, 400)}`);
+    if (planModePause)
+      pushHistory(goal, "paused", goal.lastStatus);
     return snapshot(goal);
   });
 }
@@ -358,7 +364,8 @@ async function pauseGoalForPlanMode(sessionID) {
     return snapshot(goal);
   });
 }
-async function setGoalStatus(sessionID, status) {
+async function setGoalStatus(sessionID, status, agent) {
+  const agentValue = typeof agent === "string" && agent.trim() ? agent.trim() : null;
   return mutate((state) => {
     const goal = state.goals[sessionID];
     if (!goal)
@@ -372,6 +379,8 @@ async function setGoalStatus(sessionID, status) {
     goal.stopReason = status === "active" ? null : "paused";
     goal.budgetWrapupSent = status === "active" ? false : goal.budgetWrapupSent;
     goal.blocker = status === "active" ? null : goal.blocker;
+    if (agentValue)
+      goal.lastPromptAgent = agentValue;
     goal.lastStatus = status === "active" ? "Goal resumed." : "Goal paused.";
     pushHistory(goal, status === "active" ? "resumed" : "paused", goal.lastStatus);
     return snapshot(goal);
@@ -935,6 +944,20 @@ function assistantMarker(message) {
     completedAt: messageCompletedAt(message)
   };
 }
+function agentFromMessage(message) {
+  if (!message)
+    return;
+  for (const source of [message, message.info]) {
+    if (!isRecord(source))
+      continue;
+    for (const key of ["agent", "mode"]) {
+      const value = source[key];
+      if (typeof value === "string" && value.trim())
+        return value.trim();
+    }
+  }
+  return;
+}
 async function sendContinuation(client, sessionID, prompt, agent) {
   await client.session.promptAsync({
     path: { id: sessionID },
@@ -1310,7 +1333,8 @@ var server = async ({ client }, options) => {
       const current = await getGoal(sessionID);
       if (!current)
         return;
-      if (isPlanAgent(current.lastPromptAgent)) {
+      const latestTurnAgent = agentFromMessage(latestAssistant);
+      if (isPlanAgent(current.lastPromptAgent) || isPlanAgent(latestTurnAgent)) {
         if (current.status === "active")
           await pauseGoalForPlanMode(sessionID);
         return;
@@ -1323,7 +1347,7 @@ var server = async ({ client }, options) => {
       const goal = await reserveContinuation(sessionID, maxAutoTurns, minInterval);
       if (!goal)
         return;
-      await sendContinuation(client, sessionID, goal.status === "active" ? continuationPrompt(goal) : limitPrompt(goal), goal.lastPromptAgent);
+      await sendContinuation(client, sessionID, goal.status === "active" ? continuationPrompt(goal) : limitPrompt(goal), goal.lastPromptAgent ?? latestTurnAgent ?? null);
       await recordContinuationResult(sessionID, "success", maxPromptFailures);
     } catch (error) {
       await recordContinuationResult(sessionID, "failure", maxPromptFailures);
@@ -1400,7 +1424,10 @@ var server = async ({ client }, options) => {
           const input = args;
           const requested = input.status ?? "active";
           const planningOnly = requested === "active" && isPlanAgent(context.agent);
-          const goal = await updateGoalObjective(context.sessionID, input.objective, planningOnly ? "paused" : requested);
+          const goal = await updateGoalObjective(context.sessionID, input.objective, planningOnly ? "paused" : requested, {
+            agent: typeof context.agent === "string" ? context.agent : null,
+            planModePause: planningOnly
+          });
           return JSON.stringify(planningOnly ? { goal, plan_mode_notice: PLAN_MODE_CREATE_NOTICE } : { goal }, null, 2);
         }
       },
@@ -1434,7 +1461,7 @@ var server = async ({ client }, options) => {
           if (input.status === "active" && isPlanAgent(context.agent)) {
             throw new Error("cannot resume the goal while the session is in Plan mode; ask the user to switch to Build mode and resume the goal from there");
           }
-          const goal = await setGoalStatus(context.sessionID, input.status);
+          const goal = await setGoalStatus(context.sessionID, input.status, typeof context.agent === "string" ? context.agent : null);
           return JSON.stringify({ goal }, null, 2);
         }
       },

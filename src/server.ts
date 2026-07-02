@@ -262,6 +262,18 @@ function assistantMarker(message: { info?: unknown; role?: unknown; id?: unknown
   }
 }
 
+function agentFromMessage(message: { info?: unknown } | undefined) {
+  if (!message) return undefined
+  for (const source of [message, message.info]) {
+    if (!isRecord(source)) continue
+    for (const key of ["agent", "mode"]) {
+      const value = source[key]
+      if (typeof value === "string" && value.trim()) return value.trim()
+    }
+  }
+  return undefined
+}
+
 async function sendContinuation(client: Parameters<Plugin>[0]["client"], sessionID: string, prompt: string, agent?: string | null) {
   await client.session.promptAsync({
     path: { id: sessionID },
@@ -641,7 +653,8 @@ const server: Plugin = async ({ client }, options?: Options) => {
       await recordAssistantMessage(sessionID, latestAssistant, options ?? {})
       const current = await getGoal(sessionID)
       if (!current) return
-      if (isPlanAgent(current.lastPromptAgent)) {
+      const latestTurnAgent = agentFromMessage(latestAssistant)
+      if (isPlanAgent(current.lastPromptAgent) || isPlanAgent(latestTurnAgent)) {
         if (current.status === "active") await pauseGoalForPlanMode(sessionID)
         return
       }
@@ -656,7 +669,7 @@ const server: Plugin = async ({ client }, options?: Options) => {
         client,
         sessionID,
         goal.status === "active" ? continuationPrompt(goal) : limitPrompt(goal),
-        goal.lastPromptAgent,
+        goal.lastPromptAgent ?? latestTurnAgent ?? null,
       )
       await recordContinuationResult(sessionID, "success", maxPromptFailures)
     } catch (error) {
@@ -736,7 +749,10 @@ const server: Plugin = async ({ client }, options?: Options) => {
           const input = args as { objective: string; status?: "active" | "paused" }
           const requested = input.status ?? "active"
           const planningOnly = requested === "active" && isPlanAgent(context.agent)
-          const goal = await updateGoalObjective(context.sessionID, input.objective, planningOnly ? "paused" : requested)
+          const goal = await updateGoalObjective(context.sessionID, input.objective, planningOnly ? "paused" : requested, {
+            agent: typeof context.agent === "string" ? context.agent : null,
+            planModePause: planningOnly,
+          })
           return JSON.stringify(planningOnly ? { goal, plan_mode_notice: PLAN_MODE_CREATE_NOTICE } : { goal }, null, 2)
         },
       },
@@ -784,7 +800,7 @@ const server: Plugin = async ({ client }, options?: Options) => {
               "cannot resume the goal while the session is in Plan mode; ask the user to switch to Build mode and resume the goal from there",
             )
           }
-          const goal = await setGoalStatus(context.sessionID, input.status)
+          const goal = await setGoalStatus(context.sessionID, input.status, typeof context.agent === "string" ? context.agent : null)
           return JSON.stringify({ goal }, null, 2)
         },
       },
