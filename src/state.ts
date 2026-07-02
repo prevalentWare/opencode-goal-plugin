@@ -46,6 +46,7 @@ export type AssistantProgressInput = {
   outputTokens?: number | null
   noProgressTokenThreshold?: number | null
   maxNoProgressTurns?: number | null
+  evaluateContinuation?: boolean
 }
 
 export type Goal = {
@@ -78,6 +79,9 @@ export type Goal = {
   lastAssistantText: string
   lastAssistantMessageID: string
   lastPromptAgent: string | null
+  awaitingContinuationProgress: boolean
+  continuationBaselineMessageID: string
+  continuationBaselineSummary: string
 }
 
 type State = {
@@ -158,6 +162,9 @@ const GoalSchema = Schema.Struct({
   lastAssistantText: Schema.optionalWith(Schema.String, { default: () => "" }),
   lastAssistantMessageID: Schema.optionalWith(Schema.String, { default: () => "" }),
   lastPromptAgent: Schema.optionalWith(NullableString, { default: () => null }),
+  awaitingContinuationProgress: Schema.optionalWith(Schema.Boolean, { default: () => false }),
+  continuationBaselineMessageID: Schema.optionalWith(Schema.String, { default: () => "" }),
+  continuationBaselineSummary: Schema.optionalWith(Schema.String, { default: () => "" }),
 })
 const StateSchema = Schema.Struct({
   version: Schema.Literal(1),
@@ -305,6 +312,9 @@ function normalizeGoal(goal: Goal) {
   goal.lastAssistantText ??= ""
   goal.lastAssistantMessageID ??= ""
   goal.lastPromptAgent ??= null
+  goal.awaitingContinuationProgress = goal.awaitingContinuationProgress === true
+  goal.continuationBaselineMessageID ??= ""
+  goal.continuationBaselineSummary ??= ""
   goal.noProgressTurns = nonNegativeInteger(goal.noProgressTurns, 0)
   goal.maxAutoTurns = positiveIntegerOrNull(goal.maxAutoTurns)
   goal.maxDurationSeconds = positiveIntegerOrNull(goal.maxDurationSeconds)
@@ -392,6 +402,9 @@ export function snapshot(goal: Goal): GoalSnapshot {
     lastAssistantText: goal.lastAssistantText,
     lastAssistantMessageID: goal.lastAssistantMessageID,
     lastPromptAgent: goal.lastPromptAgent,
+    awaitingContinuationProgress: goal.awaitingContinuationProgress,
+    continuationBaselineMessageID: goal.continuationBaselineMessageID,
+    continuationBaselineSummary: goal.continuationBaselineSummary,
     autoTurns: goal.autoTurns,
     lastContinuationAt: goal.lastContinuationAt,
     remainingTokens: remainingTokens(goal),
@@ -451,6 +464,9 @@ export async function createGoal(sessionID: string, objective: string, options?:
       lastAssistantText: "",
       lastAssistantMessageID: "",
       lastPromptAgent: normalizedOptions.agent,
+      awaitingContinuationProgress: false,
+      continuationBaselineMessageID: "",
+      continuationBaselineSummary: "",
     }
     pushHistory(goal, "created", goalLimitSummary(goal))
     if (paused) pushHistory(goal, "paused", goal.lastStatus)
@@ -629,24 +645,36 @@ export async function recordAssistantProgress(sessionID: string, input: Assistan
     if (text) goal.lastAssistantText = text
     if (messageID) goal.lastAssistantMessageID = messageID
 
-    const lowOutput = outputTokens > 0 && outputTokens < (threshold ?? DEFAULT_NO_PROGRESS_TOKEN_THRESHOLD)
-    const stalled = lowOutput && (repeatedMessage || !changed)
-    if (stalled) {
-      goal.noProgressTurns += 1
-      if (maxNoProgressTurns && goal.noProgressTurns >= maxNoProgressTurns) {
-        accountWallClock(goal)
-        goal.status = "paused"
-        goal.lastAccountedAt = null
-        goal.stopReason = "no progress"
-        goal.blocker = `Auto-continue paused after ${goal.noProgressTurns} low-progress turn(s). Resume the goal to retry.`
-        goal.lastStatus = goal.blocker
-        pushHistory(goal, "warning", goal.blocker)
+    // No-progress accounting is scoped to goal continuation turns: it only runs
+    // once per reserved continuation, when the completed turn is observed at the
+    // next idle. Generic observation paths (messages.transform, message.updated)
+    // record checkpoints above but never touch the counter.
+    const continuationTurnCompleted =
+      input.evaluateContinuation === true &&
+      goal.awaitingContinuationProgress &&
+      Boolean(messageID) &&
+      messageID !== goal.continuationBaselineMessageID
+    if (continuationTurnCompleted) {
+      goal.awaitingContinuationProgress = false
+      const lowOutput = outputTokens > 0 && outputTokens < (threshold ?? DEFAULT_NO_PROGRESS_TOKEN_THRESHOLD)
+      const changedSinceContinuation = Boolean(summary && summary !== goal.continuationBaselineSummary)
+      if (lowOutput && !changedSinceContinuation) {
+        goal.noProgressTurns += 1
+        if (maxNoProgressTurns && goal.noProgressTurns >= maxNoProgressTurns) {
+          accountWallClock(goal)
+          goal.status = "paused"
+          goal.lastAccountedAt = null
+          goal.stopReason = "no progress"
+          goal.blocker = `Auto-continue paused after ${goal.noProgressTurns} low-progress continuation turn(s). Resume the goal to retry.`
+          goal.lastStatus = goal.blocker
+          pushHistory(goal, "warning", goal.blocker)
+        } else {
+          goal.lastStatus = `Low-progress continuation turn detected (${goal.noProgressTurns}/${maxNoProgressTurns ?? "unbounded"}).`
+          pushHistory(goal, "warning", goal.lastStatus)
+        }
       } else {
-        goal.lastStatus = `Low-progress turn detected (${goal.noProgressTurns}/${maxNoProgressTurns ?? "unbounded"}).`
-        pushHistory(goal, "warning", goal.lastStatus)
+        goal.noProgressTurns = 0
       }
-    } else if (changed || outputTokens >= (threshold ?? DEFAULT_NO_PROGRESS_TOKEN_THRESHOLD)) {
-      goal.noProgressTurns = 0
     }
 
     goal.updatedAt = nowSeconds()
@@ -666,6 +694,9 @@ export async function reserveContinuation(sessionID: string, maxAutoTurns: numbe
     if (goal.lastContinuationAt && now - goal.lastContinuationAt < minIntervalSeconds) return null
     goal.autoTurns += 1
     goal.lastContinuationAt = now
+    goal.awaitingContinuationProgress = true
+    goal.continuationBaselineMessageID = goal.lastAssistantMessageID
+    goal.continuationBaselineSummary = summarizeText(goal.lastAssistantText)
     goal.lastStatus = `Auto-continue ${goal.autoTurns} reserved.`
     pushHistory(goal, "autoContinue", goal.lastStatus)
     goal.updatedAt = now

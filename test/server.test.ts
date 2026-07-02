@@ -517,6 +517,105 @@ test("running task deferral does not record repeated assistant messages as no-pr
   expect(String(read)).toContain('"noProgressTurns": 0')
 })
 
+test("low-output tool-call messages do not pause an active goal without continuations", async () => {
+  const hooks = await plugin.server(
+    {
+      client: {
+        session: {
+          promptAsync: async () => {},
+        },
+      },
+    } as never,
+    { auto_continue: false, no_progress_token_threshold: 50, max_no_progress_turns: 2 },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "long running goal" }, { sessionID: "ses_1" } as never)
+
+  for (const [id, tokens] of [
+    ["m1", 43],
+    ["m2", 48],
+    ["m3", 15],
+  ] as const) {
+    await hooks["experimental.chat.messages.transform"]!(
+      {},
+      {
+        messages: [
+          {
+            info: { id, role: "assistant", sessionID: "ses_1" },
+            parts: [
+              { type: "text", text: "Checking PTY status." },
+              { type: "step-finish", tokens: { input: 10, output: tokens } },
+            ],
+          },
+        ],
+      } as never,
+    )
+  }
+
+  const read = await requireTool(tools.get_goal, "get_goal").execute({}, { sessionID: "ses_1" } as never)
+  expect(String(read)).toContain('"status": "active"')
+  expect(String(read)).toContain('"noProgressTurns": 0')
+  expect(String(read)).toContain('"autoTurns": 0')
+})
+
+test("auto-continue pauses only after a low-progress continuation turn", async () => {
+  const calls: unknown[] = []
+  let latest = {
+    info: { id: "m0", role: "assistant", sessionID: "ses_1" },
+    parts: [
+      { type: "text", text: "Initial rich progress" },
+      { type: "step-finish", tokens: { input: 10, output: 200 } },
+    ],
+  }
+  const hooks = await plugin.server(
+    {
+      client: {
+        session: {
+          promptAsync: async (input: unknown) => {
+            calls.push(input)
+          },
+          messages: async () => ({ data: [latest] }),
+        },
+      },
+    } as never,
+    {
+      auto_continue: true,
+      max_auto_turns: 10,
+      min_continue_interval_seconds: 0,
+      no_progress_token_threshold: 50,
+      max_no_progress_turns: 1,
+    },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "keep going" }, { sessionID: "ses_1" } as never)
+
+  await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_1" } } as never })
+  expect(calls).toHaveLength(1)
+  const active = await requireTool(tools.get_goal, "get_goal").execute({}, { sessionID: "ses_1" } as never)
+  expect(String(active)).toContain('"status": "active"')
+  expect(String(active)).toContain('"noProgressTurns": 0')
+
+  latest = {
+    info: { id: "m1", role: "assistant", sessionID: "ses_1" },
+    parts: [
+      { type: "text", text: "Initial rich progress" },
+      { type: "step-finish", tokens: { input: 10, output: 10 } },
+    ],
+  }
+  await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_1" } } as never })
+
+  expect(calls).toHaveLength(1)
+  const read = await requireTool(tools.get_goal, "get_goal").execute({}, { sessionID: "ses_1" } as never)
+  expect(String(read)).toContain('"status": "paused"')
+  expect(String(read)).toContain('"stopReason": "no progress"')
+  expect(String(read)).toContain('"autoTurns": 1')
+  expect(String(read)).toContain("low-progress continuation turn")
+})
+
 test("terminal task waits for orchestrator assistant turn before goal continuation", async () => {
   const calls: unknown[] = []
   const hooks = await plugin.server(

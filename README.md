@@ -108,8 +108,8 @@ Defaults:
 - `max_prompt_failures`: `3`
 - `default_token_budget`: unset by default; when set, new goals inherit this token budget.
 - `max_goal_duration_seconds`: unset by default; when set, new goals inherit this elapsed-time safety limit.
-- `no_progress_token_threshold`: `50`
-- `max_no_progress_turns`: `2`
+- `no_progress_token_threshold`: `50`; output-token floor used to judge whether a goal continuation turn made progress.
+- `max_no_progress_turns`: `2`; consecutive low-progress goal continuation turns before pausing. Only turns produced by a reserved goal continuation count — ordinary low-output assistant messages (for example short tool-call-only turns from PTY or status checks) never increment this counter.
 - `register_command`: `true`
 - `command_name`: `"goal"`
 - `restricted_agents`: `["plan"]`; agents (matched case-insensitively) treated as planning-only for goal execution.
@@ -138,7 +138,7 @@ The plugin also uses safety states while keeping the goal available for review o
 
 - `budgetLimited` when a token budget is exhausted.
 - `usageLimited` when an auto-turn or elapsed-time budget is exhausted.
-- `paused` when the user pauses, auto-continue repeatedly fails, or repeated low-output/no-progress turns are detected.
+- `paused` when the user pauses, auto-continue repeatedly fails, or repeated low-progress goal continuation turns are detected. No-progress accounting is scoped to goal continuation turns: each reserved continuation is evaluated once, when its turn completes, and unrelated assistant activity in the session never pauses the goal.
 
 When a safety limit is reached, the plugin sends one wrap-up prompt asking for a concise handoff instead of silently continuing forever.
 

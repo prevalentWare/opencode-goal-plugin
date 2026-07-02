@@ -200,12 +200,14 @@ function exactTokensFromMessage(message: { info?: unknown; parts?: unknown[] }) 
 }
 
 function outputTokensFromMessage(message: { info?: unknown; parts?: unknown[] }) {
+  let total: number | undefined
   for (const part of message.parts ?? []) {
     if (part && typeof part === "object" && (part as Record<string, unknown>).type === "step-finish") {
       const output = outputTokensFromRecord((part as Record<string, unknown>).tokens)
-      if (output != null) return output
+      if (output != null) total = (total ?? 0) + output
     }
   }
+  if (total != null) return total
   if (message.info && typeof message.info === "object") return outputTokensFromRecord((message.info as Record<string, unknown>).tokens)
   return undefined
 }
@@ -566,6 +568,7 @@ async function recordAssistantMessage(
   sessionID: string,
   message: { info?: unknown; role?: unknown; id?: unknown; parts?: unknown[] } | undefined,
   options: Options,
+  evaluateContinuation = false,
 ) {
   if (!message) return
   await recordAssistantProgress(sessionID, {
@@ -574,6 +577,7 @@ async function recordAssistantMessage(
     outputTokens: outputTokensFromMessage(message) ?? null,
     noProgressTokenThreshold: positiveIntegerOrNull(options.no_progress_token_threshold),
     maxNoProgressTurns: positiveIntegerOrNull(options.max_no_progress_turns),
+    evaluateContinuation,
   })
 }
 
@@ -650,7 +654,7 @@ const server: Plugin = async ({ client }, options?: Options) => {
         return
       }
       if (busySessions.has(sessionID)) return
-      await recordAssistantMessage(sessionID, latestAssistant, options ?? {})
+      await recordAssistantMessage(sessionID, latestAssistant, options ?? {}, true)
       const current = await getGoal(sessionID)
       if (!current) return
       const latestTurnAgent = agentFromMessage(latestAssistant)

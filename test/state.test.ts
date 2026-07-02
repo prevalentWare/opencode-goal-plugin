@@ -85,18 +85,82 @@ test("reserves continuation until max auto turns is reached", async () => {
   expect((await getGoal("ses_1"))?.status).toBe("usageLimited")
 })
 
-test("records assistant checkpoints and pauses after repeated no-progress turns", async () => {
+test("generic assistant observations record checkpoints but never pause the goal", async () => {
   await createGoal("ses_1", "continue", { noProgressTokenThreshold: 50, maxNoProgressTurns: 2 })
   const first = await recordAssistantProgress("ses_1", { messageID: "m1", text: "Inspected the repo", outputTokens: 10 })
   expect(first?.lastCheckpoint?.summary).toBe("Inspected the repo")
   expect(first?.status).toBe("active")
 
-  await recordAssistantProgress("ses_1", { messageID: "m1", text: "Inspected the repo", outputTokens: 10 })
-  const paused = await recordAssistantProgress("ses_1", { messageID: "m1", text: "Inspected the repo", outputTokens: 10 })
+  await recordAssistantProgress("ses_1", { messageID: "m2", text: "Checked PTY status", outputTokens: 15 })
+  const observed = await recordAssistantProgress("ses_1", { messageID: "m3", text: "Checked PTY status", outputTokens: 15 })
 
+  expect(observed?.status).toBe("active")
+  expect(observed?.noProgressTurns).toBe(0)
+  expect(observed?.history.some((entry) => entry.type === "checkpoint")).toBe(true)
+})
+
+test("no-progress pause only counts goal continuation turns", async () => {
+  await createGoal("ses_1", "continue", { noProgressTokenThreshold: 50, maxNoProgressTurns: 2 })
+  await recordAssistantProgress("ses_1", { messageID: "m0", text: "Working on it", outputTokens: 100 })
+
+  await reserveContinuation("ses_1", 10, 0)
+  const firstStall = await recordAssistantProgress("ses_1", {
+    messageID: "m1",
+    text: "Working on it",
+    outputTokens: 10,
+    evaluateContinuation: true,
+  })
+  expect(firstStall?.noProgressTurns).toBe(1)
+  expect(firstStall?.status).toBe("active")
+
+  await reserveContinuation("ses_1", 10, 0)
+  const paused = await recordAssistantProgress("ses_1", {
+    messageID: "m2",
+    text: "Working on it",
+    outputTokens: 10,
+    evaluateContinuation: true,
+  })
   expect(paused?.status).toBe("paused")
   expect(paused?.stopReason).toBe("no progress")
-  expect(paused?.history.some((entry) => entry.type === "checkpoint")).toBe(true)
+  expect(paused?.blocker).toContain("continuation turn")
+})
+
+test("progressing continuation turns reset the no-progress counter", async () => {
+  await createGoal("ses_1", "continue", { noProgressTokenThreshold: 50, maxNoProgressTurns: 2 })
+  await recordAssistantProgress("ses_1", { messageID: "m0", text: "Working on it", outputTokens: 100 })
+
+  await reserveContinuation("ses_1", 10, 0)
+  await recordAssistantProgress("ses_1", { messageID: "m1", text: "Working on it", outputTokens: 10, evaluateContinuation: true })
+
+  await reserveContinuation("ses_1", 10, 0)
+  const progressed = await recordAssistantProgress("ses_1", {
+    messageID: "m2",
+    text: "Implemented the parser and added passing tests",
+    outputTokens: 400,
+    evaluateContinuation: true,
+  })
+
+  expect(progressed?.noProgressTurns).toBe(0)
+  expect(progressed?.status).toBe("active")
+})
+
+test("generic observations during a continuation turn do not consume the evaluation", async () => {
+  await createGoal("ses_1", "continue", { noProgressTokenThreshold: 50, maxNoProgressTurns: 2 })
+  await recordAssistantProgress("ses_1", { messageID: "m0", text: "Working on it", outputTokens: 100 })
+  await reserveContinuation("ses_1", 10, 0)
+
+  const observed = await recordAssistantProgress("ses_1", { messageID: "m1", text: "Working on it", outputTokens: 10 })
+  expect(observed?.noProgressTurns).toBe(0)
+  expect(observed?.awaitingContinuationProgress).toBe(true)
+
+  const evaluated = await recordAssistantProgress("ses_1", {
+    messageID: "m1",
+    text: "Working on it",
+    outputTokens: 10,
+    evaluateContinuation: true,
+  })
+  expect(evaluated?.noProgressTurns).toBe(1)
+  expect(evaluated?.awaitingContinuationProgress).toBe(false)
 })
 
 test("creates a paused planning goal and records the prompting agent", async () => {

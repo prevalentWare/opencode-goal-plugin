@@ -63,7 +63,10 @@ var GoalSchema = Schema.Struct({
   lastCheckpoint: Schema.optionalWith(Schema.NullOr(CheckpointSchema), { default: () => null }),
   lastAssistantText: Schema.optionalWith(Schema.String, { default: () => "" }),
   lastAssistantMessageID: Schema.optionalWith(Schema.String, { default: () => "" }),
-  lastPromptAgent: Schema.optionalWith(NullableString, { default: () => null })
+  lastPromptAgent: Schema.optionalWith(NullableString, { default: () => null }),
+  awaitingContinuationProgress: Schema.optionalWith(Schema.Boolean, { default: () => false }),
+  continuationBaselineMessageID: Schema.optionalWith(Schema.String, { default: () => "" }),
+  continuationBaselineSummary: Schema.optionalWith(Schema.String, { default: () => "" })
 });
 var StateSchema = Schema.Struct({
   version: Schema.Literal(1),
@@ -168,6 +171,9 @@ function normalizeGoal(goal) {
   goal.lastAssistantText ??= "";
   goal.lastAssistantMessageID ??= "";
   goal.lastPromptAgent ??= null;
+  goal.awaitingContinuationProgress = goal.awaitingContinuationProgress === true;
+  goal.continuationBaselineMessageID ??= "";
+  goal.continuationBaselineSummary ??= "";
   goal.noProgressTurns = nonNegativeInteger(goal.noProgressTurns, 0);
   goal.maxAutoTurns = positiveIntegerOrNull(goal.maxAutoTurns);
   goal.maxDurationSeconds = positiveIntegerOrNull(goal.maxDurationSeconds);
@@ -247,6 +253,9 @@ function snapshot(goal) {
     lastAssistantText: goal.lastAssistantText,
     lastAssistantMessageID: goal.lastAssistantMessageID,
     lastPromptAgent: goal.lastPromptAgent,
+    awaitingContinuationProgress: goal.awaitingContinuationProgress,
+    continuationBaselineMessageID: goal.continuationBaselineMessageID,
+    continuationBaselineSummary: goal.continuationBaselineSummary,
     autoTurns: goal.autoTurns,
     lastContinuationAt: goal.lastContinuationAt,
     remainingTokens: remainingTokens(goal),
@@ -297,7 +306,10 @@ async function createGoal(sessionID, objective, options) {
       lastCheckpoint: null,
       lastAssistantText: "",
       lastAssistantMessageID: "",
-      lastPromptAgent: normalizedOptions.agent
+      lastPromptAgent: normalizedOptions.agent,
+      awaitingContinuationProgress: false,
+      continuationBaselineMessageID: "",
+      continuationBaselineSummary: ""
     };
     pushHistory(goal, "created", goalLimitSummary(goal));
     if (paused)
@@ -459,24 +471,28 @@ async function recordAssistantProgress(sessionID, input) {
       goal.lastAssistantText = text;
     if (messageID)
       goal.lastAssistantMessageID = messageID;
-    const lowOutput = outputTokens > 0 && outputTokens < (threshold ?? DEFAULT_NO_PROGRESS_TOKEN_THRESHOLD);
-    const stalled = lowOutput && (repeatedMessage || !changed);
-    if (stalled) {
-      goal.noProgressTurns += 1;
-      if (maxNoProgressTurns && goal.noProgressTurns >= maxNoProgressTurns) {
-        accountWallClock(goal);
-        goal.status = "paused";
-        goal.lastAccountedAt = null;
-        goal.stopReason = "no progress";
-        goal.blocker = `Auto-continue paused after ${goal.noProgressTurns} low-progress turn(s). Resume the goal to retry.`;
-        goal.lastStatus = goal.blocker;
-        pushHistory(goal, "warning", goal.blocker);
+    const continuationTurnCompleted = input.evaluateContinuation === true && goal.awaitingContinuationProgress && Boolean(messageID) && messageID !== goal.continuationBaselineMessageID;
+    if (continuationTurnCompleted) {
+      goal.awaitingContinuationProgress = false;
+      const lowOutput = outputTokens > 0 && outputTokens < (threshold ?? DEFAULT_NO_PROGRESS_TOKEN_THRESHOLD);
+      const changedSinceContinuation = Boolean(summary && summary !== goal.continuationBaselineSummary);
+      if (lowOutput && !changedSinceContinuation) {
+        goal.noProgressTurns += 1;
+        if (maxNoProgressTurns && goal.noProgressTurns >= maxNoProgressTurns) {
+          accountWallClock(goal);
+          goal.status = "paused";
+          goal.lastAccountedAt = null;
+          goal.stopReason = "no progress";
+          goal.blocker = `Auto-continue paused after ${goal.noProgressTurns} low-progress continuation turn(s). Resume the goal to retry.`;
+          goal.lastStatus = goal.blocker;
+          pushHistory(goal, "warning", goal.blocker);
+        } else {
+          goal.lastStatus = `Low-progress continuation turn detected (${goal.noProgressTurns}/${maxNoProgressTurns ?? "unbounded"}).`;
+          pushHistory(goal, "warning", goal.lastStatus);
+        }
       } else {
-        goal.lastStatus = `Low-progress turn detected (${goal.noProgressTurns}/${maxNoProgressTurns ?? "unbounded"}).`;
-        pushHistory(goal, "warning", goal.lastStatus);
+        goal.noProgressTurns = 0;
       }
-    } else if (changed || outputTokens >= (threshold ?? DEFAULT_NO_PROGRESS_TOKEN_THRESHOLD)) {
-      goal.noProgressTurns = 0;
     }
     goal.updatedAt = nowSeconds();
     return snapshot(goal);
@@ -499,6 +515,9 @@ async function reserveContinuation(sessionID, maxAutoTurns, minIntervalSeconds) 
       return null;
     goal.autoTurns += 1;
     goal.lastContinuationAt = now;
+    goal.awaitingContinuationProgress = true;
+    goal.continuationBaselineMessageID = goal.lastAssistantMessageID;
+    goal.continuationBaselineSummary = summarizeText(goal.lastAssistantText);
     goal.lastStatus = `Auto-continue ${goal.autoTurns} reserved.`;
     pushHistory(goal, "autoContinue", goal.lastStatus);
     goal.updatedAt = now;
@@ -883,13 +902,16 @@ function exactTokensFromMessage(message) {
   return;
 }
 function outputTokensFromMessage(message) {
+  let total;
   for (const part of message.parts ?? []) {
     if (part && typeof part === "object" && part.type === "step-finish") {
       const output = outputTokensFromRecord(part.tokens);
       if (output != null)
-        return output;
+        total = (total ?? 0) + output;
     }
   }
+  if (total != null)
+    return total;
   if (message.info && typeof message.info === "object")
     return outputTokensFromRecord(message.info.tokens);
   return;
@@ -1239,7 +1261,7 @@ class TaskTracker {
     return false;
   }
 }
-async function recordAssistantMessage(sessionID, message, options) {
+async function recordAssistantMessage(sessionID, message, options, evaluateContinuation = false) {
   if (!message)
     return;
   await recordAssistantProgress(sessionID, {
@@ -1247,7 +1269,8 @@ async function recordAssistantMessage(sessionID, message, options) {
     text: textFromMessage(message),
     outputTokens: outputTokensFromMessage(message) ?? null,
     noProgressTokenThreshold: positiveIntegerOrNull2(options.no_progress_token_threshold),
-    maxNoProgressTurns: positiveIntegerOrNull2(options.max_no_progress_turns)
+    maxNoProgressTurns: positiveIntegerOrNull2(options.max_no_progress_turns),
+    evaluateContinuation
   });
 }
 function mergeSystemReminder(output, reminder) {
@@ -1329,7 +1352,7 @@ var server = async ({ client }, options) => {
       }
       if (busySessions.has(sessionID))
         return;
-      await recordAssistantMessage(sessionID, latestAssistant, options ?? {});
+      await recordAssistantMessage(sessionID, latestAssistant, options ?? {}, true);
       const current = await getGoal(sessionID);
       if (!current)
         return;
