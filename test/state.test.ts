@@ -11,6 +11,7 @@ import {
   getGoal,
   markGoalUnmet,
   pauseGoalForPlanMode,
+  recordContinuationResult,
   recordPromptAgent,
   reserveContinuation,
   setGoalStatus,
@@ -104,6 +105,7 @@ test("no-progress pause only counts goal continuation turns", async () => {
   await recordAssistantProgress("ses_1", { messageID: "m0", text: "Working on it", outputTokens: 100 })
 
   await reserveContinuation("ses_1", 10, 0)
+  await recordContinuationResult("ses_1", "success", 3)
   const firstStall = await recordAssistantProgress("ses_1", {
     messageID: "m1",
     text: "Working on it",
@@ -114,6 +116,7 @@ test("no-progress pause only counts goal continuation turns", async () => {
   expect(firstStall?.status).toBe("active")
 
   await reserveContinuation("ses_1", 10, 0)
+  await recordContinuationResult("ses_1", "success", 3)
   const paused = await recordAssistantProgress("ses_1", {
     messageID: "m2",
     text: "Working on it",
@@ -130,9 +133,11 @@ test("progressing continuation turns reset the no-progress counter", async () =>
   await recordAssistantProgress("ses_1", { messageID: "m0", text: "Working on it", outputTokens: 100 })
 
   await reserveContinuation("ses_1", 10, 0)
+  await recordContinuationResult("ses_1", "success", 3)
   await recordAssistantProgress("ses_1", { messageID: "m1", text: "Working on it", outputTokens: 10, evaluateContinuation: true })
 
   await reserveContinuation("ses_1", 10, 0)
+  await recordContinuationResult("ses_1", "success", 3)
   const progressed = await recordAssistantProgress("ses_1", {
     messageID: "m2",
     text: "Implemented the parser and added passing tests",
@@ -148,6 +153,7 @@ test("generic observations during a continuation turn do not consume the evaluat
   await createGoal("ses_1", "continue", { noProgressTokenThreshold: 50, maxNoProgressTurns: 2 })
   await recordAssistantProgress("ses_1", { messageID: "m0", text: "Working on it", outputTokens: 100 })
   await reserveContinuation("ses_1", 10, 0)
+  await recordContinuationResult("ses_1", "success", 3)
 
   const observed = await recordAssistantProgress("ses_1", { messageID: "m1", text: "Working on it", outputTokens: 10 })
   expect(observed?.noProgressTurns).toBe(0)
@@ -161,6 +167,26 @@ test("generic observations during a continuation turn do not consume the evaluat
   })
   expect(evaluated?.noProgressTurns).toBe(1)
   expect(evaluated?.awaitingContinuationProgress).toBe(false)
+})
+
+test("failed continuation sends do not arm no-progress evaluation", async () => {
+  await createGoal("ses_1", "continue", { noProgressTokenThreshold: 50, maxNoProgressTurns: 2 })
+  await recordAssistantProgress("ses_1", { messageID: "m0", text: "Checking status", outputTokens: 100 })
+
+  const reserved = await reserveContinuation("ses_1", 10, 0)
+  expect(reserved?.awaitingContinuationProgress).toBe(false)
+
+  const failed = await recordContinuationResult("ses_1", "failure", 3)
+  expect(failed?.awaitingContinuationProgress).toBe(false)
+
+  const observed = await recordAssistantProgress("ses_1", {
+    messageID: "m_user_response",
+    text: "Checking status",
+    outputTokens: 10,
+    evaluateContinuation: true,
+  })
+  expect(observed?.noProgressTurns).toBe(0)
+  expect(observed?.status).toBe("active")
 })
 
 test("creates a paused planning goal and records the prompting agent", async () => {

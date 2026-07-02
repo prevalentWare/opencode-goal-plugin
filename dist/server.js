@@ -515,7 +515,6 @@ async function reserveContinuation(sessionID, maxAutoTurns, minIntervalSeconds) 
       return null;
     goal.autoTurns += 1;
     goal.lastContinuationAt = now;
-    goal.awaitingContinuationProgress = true;
     goal.continuationBaselineMessageID = goal.lastAssistantMessageID;
     goal.continuationBaselineSummary = summarizeText(goal.lastAssistantText);
     goal.lastStatus = `Auto-continue ${goal.autoTurns} reserved.`;
@@ -533,11 +532,14 @@ async function recordContinuationResult(sessionID, result, maxFailures) {
     goal.updatedAt = now;
     if (result === "success") {
       goal.continuationFailures = 0;
-      if (goal.status === "active")
+      if (goal.status === "active") {
         goal.lastStatus = "Auto-continue prompt sent.";
+        goal.awaitingContinuationProgress = true;
+      }
       return snapshot(goal);
     }
     goal.continuationFailures += 1;
+    goal.awaitingContinuationProgress = false;
     goal.lastStatus = `Auto-continue failed ${goal.continuationFailures} time(s).`;
     pushHistory(goal, "error", goal.lastStatus);
     if (goal.continuationFailures >= maxFailures) {

@@ -694,7 +694,9 @@ export async function reserveContinuation(sessionID: string, maxAutoTurns: numbe
     if (goal.lastContinuationAt && now - goal.lastContinuationAt < minIntervalSeconds) return null
     goal.autoTurns += 1
     goal.lastContinuationAt = now
-    goal.awaitingContinuationProgress = true
+    // The baseline is captured at reservation time, but the no-progress
+    // evaluation is only armed once recordContinuationResult confirms the
+    // continuation prompt was actually delivered.
     goal.continuationBaselineMessageID = goal.lastAssistantMessageID
     goal.continuationBaselineSummary = summarizeText(goal.lastAssistantText)
     goal.lastStatus = `Auto-continue ${goal.autoTurns} reserved.`
@@ -712,10 +714,14 @@ export async function recordContinuationResult(sessionID: string, result: "succe
     goal.updatedAt = now
     if (result === "success") {
       goal.continuationFailures = 0
-      if (goal.status === "active") goal.lastStatus = "Auto-continue prompt sent."
+      if (goal.status === "active") {
+        goal.lastStatus = "Auto-continue prompt sent."
+        goal.awaitingContinuationProgress = true
+      }
       return snapshot(goal)
     }
     goal.continuationFailures += 1
+    goal.awaitingContinuationProgress = false
     goal.lastStatus = `Auto-continue failed ${goal.continuationFailures} time(s).`
     pushHistory(goal, "error", goal.lastStatus)
     if (goal.continuationFailures >= maxFailures) {
