@@ -9,8 +9,10 @@ import {
   formatGoalHistory,
   getGoal,
   markGoalUnmet,
+  pauseGoalForPlanMode,
   recordAssistantProgress,
   recordContinuationResult,
+  recordPromptAgent,
   reserveContinuation,
   setGoalStatus,
   updateGoalObjective,
@@ -29,6 +31,8 @@ type Options = {
   max_goal_duration_seconds?: number
   no_progress_token_threshold?: number
   max_no_progress_turns?: number
+  restricted_agents?: string[]
+  allow_goal_execution_from_plan?: boolean
 }
 
 type CreateGoalArgs = {
@@ -54,10 +58,13 @@ const DEFAULT_MAX_AUTO_TURNS = 25
 const DEFAULT_CONTINUE_INTERVAL_SECONDS = 3
 const DEFAULT_MAX_PROMPT_FAILURES = 3
 const DEFAULT_COMMAND_NAME = "goal"
+const DEFAULT_RESTRICTED_AGENTS = ["plan"]
 const GOAL_SYSTEM_MARKER = "OpenCode goal mode"
 const TASK_SETTLE_DELAY_MS = 25
 const SNAPSHOT_IDLE_HOLD_MS = 250
 const TASK_TERMINAL_STATES = new Set<TaskState>(["completed", "error", "cancelled"])
+const PLAN_MODE_CREATE_NOTICE =
+  'Goal recorded while the session is in Plan mode, so execution is paused. Do not start implementation work now. Ask the user to switch to Build mode and resume the goal (for example with "/goal resume") to begin execution.'
 const activeContinuations = new Set<string>()
 
 type TaskState = "running" | "completed" | "error" | "cancelled"
@@ -85,6 +92,12 @@ type SnapshotIdleHold = {
   taskID: string
   parentSessionID: string
   expiresAt: number
+}
+
+function restrictedAgentSet(options?: Options) {
+  if (options?.allow_goal_execution_from_plan === true) return new Set<string>()
+  const names = Array.isArray(options?.restricted_agents) ? options.restricted_agents : DEFAULT_RESTRICTED_AGENTS
+  return new Set(names.map((name) => (typeof name === "string" ? name.trim().toLowerCase() : "")).filter(Boolean))
 }
 
 function goalCommandTemplate(commandName: string) {
@@ -249,10 +262,11 @@ function assistantMarker(message: { info?: unknown; role?: unknown; id?: unknown
   }
 }
 
-async function sendContinuation(client: Parameters<Plugin>[0]["client"], sessionID: string, prompt: string) {
+async function sendContinuation(client: Parameters<Plugin>[0]["client"], sessionID: string, prompt: string, agent?: string | null) {
   await client.session.promptAsync({
     path: { id: sessionID },
     body: {
+      ...(agent ? { agent } : {}),
       parts: [{ type: "text", text: prompt }],
     },
   })
@@ -573,6 +587,22 @@ const server: Plugin = async ({ client }, options?: Options) => {
   const taskDeferredSessions = new Set<string>()
   const scheduledContinuations = new Map<string, ReturnType<typeof setTimeout>>()
   const busySessions = new Set<string>()
+  const planAgents = restrictedAgentSet(options)
+  const isPlanAgent = (agent: unknown) => typeof agent === "string" && planAgents.has(agent.trim().toLowerCase())
+
+  async function createGoalFromTool(input: CreateGoalArgs, context: { sessionID: string; agent?: string }) {
+    const planningOnly = isPlanAgent(context.agent)
+    const goal = await createGoal(context.sessionID, input.objective, {
+      tokenBudget: input.token_budget ?? options?.default_token_budget ?? null,
+      maxAutoTurns: input.max_auto_turns ?? null,
+      maxDurationSeconds: input.max_duration_seconds ?? options?.max_goal_duration_seconds ?? null,
+      noProgressTokenThreshold: options?.no_progress_token_threshold ?? null,
+      maxNoProgressTurns: options?.max_no_progress_turns ?? null,
+      agent: typeof context.agent === "string" ? context.agent : null,
+      initialStatus: planningOnly ? "paused" : "active",
+    })
+    return JSON.stringify(planningOnly ? { goal, plan_mode_notice: PLAN_MODE_CREATE_NOTICE } : { goal }, null, 2)
+  }
 
   async function taskBlockStatus(sessionID: string) {
     if (!deferWhileTasksActive) return false
@@ -609,6 +639,12 @@ const server: Plugin = async ({ client }, options?: Options) => {
       }
       if (busySessions.has(sessionID)) return
       await recordAssistantMessage(sessionID, latestAssistant, options ?? {})
+      const current = await getGoal(sessionID)
+      if (!current) return
+      if (isPlanAgent(current.lastPromptAgent)) {
+        if (current.status === "active") await pauseGoalForPlanMode(sessionID)
+        return
+      }
       if (!fromTaskDeferral && taskDeferredSessions.has(sessionID)) {
         scheduleSettledContinuation(sessionID)
         return
@@ -616,7 +652,12 @@ const server: Plugin = async ({ client }, options?: Options) => {
       taskDeferredSessions.delete(sessionID)
       const goal = await reserveContinuation(sessionID, maxAutoTurns, minInterval)
       if (!goal) return
-      await sendContinuation(client, sessionID, goal.status === "active" ? continuationPrompt(goal) : limitPrompt(goal))
+      await sendContinuation(
+        client,
+        sessionID,
+        goal.status === "active" ? continuationPrompt(goal) : limitPrompt(goal),
+        goal.lastPromptAgent,
+      )
       await recordContinuationResult(sessionID, "success", maxPromptFailures)
     } catch (error) {
       await recordContinuationResult(sessionID, "failure", maxPromptFailures)
@@ -661,7 +702,7 @@ const server: Plugin = async ({ client }, options?: Options) => {
       },
       create_goal: {
         description:
-          "Create a goal only when explicitly requested by the user or system/developer instructions; do not infer goals from ordinary tasks. Fails if a non-complete goal exists.",
+          "Create a goal only when explicitly requested by the user or system/developer instructions; do not infer goals from ordinary tasks. Fails if a non-complete goal exists. While the session is in Plan mode, the goal is recorded as paused and execution requires the user to switch to Build mode.",
         args: {
           objective: z.string().min(1).max(4000).describe("The concrete objective to start pursuing."),
           token_budget: z.number().int().positive().nullable().optional().describe("Optional positive token budget."),
@@ -669,20 +710,12 @@ const server: Plugin = async ({ client }, options?: Options) => {
           max_duration_seconds: z.number().int().positive().nullable().optional().describe("Optional per-goal duration limit."),
         },
         async execute(args, context) {
-          const input = args as CreateGoalArgs
-          const goal = await createGoal(context.sessionID, input.objective, {
-            tokenBudget: input.token_budget ?? options?.default_token_budget ?? null,
-            maxAutoTurns: input.max_auto_turns ?? null,
-            maxDurationSeconds: input.max_duration_seconds ?? options?.max_goal_duration_seconds ?? null,
-            noProgressTokenThreshold: options?.no_progress_token_threshold ?? null,
-            maxNoProgressTurns: options?.max_no_progress_turns ?? null,
-          })
-          return JSON.stringify({ goal }, null, 2)
+          return createGoalFromTool(args as CreateGoalArgs, context)
         },
       },
       set_goal: {
         description:
-          "Set a new goal when the user explicitly asks the agent to formulate and set its own goal. The model should write the objective itself based on the user's explicit request. Fails if a non-complete goal exists.",
+          "Set a new goal when the user explicitly asks the agent to formulate and set its own goal. The model should write the objective itself based on the user's explicit request. Fails if a non-complete goal exists. While the session is in Plan mode, the goal is recorded as paused and execution requires the user to switch to Build mode.",
         args: {
           objective: z.string().min(1).max(4000).describe("The model-formulated concrete objective to start pursuing."),
           token_budget: z.number().int().positive().nullable().optional().describe("Optional positive token budget."),
@@ -690,15 +723,7 @@ const server: Plugin = async ({ client }, options?: Options) => {
           max_duration_seconds: z.number().int().positive().nullable().optional().describe("Optional per-goal duration limit."),
         },
         async execute(args, context) {
-          const input = args as CreateGoalArgs
-          const goal = await createGoal(context.sessionID, input.objective, {
-            tokenBudget: input.token_budget ?? options?.default_token_budget ?? null,
-            maxAutoTurns: input.max_auto_turns ?? null,
-            maxDurationSeconds: input.max_duration_seconds ?? options?.max_goal_duration_seconds ?? null,
-            noProgressTokenThreshold: options?.no_progress_token_threshold ?? null,
-            maxNoProgressTurns: options?.max_no_progress_turns ?? null,
-          })
-          return JSON.stringify({ goal }, null, 2)
+          return createGoalFromTool(args as CreateGoalArgs, context)
         },
       },
       update_goal_objective: {
@@ -709,8 +734,10 @@ const server: Plugin = async ({ client }, options?: Options) => {
         },
         async execute(args, context) {
           const input = args as { objective: string; status?: "active" | "paused" }
-          const goal = await updateGoalObjective(context.sessionID, input.objective, input.status ?? "active")
-          return JSON.stringify({ goal }, null, 2)
+          const requested = input.status ?? "active"
+          const planningOnly = requested === "active" && isPlanAgent(context.agent)
+          const goal = await updateGoalObjective(context.sessionID, input.objective, planningOnly ? "paused" : requested)
+          return JSON.stringify(planningOnly ? { goal, plan_mode_notice: PLAN_MODE_CREATE_NOTICE } : { goal }, null, 2)
         },
       },
       update_goal: {
@@ -745,12 +772,18 @@ const server: Plugin = async ({ client }, options?: Options) => {
         },
       },
       update_goal_status: {
-        description: "Pause or resume the current OpenCode goal when the user explicitly asks to pause or resume it.",
+        description:
+          "Pause or resume the current OpenCode goal when the user explicitly asks to pause or resume it. Resuming is not allowed while the session is in Plan mode; the user must switch to Build mode first.",
         args: {
           status: z.enum(["active", "paused"]).describe("active resumes a goal; paused pauses it without clearing it."),
         },
         async execute(args, context) {
           const input = args as { status: "active" | "paused" }
+          if (input.status === "active" && isPlanAgent(context.agent)) {
+            throw new Error(
+              "cannot resume the goal while the session is in Plan mode; ask the user to switch to Build mode and resume the goal from there",
+            )
+          }
           const goal = await setGoalStatus(context.sessionID, input.status)
           return JSON.stringify({ goal }, null, 2)
         },
@@ -772,6 +805,12 @@ const server: Plugin = async ({ client }, options?: Options) => {
         output as { output?: unknown },
       )
     },
+    async "chat.message"(input, output) {
+      const sessionID = typeof input?.sessionID === "string" ? input.sessionID : output.message?.sessionID
+      const agent = typeof input?.agent === "string" && input.agent.trim() ? input.agent : output.message?.agent
+      if (typeof sessionID !== "string" || typeof agent !== "string" || !agent.trim()) return
+      await recordPromptAgent(sessionID, agent)
+    },
     async "experimental.chat.messages.transform"(input, output) {
       taskTracker.observeMessages(output.messages)
       const sessionID =
@@ -784,7 +823,8 @@ const server: Plugin = async ({ client }, options?: Options) => {
     },
     async "experimental.chat.system.transform"(input, output) {
       if (typeof input.sessionID !== "string") return
-      mergeSystemReminder(output, systemReminder(await getGoal(input.sessionID)))
+      const goal = await getGoal(input.sessionID)
+      mergeSystemReminder(output, systemReminder(goal, { planningOnly: isPlanAgent(goal?.lastPromptAgent) }))
     },
     async "experimental.session.compacting"(input, output) {
       const goal = await getGoal(input.sessionID)

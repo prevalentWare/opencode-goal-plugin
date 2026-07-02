@@ -22,6 +22,7 @@ The OpenCode Goal Plugin adds:
 - Goal close evidence: `complete` requires verified evidence, and `unmet` requires a concrete blocker.
 - Persistent per-session goal state with history, checkpoints, budgets, and owner-only file permissions.
 - Optional automatic continuation on `session.idle` / `session.status`, with no-progress pause and budget wrap-up safeguards.
+- Plan-mode safety: goals created from the `plan` agent stay paused, and auto-continue never escapes a Plan-mode session or switches agents on its own.
 - Compaction context so active goals are preserved when OpenCode summarizes a long session.
 
 ## Why Use This OpenCode Goal Plugin?
@@ -89,7 +90,9 @@ Server options can be configured in `opencode.json`:
         "default_token_budget": 200000,
         "max_goal_duration_seconds": 1800,
         "no_progress_token_threshold": 50,
-        "max_no_progress_turns": 2
+        "max_no_progress_turns": 2,
+        "restricted_agents": ["plan"],
+        "allow_goal_execution_from_plan": false
       }
     ]
   ]
@@ -109,6 +112,8 @@ Defaults:
 - `max_no_progress_turns`: `2`
 - `register_command`: `true`
 - `command_name`: `"goal"`
+- `restricted_agents`: `["plan"]`; agents (matched case-insensitively) treated as planning-only for goal execution.
+- `allow_goal_execution_from_plan`: `false`; when `true`, disables Plan-mode goal restrictions entirely.
 
 ## Goal Workflow
 
@@ -136,6 +141,18 @@ The plugin also uses safety states while keeping the goal available for review o
 - `paused` when the user pauses, auto-continue repeatedly fails, or repeated low-output/no-progress turns are detected.
 
 When a safety limit is reached, the plugin sends one wrap-up prompt asking for a concise handoff instead of silently continuing forever.
+
+## Plan Mode Safety
+
+OpenCode Plan mode is a user-controlled safety boundary, and goal mode must not become an escape hatch out of it. The plugin enforces that boundary in several layers:
+
+- Goals created with `create_goal` or `set_goal` from the `plan` agent are recorded as `paused` with stop reason `plan mode`, never as active implementation goals. The tool response tells the agent to ask the user to switch to Build mode and resume the goal.
+- Automatic idle continuation is suppressed while the last user prompt came from a restricted agent. If a previously active goal idles under Plan mode, it is paused visibly instead of continuing autonomously.
+- Resuming a goal (`update_goal_status` with `active`, or `update_goal_objective` with `status: "active"`) is refused from Plan mode, so a prompt-injected instruction inside repository content cannot self-escalate a planning session into Build-mode execution. Switching to Build mode and resuming is an explicit user action.
+- Continuation prompts are pinned to the agent recorded from the last user prompt (`body.agent`), so auto-continue never silently switches the session to a different agent or mode.
+- The goal system reminder becomes planning-only after a Plan-mode prompt: it shows goal state but instructs the agent not to perform implementation work.
+
+The set of planning-only agents is configurable with `restricted_agents` (default `["plan"]`). Setting `allow_goal_execution_from_plan` to `true` opts out of all of these restrictions; the secure default is `false`.
 
 ## State
 

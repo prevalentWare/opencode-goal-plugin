@@ -796,6 +796,256 @@ test("auto-continue failures pause after configured retry limit", async () => {
   expect(logs).toHaveLength(1)
 })
 
+test("set_goal from the plan agent records a paused goal instead of an active one", async () => {
+  const calls: unknown[] = []
+  const hooks = await plugin.server(
+    {
+      client: {
+        session: {
+          promptAsync: async (input: unknown) => {
+            calls.push(input)
+          },
+        },
+      },
+    } as never,
+    { auto_continue: true, max_auto_turns: 5, min_continue_interval_seconds: 0 },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+
+  const created = await requireTool(tools.set_goal, "set_goal").execute(
+    { objective: "create opencode-goal-plan-bypass.txt" },
+    { sessionID: "ses_1", agent: "plan" } as never,
+  )
+
+  expect(String(created)).toContain('"status": "paused"')
+  expect(String(created)).toContain('"stopReason": "plan mode"')
+  expect(String(created)).toContain('"plan_mode_notice"')
+  expect(String(created)).toContain("Build mode")
+
+  await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_1" } } as never })
+  expect(calls).toHaveLength(0)
+})
+
+test("create_goal from the plan agent records a paused goal", async () => {
+  const hooks = await plugin.server(
+    {
+      client: {
+        session: {
+          promptAsync: async () => {},
+        },
+      },
+    } as never,
+    { auto_continue: false },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+
+  const created = await requireTool(tools.create_goal, "create_goal").execute(
+    { objective: "implement the feature" },
+    { sessionID: "ses_1", agent: "plan" } as never,
+  )
+
+  expect(String(created)).toContain('"status": "paused"')
+  expect(String(created)).toContain('"plan_mode_notice"')
+})
+
+test("plan-created goal cannot resume from plan but resumes from build", async () => {
+  const hooks = await plugin.server(
+    {
+      client: {
+        session: {
+          promptAsync: async () => {},
+        },
+      },
+    } as never,
+    { auto_continue: false },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+
+  await requireTool(tools.set_goal, "set_goal").execute(
+    { objective: "implement the feature" },
+    { sessionID: "ses_1", agent: "plan" } as never,
+  )
+
+  await expect(
+    requireTool(tools.update_goal_status, "update_goal_status").execute(
+      { status: "active" },
+      { sessionID: "ses_1", agent: "plan" } as never,
+    ),
+  ).rejects.toThrow("Plan mode")
+
+  const resumed = await requireTool(tools.update_goal_status, "update_goal_status").execute(
+    { status: "active" },
+    { sessionID: "ses_1", agent: "build" } as never,
+  )
+  expect(String(resumed)).toContain('"status": "active"')
+})
+
+test("update_goal_objective cannot activate a goal from the plan agent", async () => {
+  const hooks = await plugin.server(
+    {
+      client: {
+        session: {
+          promptAsync: async () => {},
+        },
+      },
+    } as never,
+    { auto_continue: false },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+
+  await requireTool(tools.set_goal, "set_goal").execute(
+    { objective: "implement the feature" },
+    { sessionID: "ses_1", agent: "plan" } as never,
+  )
+  const edited = await requireTool(tools.update_goal_objective, "update_goal_objective").execute(
+    { objective: "implement the feature safely", status: "active" },
+    { sessionID: "ses_1", agent: "plan" } as never,
+  )
+
+  expect(String(edited)).toContain('"status": "paused"')
+  expect(String(edited)).toContain('"plan_mode_notice"')
+})
+
+test("idle continuation is suppressed and pauses the goal after a plan-mode prompt", async () => {
+  const calls: unknown[] = []
+  const hooks = await plugin.server(
+    {
+      client: {
+        session: {
+          promptAsync: async (input: unknown) => {
+            calls.push(input)
+          },
+        },
+      },
+    } as never,
+    { auto_continue: true, max_auto_turns: 5, min_continue_interval_seconds: 0 },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+
+  await requireTool(tools.create_goal, "create_goal").execute(
+    { objective: "keep going" },
+    { sessionID: "ses_1", agent: "build" } as never,
+  )
+  await hooks["chat.message"]!(
+    { sessionID: "ses_1", agent: "plan" } as never,
+    { message: { sessionID: "ses_1", agent: "plan" }, parts: [] } as never,
+  )
+  await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_1" } } as never })
+
+  expect(calls).toHaveLength(0)
+  const read = await requireTool(tools.get_goal, "get_goal").execute({}, { sessionID: "ses_1" } as never)
+  expect(String(read)).toContain('"status": "paused"')
+  expect(String(read)).toContain('"stopReason": "plan mode"')
+})
+
+test("auto-continue pins the continuation prompt to the recorded agent", async () => {
+  const calls: { body?: { agent?: string } }[] = []
+  const hooks = await plugin.server(
+    {
+      client: {
+        session: {
+          promptAsync: async (input: unknown) => {
+            calls.push(input as { body?: { agent?: string } })
+          },
+        },
+      },
+    } as never,
+    { auto_continue: true, max_auto_turns: 5, min_continue_interval_seconds: 0 },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+
+  await requireTool(tools.create_goal, "create_goal").execute(
+    { objective: "keep going" },
+    { sessionID: "ses_1", agent: "build" } as never,
+  )
+  await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_1" } } as never })
+
+  expect(calls).toHaveLength(1)
+  expect(calls[0]?.body?.agent).toBe("build")
+})
+
+test("system reminder becomes planning-only after a plan-mode prompt", async () => {
+  const hooks = await plugin.server(
+    {
+      client: {
+        session: {
+          promptAsync: async () => {},
+        },
+      },
+    } as never,
+    { auto_continue: false },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+
+  await requireTool(tools.create_goal, "create_goal").execute(
+    { objective: "keep going" },
+    { sessionID: "ses_1", agent: "build" } as never,
+  )
+  await hooks["chat.message"]!(
+    { sessionID: "ses_1", agent: "plan" } as never,
+    { message: { sessionID: "ses_1", agent: "plan" }, parts: [] } as never,
+  )
+  const output = { system: ["Base system prompt"] }
+  await hooks["experimental.chat.system.transform"]!({ sessionID: "ses_1" } as never, output)
+
+  expect(output.system[0]).toContain("Plan mode")
+  expect(output.system[0]).toContain("Do not perform implementation work")
+  expect(output.system[0]).not.toContain("Continue working toward the active session goal")
+})
+
+test("allow_goal_execution_from_plan restores active goal creation from plan", async () => {
+  const hooks = await plugin.server(
+    {
+      client: {
+        session: {
+          promptAsync: async () => {},
+        },
+      },
+    } as never,
+    { auto_continue: false, allow_goal_execution_from_plan: true },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+
+  const created = await requireTool(tools.set_goal, "set_goal").execute(
+    { objective: "implement the feature" },
+    { sessionID: "ses_1", agent: "plan" } as never,
+  )
+
+  expect(String(created)).toContain('"status": "active"')
+  expect(String(created)).not.toContain("plan_mode_notice")
+})
+
+test("restricted_agents option extends plan-mode protection to custom agents", async () => {
+  const hooks = await plugin.server(
+    {
+      client: {
+        session: {
+          promptAsync: async () => {},
+        },
+      },
+    } as never,
+    { auto_continue: false, restricted_agents: ["plan", "reviewer"] },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+
+  const created = await requireTool(tools.create_goal, "create_goal").execute(
+    { objective: "implement the feature" },
+    { sessionID: "ses_1", agent: "Reviewer" } as never,
+  )
+
+  expect(String(created)).toContain('"status": "paused"')
+  expect(String(created)).toContain('"plan_mode_notice"')
+})
+
 test("idle handler skips overlapping continuations for the same session", async () => {
   let release: (() => void) | undefined
   const calls: unknown[] = []

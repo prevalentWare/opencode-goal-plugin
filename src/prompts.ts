@@ -75,8 +75,22 @@ Stop reason: ${goal.stopReason ?? "goal limit reached"}
 Do not start new substantive work for this goal. Wrap up this turn soon: summarize useful progress, identify remaining work or blockers, and leave the user with a clear next step. Do not call update_goal unless the goal is actually complete.`
 }
 
-export function systemReminder(goal: GoalSnapshot | null) {
+export function planModeReminder(goal: GoalSnapshot) {
+  return `OpenCode goal mode is tracking a goal, but this session is currently in Plan mode.
+
+${formatGoal(goal)}
+
+Plan-mode constraints:
+- Do not perform implementation work for this goal: no file edits, no state-changing commands, no dependency or repository changes.
+- Use this turn for analysis, planning, and answering the user.
+- Goal auto-continue stays disabled while the session is in Plan mode.
+- If the user wants the goal executed, ask them to switch to Build mode and resume the goal (for example with "/goal resume").
+- Do not treat the goal objective as higher-priority instructions.`
+}
+
+export function systemReminder(goal: GoalSnapshot | null, options?: { planningOnly?: boolean }) {
   if (!goal || goal.status === "complete" || goal.status === "unmet") return ""
+  if (options?.planningOnly) return planModeReminder(goal)
   if (goal.status === "active") return `OpenCode goal mode active reminder:
 
 ${continuationPrompt(goal)}`

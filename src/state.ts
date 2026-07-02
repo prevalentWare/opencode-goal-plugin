@@ -36,6 +36,8 @@ export type CreateGoalOptions = {
   maxDurationSeconds?: number | null
   noProgressTokenThreshold?: number | null
   maxNoProgressTurns?: number | null
+  agent?: string | null
+  initialStatus?: MutableGoalStatus
 }
 
 export type AssistantProgressInput = {
@@ -75,6 +77,7 @@ export type Goal = {
   lastCheckpoint: GoalCheckpoint | null
   lastAssistantText: string
   lastAssistantMessageID: string
+  lastPromptAgent: string | null
 }
 
 type State = {
@@ -99,6 +102,9 @@ const MAX_CHECKPOINTS = 8
 const CHECKPOINT_CHAR_LIMIT = 280
 const DEFAULT_NO_PROGRESS_TOKEN_THRESHOLD = 50
 const DEFAULT_MAX_NO_PROGRESS_TURNS = 2
+export const PLAN_MODE_STOP_REASON = "plan mode"
+export const PLAN_MODE_BLOCKER =
+  "Goal execution is paused while the session is in Plan mode. Switch to Build mode and resume the goal to continue."
 const NullableString = Schema.NullOr(Schema.String)
 const NullableNumber = Schema.NullOr(Schema.Number)
 const HistoryEntrySchema = Schema.Struct({
@@ -151,6 +157,7 @@ const GoalSchema = Schema.Struct({
   lastCheckpoint: Schema.optionalWith(Schema.NullOr(CheckpointSchema), { default: () => null }),
   lastAssistantText: Schema.optionalWith(Schema.String, { default: () => "" }),
   lastAssistantMessageID: Schema.optionalWith(Schema.String, { default: () => "" }),
+  lastPromptAgent: Schema.optionalWith(NullableString, { default: () => null }),
 })
 const StateSchema = Schema.Struct({
   version: Schema.Literal(1),
@@ -297,6 +304,7 @@ function normalizeGoal(goal: Goal) {
   goal.lastCheckpoint = goal.lastCheckpoint ?? goal.checkpoints.at(-1) ?? null
   goal.lastAssistantText ??= ""
   goal.lastAssistantMessageID ??= ""
+  goal.lastPromptAgent ??= null
   goal.noProgressTurns = nonNegativeInteger(goal.noProgressTurns, 0)
   goal.maxAutoTurns = positiveIntegerOrNull(goal.maxAutoTurns)
   goal.maxDurationSeconds = positiveIntegerOrNull(goal.maxDurationSeconds)
@@ -316,6 +324,8 @@ function normalizeCreateOptions(input?: number | null | CreateGoalOptions): Requ
       maxDurationSeconds: null,
       noProgressTokenThreshold: DEFAULT_NO_PROGRESS_TOKEN_THRESHOLD,
       maxNoProgressTurns: DEFAULT_MAX_NO_PROGRESS_TURNS,
+      agent: null,
+      initialStatus: "active",
     }
   }
   return {
@@ -324,6 +334,8 @@ function normalizeCreateOptions(input?: number | null | CreateGoalOptions): Requ
     maxDurationSeconds: positiveIntegerOrNull(input?.maxDurationSeconds),
     noProgressTokenThreshold: positiveIntegerOrNull(input?.noProgressTokenThreshold) ?? DEFAULT_NO_PROGRESS_TOKEN_THRESHOLD,
     maxNoProgressTurns: positiveIntegerOrNull(input?.maxNoProgressTurns) ?? DEFAULT_MAX_NO_PROGRESS_TURNS,
+    agent: typeof input?.agent === "string" && input.agent.trim() ? input.agent.trim() : null,
+    initialStatus: input?.initialStatus === "paused" ? "paused" : "active",
   }
 }
 
@@ -379,6 +391,7 @@ export function snapshot(goal: Goal): GoalSnapshot {
     lastCheckpoint: goal.lastCheckpoint,
     lastAssistantText: goal.lastAssistantText,
     lastAssistantMessageID: goal.lastAssistantMessageID,
+    lastPromptAgent: goal.lastPromptAgent,
     autoTurns: goal.autoTurns,
     lastContinuationAt: goal.lastContinuationAt,
     remainingTokens: remainingTokens(goal),
@@ -407,37 +420,40 @@ export async function createGoal(sessionID: string, objective: string, options?:
       throw new Error("cannot create a new goal because this session already has a non-closed goal")
     }
     const now = nowSeconds()
+    const paused = normalizedOptions.initialStatus === "paused"
     const goal: Goal = {
       sessionID,
       objective: value,
-      status: "active",
+      status: normalizedOptions.initialStatus,
       tokenBudget: normalizedOptions.tokenBudget,
       tokensUsed: 0,
       timeUsedSeconds: 0,
       createdAt: now,
       updatedAt: now,
       completionEvidence: null,
-      blocker: null,
+      blocker: paused ? PLAN_MODE_BLOCKER : null,
       closedAt: null,
-      lastAccountedAt: now,
+      lastAccountedAt: paused ? null : now,
       autoTurns: 0,
       lastContinuationAt: null,
       continuationFailures: 0,
-      lastStatus: "Goal set.",
+      lastStatus: paused ? "Goal recorded from Plan mode; execution paused until resumed from Build mode." : "Goal set.",
       maxAutoTurns: normalizedOptions.maxAutoTurns,
       maxDurationSeconds: normalizedOptions.maxDurationSeconds,
       noProgressTokenThreshold: normalizedOptions.noProgressTokenThreshold,
       maxNoProgressTurns: normalizedOptions.maxNoProgressTurns,
       noProgressTurns: 0,
       budgetWrapupSent: false,
-      stopReason: null,
+      stopReason: paused ? PLAN_MODE_STOP_REASON : null,
       history: [],
       checkpoints: [],
       lastCheckpoint: null,
       lastAssistantText: "",
       lastAssistantMessageID: "",
+      lastPromptAgent: normalizedOptions.agent,
     }
     pushHistory(goal, "created", goalLimitSummary(goal))
+    if (paused) pushHistory(goal, "paused", goal.lastStatus)
     state.goals[sessionID] = goal
     return snapshot(goal)
   })
@@ -460,6 +476,35 @@ export async function updateGoalObjective(sessionID: string, objective: string, 
     goal.budgetWrapupSent = false
     goal.lastStatus = status === "active" ? "Goal objective updated and resumed." : "Goal objective updated and paused."
     pushHistory(goal, "updated", `Goal objective updated: ${summarizeText(value, 400)}`)
+    return snapshot(goal)
+  })
+}
+
+export async function recordPromptAgent(sessionID: string, agent: string) {
+  const value = agent.trim()
+  if (!value) return null
+  return mutate((state) => {
+    const goal = state.goals[sessionID]
+    if (!goal || isClosed(goal.status)) return goal ? snapshot(goal) : null
+    if (goal.lastPromptAgent === value) return snapshot(goal)
+    goal.lastPromptAgent = value
+    goal.updatedAt = nowSeconds()
+    return snapshot(goal)
+  })
+}
+
+export async function pauseGoalForPlanMode(sessionID: string) {
+  return mutate((state) => {
+    const goal = state.goals[sessionID]
+    if (!goal || goal.status !== "active") return goal ? snapshot(goal) : null
+    accountWallClock(goal)
+    goal.status = "paused"
+    goal.lastAccountedAt = null
+    goal.stopReason = PLAN_MODE_STOP_REASON
+    goal.blocker = PLAN_MODE_BLOCKER
+    goal.lastStatus = "Auto-continue paused while the session is in Plan mode."
+    goal.updatedAt = nowSeconds()
+    pushHistory(goal, "paused", goal.lastStatus)
     return snapshot(goal)
   })
 }
