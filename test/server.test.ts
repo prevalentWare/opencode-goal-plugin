@@ -131,7 +131,7 @@ test("server plugin registers goal as a desktop/web command by default", async (
   expect(config.command?.goal?.template).toContain('"edit "')
 })
 
-test("system transform merges goal context into the primary system block idempotently", async () => {
+test("system transform keeps active goal context cache-stable as usage changes", async () => {
   const hooks = await plugin.server(
     {
       client: {
@@ -146,14 +146,31 @@ test("system transform merges goal context into the primary system block idempot
   if (!tools) throw new Error("expected goal tools to be registered")
 
   await requireTool(tools.create_goal, "create_goal").execute({ objective: "finish" }, { sessionID: "ses_1" } as never)
-  const output = { system: ["Base system prompt"] }
-  await hooks["experimental.chat.system.transform"]!({ sessionID: "ses_1" } as never, output)
-  await hooks["experimental.chat.system.transform"]!({ sessionID: "ses_1" } as never, output)
+  const first = { system: ["Base system prompt"] }
+  await hooks["experimental.chat.system.transform"]!({ sessionID: "ses_1" } as never, first)
+  await hooks["experimental.chat.messages.transform"]!(
+    {},
+    {
+      messages: [
+        {
+          info: { id: "msg_1", role: "assistant", sessionID: "ses_1" },
+          parts: [
+            { type: "text", text: "Inspected the repository and identified the next step." },
+            { type: "step-finish", tokens: { input: 100, output: 20, cache: { read: 80, write: 0 } } },
+          ],
+        },
+      ],
+    } as never,
+  )
+  const second = { system: ["Base system prompt"] }
+  await hooks["experimental.chat.system.transform"]!({ sessionID: "ses_1" } as never, second)
 
-  expect(output.system).toHaveLength(1)
-  expect(output.system[0]).toStartWith("Base system prompt")
-  expect(output.system[0]).toContain("OpenCode goal mode")
-  expect(output.system[0]?.match(/OpenCode goal mode/g)?.length).toBe(1)
+  expect(first).toEqual(second)
+  expect(first.system).toHaveLength(1)
+  expect(first.system[0]).toStartWith("Base system prompt")
+  expect(first.system[0]).toContain("OpenCode goal mode")
+  expect(first.system[0]).not.toContain("Tokens used")
+  expect(first.system[0]).not.toContain("Latest checkpoint")
 })
 
 test("compaction autocontinue is disabled while a goal is active", async () => {
