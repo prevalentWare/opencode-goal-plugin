@@ -441,6 +441,221 @@ test("session status idle event auto-continues active goals", async () => {
   expect(calls).toHaveLength(1)
 })
 
+test("turn watchdog retries a busy active goal without consuming continuation budgets", async () => {
+  const calls: { body?: { agent?: string; parts?: { text?: string }[] } }[] = []
+  const hooks = await plugin.server(
+    {
+      client: {
+        session: {
+          promptAsync: async (input: unknown) => {
+            calls.push(input as { body?: { agent?: string; parts?: { text?: string }[] } })
+          },
+        },
+      },
+    } as never,
+    { auto_continue: false, max_turn_time: 0.02, max_auto_turns: 1, max_prompt_failures: 1 },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+
+  const context = { sessionID: "ses_1", agent: "build" } as never
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "keep going" }, context)
+  await hooks.event!({
+    event: { type: "session.status", properties: { sessionID: "ses_1", status: { type: "busy" } } } as never,
+  })
+
+  await waitForContinuation(calls)
+  await new Promise((resolve) => setTimeout(resolve, 30))
+
+  expect(calls).toHaveLength(1)
+  expect(calls[0]?.body?.agent).toBe("build")
+  expect(calls[0]?.body?.parts?.[0]?.text).toContain("Continue working toward the active session goal")
+  const read = await requireTool(tools.get_goal, "get_goal").execute({}, context)
+  expect(String(read)).toContain('"status": "active"')
+  expect(String(read)).toContain('"autoTurns": 0')
+  expect(String(read)).toContain('"continuationFailures": 0')
+  expect(String(read)).toContain('"awaitingContinuationProgress": false')
+
+  await hooks.event!({
+    event: { type: "session.status", properties: { sessionID: "ses_1", status: { type: "busy" } } } as never,
+  })
+  await waitFor(() => calls.length === 2)
+})
+
+test("turn watchdog resets when another busy turn starts", async () => {
+  const calls: unknown[] = []
+  const hooks = await plugin.server(
+    {
+      client: {
+        session: {
+          promptAsync: async (input: unknown) => {
+            calls.push(input)
+          },
+        },
+      },
+    } as never,
+    { auto_continue: false, max_turn_time: 0.08 },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "keep going" }, { sessionID: "ses_1" } as never)
+  await hooks.event!({
+    event: { type: "session.status", properties: { sessionID: "ses_1", status: { type: "busy" } } } as never,
+  })
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  await hooks.event!({
+    event: { type: "session.status", properties: { sessionID: "ses_1", status: { type: "busy" } } } as never,
+  })
+  await new Promise((resolve) => setTimeout(resolve, 50))
+
+  expect(calls).toHaveLength(0)
+  await waitForContinuation(calls)
+})
+
+test("turn watchdog cancels on idle, retry, deletion, and dispose", async () => {
+  const calls: unknown[] = []
+  const hooks = await plugin.server(
+    {
+      client: {
+        session: {
+          promptAsync: async (input: unknown) => {
+            calls.push(input)
+          },
+        },
+      },
+    } as never,
+    { auto_continue: false, max_turn_time: 0.02 },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+
+  for (const sessionID of ["ses_idle", "ses_retry", "ses_deleted"]) {
+    await requireTool(tools.create_goal, "create_goal").execute({ objective: "keep going" }, { sessionID } as never)
+    await hooks.event!({
+      event: { type: "session.status", properties: { sessionID, status: { type: "busy" } } } as never,
+    })
+  }
+  await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_idle" } } as never })
+  await hooks.event!({
+    event: { type: "session.status", properties: { sessionID: "ses_retry", status: { type: "retry" } } } as never,
+  })
+  await hooks.event!({ event: { type: "session.deleted", properties: { info: { id: "ses_deleted" } } } as never })
+  await new Promise((resolve) => setTimeout(resolve, 50))
+
+  expect(calls).toHaveLength(0)
+
+  await requireTool(tools.create_goal, "create_goal").execute(
+    { objective: "keep going" },
+    { sessionID: "ses_disposed" } as never,
+  )
+  await hooks.event!({
+    event: { type: "session.status", properties: { sessionID: "ses_disposed", status: { type: "busy" } } } as never,
+  })
+  await hooks.dispose?.()
+  await new Promise((resolve) => setTimeout(resolve, 50))
+
+  expect(calls).toHaveLength(0)
+})
+
+test("turn watchdog does not inject while tasks are active, the goal is paused, or the turn is restricted", async () => {
+  const calls: unknown[] = []
+  const hooks = await plugin.server(
+    {
+      client: {
+        session: {
+          messages: async (input: { path: { id: string } }) => ({
+            data:
+              input.path.id === "ses_latest_plan"
+                ? [
+                    {
+                      info: { id: "msg_plan", role: "assistant", sessionID: "ses_latest_plan", mode: "plan" },
+                      parts: [],
+                    },
+                  ]
+                : [],
+          }),
+          promptAsync: async (input: unknown) => {
+            calls.push(input)
+          },
+        },
+      },
+    } as never,
+    { auto_continue: false, max_turn_time: 0.02 },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+
+  await requireTool(tools.create_goal, "create_goal").execute(
+    { objective: "task goal" },
+    { sessionID: "ses_task", agent: "build" } as never,
+  )
+  await hooks["tool.execute.after"]?.(
+    { tool: "Task", sessionID: "ses_task", callID: "call_1", args: {} } as never,
+    { title: "Task", output: "task_id: task_1\nstate: running", metadata: {} } as never,
+  )
+  await requireTool(tools.create_goal, "create_goal").execute(
+    { objective: "restricted goal" },
+    { sessionID: "ses_plan", agent: "build" } as never,
+  )
+  await hooks["chat.message"]!(
+    { sessionID: "ses_plan", agent: "plan" } as never,
+    { message: { sessionID: "ses_plan", agent: "plan" }, parts: [] } as never,
+  )
+  await requireTool(tools.create_goal, "create_goal").execute(
+    { objective: "latest restricted turn" },
+    { sessionID: "ses_latest_plan", agent: "build" } as never,
+  )
+  await requireTool(tools.create_goal, "create_goal").execute(
+    { objective: "paused goal" },
+    { sessionID: "ses_paused", agent: "build" } as never,
+  )
+  await requireTool(tools.update_goal_status, "update_goal_status").execute(
+    { status: "paused" },
+    { sessionID: "ses_paused", agent: "build" } as never,
+  )
+  for (const sessionID of ["ses_task", "ses_plan", "ses_latest_plan", "ses_paused"]) {
+    await hooks.event!({
+      event: { type: "session.status", properties: { sessionID, status: { type: "busy" } } } as never,
+    })
+  }
+  await new Promise((resolve) => setTimeout(resolve, 50))
+
+  expect(calls).toHaveLength(0)
+})
+
+test("turn watchdog transport failures do not pause or charge the goal", async () => {
+  const logs: unknown[] = []
+  const hooks = await plugin.server(
+    {
+      client: {
+        app: { log: async (input: unknown) => logs.push(input) },
+        session: {
+          promptAsync: async () => {
+            throw new Error("network down")
+          },
+        },
+      },
+    } as never,
+    { auto_continue: false, max_turn_time: 0.02, max_prompt_failures: 1 },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+
+  const context = { sessionID: "ses_1" } as never
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "keep going" }, context)
+  await hooks.event!({
+    event: { type: "session.status", properties: { sessionID: "ses_1", status: { type: "busy" } } } as never,
+  })
+  await waitFor(() => logs.length === 1)
+
+  const read = await requireTool(tools.get_goal, "get_goal").execute({}, context)
+  expect(String(read)).toContain('"status": "active"')
+  expect(String(read)).toContain('"autoTurns": 0')
+  expect(String(read)).toContain('"continuationFailures": 0')
+  expect(JSON.stringify(logs[0])).toContain("Turn watchdog retry failed")
+})
+
 test("running task defers idle auto-continue", async () => {
   const calls: unknown[] = []
   const hooks = await plugin.server(

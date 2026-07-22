@@ -24,6 +24,7 @@ type Options = {
   defer_while_tasks_active?: boolean
   max_auto_turns?: number
   min_continue_interval_seconds?: number
+  max_turn_time?: number
   max_prompt_failures?: number
   register_command?: boolean
   command_name?: string
@@ -62,6 +63,7 @@ const DEFAULT_RESTRICTED_AGENTS = ["plan"]
 const GOAL_SYSTEM_MARKER = "OpenCode goal mode"
 const TASK_SETTLE_DELAY_MS = 25
 const SNAPSHOT_IDLE_HOLD_MS = 250
+const MAX_TIMER_DELAY_MS = 2_147_483_647
 const TASK_TERMINAL_STATES = new Set<TaskState>(["completed", "error", "cancelled"])
 const PLAN_MODE_CREATE_NOTICE =
   'Goal recorded while the session is in Plan mode, so execution is paused. Do not start implementation work now. Ask the user to switch to Build mode and resume the goal (for example with "/goal resume") to begin execution.'
@@ -92,6 +94,10 @@ type SnapshotIdleHold = {
   taskID: string
   parentSessionID: string
   expiresAt: number
+}
+
+type TurnWatchdog = {
+  timer: ReturnType<typeof setTimeout>
 }
 
 function restrictedAgentSet(options?: Options) {
@@ -132,6 +138,11 @@ function commandNameFromOptions(options?: Options) {
 
 function positiveIntegerOrNull(value: unknown) {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : null
+}
+
+function timeoutMillisecondsFromSeconds(value: unknown) {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return null
+  return Math.min(Math.ceil(value * 1000), MAX_TIMER_DELAY_MS)
 }
 
 function registerDesktopCommand(config: Config, commandName: string) {
@@ -292,12 +303,15 @@ function isIdleEvent(event: { type?: string; properties?: Record<string, unknown
   return event.type === "session.status" && typeof status === "object" && status !== null && (status as { type?: unknown }).type === "idle"
 }
 
-function sessionIDFromEvent(event: { properties?: Record<string, unknown> }) {
+function sessionIDFromEvent(event: { type?: string; properties?: Record<string, unknown> }) {
   const direct = event.properties?.sessionID
   if (typeof direct === "string") return direct
   const info = event.properties?.info
-  if (typeof info === "object" && info !== null && typeof (info as { sessionID?: unknown }).sessionID === "string") {
-    return (info as { sessionID: string }).sessionID
+  if (typeof info === "object" && info !== null) {
+    if (typeof (info as { sessionID?: unknown }).sessionID === "string") return (info as { sessionID: string }).sessionID
+    if (event.type === "session.deleted" && typeof (info as { id?: unknown }).id === "string") {
+      return (info as { id: string }).id
+    }
   }
   return undefined
 }
@@ -606,12 +620,14 @@ const server: Plugin = async ({ client }, options?: Options) => {
   const deferWhileTasksActive = options?.defer_while_tasks_active ?? true
   const maxAutoTurns = positiveIntegerOrNull(options?.max_auto_turns) ?? DEFAULT_MAX_AUTO_TURNS
   const minInterval = positiveIntegerOrNull(options?.min_continue_interval_seconds) ?? DEFAULT_CONTINUE_INTERVAL_SECONDS
+  const maxTurnTimeMs = timeoutMillisecondsFromSeconds(options?.max_turn_time)
   const maxPromptFailures = positiveIntegerOrNull(options?.max_prompt_failures) ?? DEFAULT_MAX_PROMPT_FAILURES
   const registerCommand = options?.register_command ?? true
   const commandName = commandNameFromOptions(options)
   const taskTracker = new TaskTracker()
   const taskDeferredSessions = new Set<string>()
   const scheduledContinuations = new Map<string, ReturnType<typeof setTimeout>>()
+  const turnWatchdogs = new Map<string, TurnWatchdog>()
   const busySessions = new Set<string>()
   const planAgents = restrictedAgentSet(options)
   const isPlanAgent = (agent: unknown) => typeof agent === "string" && planAgents.has(agent.trim().toLowerCase())
@@ -636,6 +652,65 @@ const server: Plugin = async ({ client }, options?: Options) => {
     return {
       blocked: taskTracker.hasBlockingTasks(sessionID),
       retryAt: taskTracker.nextSnapshotIdleRetryAt(sessionID),
+    }
+  }
+
+  function clearTurnWatchdog(sessionID: string) {
+    const watchdog = turnWatchdogs.get(sessionID)
+    if (!watchdog) return
+    clearTimeout(watchdog.timer)
+    turnWatchdogs.delete(sessionID)
+  }
+
+  function armTurnWatchdog(sessionID: string) {
+    if (maxTurnTimeMs == null) return
+    clearTurnWatchdog(sessionID)
+    const watchdog: TurnWatchdog = {
+      timer: setTimeout(() => void runTurnWatchdog(sessionID, watchdog), maxTurnTimeMs),
+    }
+    const maybeUnref = watchdog.timer as { unref?: () => void }
+    if (typeof maybeUnref.unref === "function") maybeUnref.unref()
+    turnWatchdogs.set(sessionID, watchdog)
+  }
+
+  async function runTurnWatchdog(sessionID: string, watchdog: TurnWatchdog) {
+    let claimedContinuation = false
+    try {
+      if (turnWatchdogs.get(sessionID) !== watchdog || !busySessions.has(sessionID)) return
+      const goal = await getGoal(sessionID)
+      if (turnWatchdogs.get(sessionID) !== watchdog || !busySessions.has(sessionID)) return
+      if (goal?.status !== "active" || isPlanAgent(goal.lastPromptAgent)) return
+      const latestAssistant = await fetchLatestAssistant(client, sessionID)
+      if (turnWatchdogs.get(sessionID) !== watchdog || !busySessions.has(sessionID)) return
+      const latestTurnAgent = agentFromMessage(latestAssistant)
+      if (isPlanAgent(latestTurnAgent)) return
+      const taskStatus = await taskBlockStatus(sessionID)
+      if (turnWatchdogs.get(sessionID) !== watchdog || !busySessions.has(sessionID)) return
+      if (taskStatus && taskStatus.blocked) return
+      const current = await getGoal(sessionID)
+      if (turnWatchdogs.get(sessionID) !== watchdog || !busySessions.has(sessionID)) return
+      if (current?.status !== "active" || isPlanAgent(current.lastPromptAgent) || activeContinuations.has(sessionID)) return
+
+      turnWatchdogs.delete(sessionID)
+      activeContinuations.add(sessionID)
+      claimedContinuation = true
+      await sendContinuation(client, sessionID, continuationPrompt(current), current.lastPromptAgent ?? latestTurnAgent ?? null)
+    } catch (error) {
+      try {
+        await client.app?.log?.({
+          body: {
+            service: "opencode-goal-plugin",
+            level: "error",
+            message: "Turn watchdog retry failed",
+            extra: { error: error instanceof Error ? error.message : String(error) },
+          },
+        })
+      } catch {
+        return
+      }
+    } finally {
+      if (claimedContinuation) activeContinuations.delete(sessionID)
+      if (turnWatchdogs.get(sessionID) === watchdog) turnWatchdogs.delete(sessionID)
     }
   }
 
@@ -706,6 +781,8 @@ const server: Plugin = async ({ client }, options?: Options) => {
     async dispose() {
       for (const timer of scheduledContinuations.values()) clearTimeout(timer)
       scheduledContinuations.clear()
+      for (const watchdog of turnWatchdogs.values()) clearTimeout(watchdog.timer)
+      turnWatchdogs.clear()
     },
     async config(config) {
       if (!registerCommand) return
@@ -876,16 +953,27 @@ const server: Plugin = async ({ client }, options?: Options) => {
         const status = (event as { properties?: Record<string, unknown> }).properties?.status
         if (isRecord(status) && typeof status.type === "string") {
           if (status.type === "busy") busySessions.add(sessionID)
-          if (status.type === "idle") busySessions.delete(sessionID)
+          if (status.type === "busy") armTurnWatchdog(sessionID)
+          if (status.type === "idle") {
+            busySessions.delete(sessionID)
+            clearTurnWatchdog(sessionID)
+          }
+          if (status.type === "retry") clearTurnWatchdog(sessionID)
           taskTracker.observeSessionStatus(sessionID, status.type)
         }
       }
       if (sessionID && eventType === "session.idle") {
         busySessions.delete(sessionID)
+        clearTurnWatchdog(sessionID)
         taskTracker.observeSessionStatus(sessionID, "idle")
       }
       if (sessionID && eventType === "session.deleted") {
         busySessions.delete(sessionID)
+        clearTurnWatchdog(sessionID)
+        const scheduled = scheduledContinuations.get(sessionID)
+        if (scheduled) clearTimeout(scheduled)
+        scheduledContinuations.delete(sessionID)
+        taskDeferredSessions.delete(sessionID)
         taskTracker.observeSessionDeleted(sessionID)
       }
       if (sessionID && (event as { type?: string }).type === "message.updated") {

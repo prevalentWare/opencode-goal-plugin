@@ -86,6 +86,7 @@ Server options can be configured in `opencode.json`:
         "defer_while_tasks_active": true,
         "max_auto_turns": 25,
         "min_continue_interval_seconds": 3,
+        "max_turn_time": 300,
         "max_prompt_failures": 3,
         "default_token_budget": 200000,
         "max_goal_duration_seconds": 1800,
@@ -105,6 +106,7 @@ Defaults:
 - `defer_while_tasks_active`: `true`; when enabled, goal auto-continuation waits for active OpenCode Task child sessions and their orchestrator reconciliation before sending the next goal prompt.
 - `max_auto_turns`: `25`
 - `min_continue_interval_seconds`: `3`
+- `max_turn_time`: unset by default; set a positive number of seconds to retry one active-goal continuation prompt when a model turn remains busy for that long. Each new busy event resets the watchdog. Idle, built-in retry, session deletion, active Task children, and restricted agents suppress the retry. Watchdog retries are independent of `min_continue_interval_seconds` and do not consume auto-turn, no-progress, or prompt-failure budgets.
 - `max_prompt_failures`: `3`
 - `default_token_budget`: unset by default; when set, new goals inherit this token budget.
 - `max_goal_duration_seconds`: unset by default; when set, new goals inherit this elapsed-time safety limit.
@@ -174,7 +176,7 @@ The state file is written atomically with owner-only permissions when the host f
 
 ## Credits
 
-This plugin follows Codex's native goal-mode semantics where OpenCode plugin hooks allow it. Several hardening ideas were adapted from Willy Topete's [`willytop8/OpenCode-goal-plugin`](https://github.com/willytop8/OpenCode-goal-plugin), especially lifecycle history, checkpoints, no-progress safeguards, budget wrap-up behavior, and strict-provider-safe system prompt merging. Thank you, Willy.
+This plugin follows Codex's native goal-mode semantics where OpenCode plugin hooks allow it. Several hardening ideas were adapted from William Ricchiuti's [`willytop8/OpenCode-goal-plugin`](https://github.com/willytop8/OpenCode-goal-plugin), especially lifecycle history, checkpoints, no-progress safeguards, budget wrap-up behavior, and strict-provider-safe system prompt merging. Thank you, William.
 
 ## Development
 
@@ -213,6 +215,6 @@ OpenCode plugin modules are target-specific. This package exports separate modul
 }
 ```
 
-Codex goal mode has deeper runtime integration for thread lifecycle control. This plugin implements the same workflow using OpenCode plugin hooks. Token usage is read from OpenCode step-finish usage when available and falls back to message token metadata or text estimation when exact usage is unavailable. Continuation is driven by OpenCode idle events, including `session.idle` and `session.status` idle notifications. By default, continuation is deferred while OpenCode Task child sessions are active or their terminal result still needs an orchestrator turn. During compaction, the plugin disables OpenCode's generic synthetic auto-continue while an active goal exists so the goal-specific continuation prompt remains authoritative.
+Codex goal mode has deeper runtime integration for thread lifecycle control. This plugin implements the same workflow using OpenCode plugin hooks. Token usage is read from OpenCode step-finish usage when available and falls back to message token metadata or text estimation when exact usage is unavailable. Continuation is driven by OpenCode idle events, including `session.idle` and `session.status` idle notifications. The optional `max_turn_time` watchdog can retry one goal continuation prompt when a model turn remains busy, without consuming the goal's auto-turn, no-progress, or prompt-failure budgets. By default, continuation is deferred while OpenCode Task child sessions are active or their terminal result still needs an orchestrator turn. During compaction, the plugin disables OpenCode's generic synthetic auto-continue while an active goal exists so the goal-specific continuation prompt remains authoritative.
 
 The goal sidebar shows the current status, elapsed time, token usage, auto-continue count, latest checkpoint, latest status message, stop reason, and objective when a goal is active, paused, or safety-limited. Closed goals remain visible briefly through the latest tool state as achieved or unmet.
