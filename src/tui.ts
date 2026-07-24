@@ -16,7 +16,7 @@ type GoalHistoryEntry = {
 type GoalSnapshot = {
   sessionID: string
   objective: string
-  status: "active" | "paused" | "budgetLimited" | "usageLimited" | "complete" | "unmet"
+  status: "active" | "paused" | "blocked" | "usageLimited" | "budgetLimited" | "complete"
   tokenBudget: number | null
   tokensUsed: number
   timeUsedSeconds: number
@@ -39,6 +39,9 @@ type GoalSnapshot = {
   lastCheckpoint: GoalCheckpoint | null
   lastAssistantText: string
   lastAssistantMessageID: string
+  lastPromptAgent?: string | null
+  lastPromptModel?: { providerID: string; modelID: string } | null
+  blockedAuditTurns?: number
   autoTurns: number
   lastContinuationAt: number | null
   remainingTokens: number | null
@@ -130,31 +133,28 @@ function toast(api: TuiPluginApi, message: string, variant: "info" | "success" |
   api.ui.toast({ title: "Goal", message, variant, duration: 2500 })
 }
 
-async function sendGoalPrompt(api: TuiPluginApi, sessionID: string, text: string) {
-  await api.client.session.promptAsync({
+async function sendGoalCommand(api: TuiPluginApi, sessionID: string, args: string) {
+  await api.client.session.command({
     sessionID,
-    parts: [{ type: "text", text }],
+    command: "goal",
+    arguments: args,
   })
 }
 
 function refreshGoalPrompt() {
-  return "Call get_goal for this session and report the current goal state briefly."
+  return ""
 }
 
 function clearGoalPrompt() {
-  return "Clear the current session goal by calling clear_goal. Report whether a goal was cleared."
+  return "clear"
 }
 
 function pauseGoalPrompt() {
-  return 'Pause the current session goal by calling update_goal_status with status "paused". Report the result briefly.'
+  return "pause"
 }
 
 function resumeGoalPrompt() {
-  return 'Resume the current session goal by calling update_goal_status with status "active", then continue working toward it.'
-}
-
-function historyGoalPrompt() {
-  return "Call get_goal_history for this session and report the current goal history briefly."
+  return "resume"
 }
 
 function actionOption(api: TuiPluginApi, sessionID: string, title: string, value: string, description: string, prompt: string) {
@@ -163,7 +163,7 @@ function actionOption(api: TuiPluginApi, sessionID: string, title: string, value
     value,
     description,
     onSelect: () => {
-      void sendGoalPrompt(api, sessionID, prompt)
+      void sendGoalCommand(api, sessionID, prompt)
         .then(() => api.ui.dialog.clear())
         .catch((error) => toast(api, error instanceof Error ? error.message : String(error), "error"))
     },
@@ -176,11 +176,10 @@ function showSummary(api: TuiPluginApi, sessionID: string, goal: GoalSnapshot | 
     actionOption(api, sessionID, "Refresh", "refresh", "Ask the agent to read the current goal state", refreshGoalPrompt()),
     ...(goal
       ? [
-          actionOption(api, sessionID, "History", "history", "Ask the agent to show lifecycle history", historyGoalPrompt()),
           ...(goal.status === "active"
             ? [actionOption(api, sessionID, "Pause", "pause", "Pause auto-continuation without clearing", pauseGoalPrompt())]
             : []),
-          ...(goal.status === "paused" || goal.status === "budgetLimited" || goal.status === "usageLimited"
+          ...(goal.status === "paused" || goal.status === "blocked" || goal.status === "budgetLimited" || goal.status === "usageLimited"
             ? [actionOption(api, sessionID, "Resume", "resume", "Resume the goal and continue", resumeGoalPrompt())]
             : []),
           actionOption(api, sessionID, "Clear", "clear", "Ask the agent to clear this session goal", clearGoalPrompt()),
@@ -248,7 +247,7 @@ function isGoalSnapshot(value: unknown): value is GoalSnapshot {
   if (!isRecord(value)) return false
   if (typeof value.sessionID !== "string") return false
   if (typeof value.objective !== "string") return false
-  if (!["active", "paused", "budgetLimited", "usageLimited", "complete", "unmet"].includes(String(value.status))) return false
+  if (!["active", "paused", "blocked", "usageLimited", "budgetLimited", "complete"].includes(String(value.status))) return false
   if (value.tokenBudget !== null && typeof value.tokenBudget !== "number") return false
   if (typeof value.tokensUsed !== "number") return false
   if (typeof value.timeUsedSeconds !== "number") return false
@@ -271,6 +270,15 @@ function isGoalSnapshot(value: unknown): value is GoalSnapshot {
   if (value.lastCheckpoint !== null && !isCheckpoint(value.lastCheckpoint)) return false
   if (typeof value.lastAssistantText !== "string") return false
   if (typeof value.lastAssistantMessageID !== "string") return false
+  if (value.lastPromptAgent != null && typeof value.lastPromptAgent !== "string") return false
+  if (
+    value.lastPromptModel != null &&
+    (!isRecord(value.lastPromptModel) ||
+      typeof value.lastPromptModel.providerID !== "string" ||
+      typeof value.lastPromptModel.modelID !== "string")
+  )
+    return false
+  if (value.blockedAuditTurns != null && typeof value.blockedAuditTurns !== "number") return false
   if (typeof value.autoTurns !== "number") return false
   if (value.lastContinuationAt != null && typeof value.lastContinuationAt !== "number") return false
   if (value.remainingTokens !== null && typeof value.remainingTokens !== "number") return false
@@ -281,20 +289,10 @@ function isGoalSnapshot(value: unknown): value is GoalSnapshot {
 function parseGoalToolOutput(part: GoalToolPart): GoalSnapshot | null | undefined {
   if (part.type !== "tool") return undefined
   if (
-    ![
-      "get_goal",
-      "get_goal_history",
-      "create_goal",
-      "set_goal",
-      "update_goal",
-      "update_goal_objective",
-      "update_goal_status",
-      "clear_goal",
-    ].includes(part.tool ?? "")
+    !["get_goal", "create_goal", "update_goal"].includes(part.tool ?? "")
   )
     return undefined
   if (part.state?.status !== "completed") return undefined
-  if (part.tool === "clear_goal") return null
   if (typeof part.state.output !== "string") return undefined
 
   try {
@@ -340,6 +338,9 @@ function formatGoal(goal: GoalSnapshot | null) {
   if (goal.remainingTokens != null) lines.push(`Tokens remaining: ${goal.remainingTokens}`)
   if (goal.maxDurationSeconds != null) lines.push(`Duration limit: ${formatDuration(goal.maxDurationSeconds)}`)
   if (goal.noProgressTurns > 0) lines.push(`No-progress turns: ${goal.noProgressTurns}`)
+  if (goal.blockedAuditTurns != null) lines.push(`Blocked-audit turns: ${goal.blockedAuditTurns}/3`)
+  if (goal.lastPromptAgent) lines.push(`Pinned agent: ${goal.lastPromptAgent}`)
+  if (goal.lastPromptModel) lines.push(`Pinned model: ${goal.lastPromptModel.providerID}/${goal.lastPromptModel.modelID}`)
   if (goal.lastCheckpoint) lines.push(`Latest checkpoint: ${goal.lastCheckpoint.summary}`)
   if (goal.stopReason) lines.push(`Stop reason: ${goal.stopReason}`)
   if (goal.lastStatus) lines.push(`Last status: ${goal.lastStatus}`)
@@ -353,9 +354,11 @@ function GoalSidebar(api: TuiPluginApi, sessionID: string) {
   const state = goalStateFromSession(api, sessionID)
   const goal = state.goal
   if (!goal) return null
-  if (goal.status === "complete" || goal.status === "unmet") {
+  if (goal.status === "complete" || goal.status === "blocked") {
     const elapsed = liveTimeUsedSeconds(goal)
-    return text({ fg: goal.status === "complete" ? theme.primary : theme.textMuted }, [`${goal.status === "complete" ? "Goal achieved" : "Goal unmet"} (${formatDurationBadge(elapsed)})`])
+    return text({ fg: goal.status === "complete" ? theme.primary : theme.textMuted }, [
+      `${goal.status === "complete" ? "Goal achieved" : "Goal blocked"} (${formatDurationBadge(elapsed)})`,
+    ])
   }
   const [nowSeconds, setNowSeconds] = createSignal(currentEpochSeconds())
   if (goal.status === "active") {
@@ -420,7 +423,7 @@ const tui: TuiPlugin = async (api) => {
 }
 
 const plugin: TuiPluginModule = {
-  id: "local.goal-mode.tui",
+  id: "slash-goal-for-opencode.tui",
   tui,
 }
 

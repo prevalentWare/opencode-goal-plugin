@@ -1,18 +1,28 @@
 import { readFileSync } from "node:fs"
-import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises"
+import { chmod, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises"
+import { randomUUID } from "node:crypto"
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
+import { Database } from "bun:sqlite"
 import { Data, Effect, Schema } from "effect"
 
-export type GoalStatus = "active" | "paused" | "budgetLimited" | "usageLimited" | "complete" | "unmet"
+export type GoalStatus = "active" | "paused" | "blocked" | "usageLimited" | "budgetLimited" | "complete"
 export type MutableGoalStatus = "active" | "paused"
+export type GoalModel = { providerID: string; modelID: string }
+export type MessageUsageAccuracy = "estimated" | "exact"
+export type ContinuationReservation = {
+  nonce: string
+  promptGeneration: number
+  autoTurn: number
+  kind: "continuation" | "wrapup"
+}
 export type GoalHistoryType =
   | "created"
   | "updated"
   | "paused"
   | "resumed"
   | "completed"
-  | "unmet"
+  | "blocked"
   | "autoContinue"
   | "checkpoint"
   | "warning"
@@ -37,6 +47,10 @@ export type CreateGoalOptions = {
   noProgressTokenThreshold?: number | null
   maxNoProgressTurns?: number | null
   agent?: string | null
+  model?: GoalModel | null
+  accountingMessageID?: string | null
+  accountingMessageTokens?: number | null
+  accountingMessageAccuracy?: MessageUsageAccuracy | null
   initialStatus?: MutableGoalStatus
 }
 
@@ -79,6 +93,13 @@ export type Goal = {
   lastAssistantText: string
   lastAssistantMessageID: string
   lastPromptAgent: string | null
+  lastPromptModel: GoalModel | null
+  promptGeneration: number
+  blockedAuditTurns: number
+  accountedMessageTokens: Record<string, number>
+  accountedMessageExact: Record<string, boolean>
+  accountedMessageOrder: string[]
+  continuationReservation: ContinuationReservation | null
   awaitingContinuationProgress: boolean
   continuationBaselineMessageID: string
   continuationBaselineSummary: string
@@ -105,10 +126,13 @@ const MAX_HISTORY_ENTRIES = 50
 const MAX_CHECKPOINTS = 8
 const CHECKPOINT_CHAR_LIMIT = 280
 const DEFAULT_NO_PROGRESS_TOKEN_THRESHOLD = 50
-const DEFAULT_MAX_NO_PROGRESS_TURNS = 2
+const DEFAULT_MAX_NO_PROGRESS_TURNS: number | null = null
 export const PLAN_MODE_STOP_REASON = "plan mode"
 export const PLAN_MODE_BLOCKER =
   "Goal execution is paused while the session is in Plan mode. Switch to Build mode and resume the goal to continue."
+export const USER_INTERRUPT_STOP_REASON = "user interrupt"
+export const USER_INTERRUPT_BLOCKER =
+  "Goal execution was paused because the user interrupted the active turn. Run /goal resume to continue."
 const NullableString = Schema.NullOr(Schema.String)
 const NullableNumber = Schema.NullOr(Schema.Number)
 const HistoryEntrySchema = Schema.Struct({
@@ -118,6 +142,9 @@ const HistoryEntrySchema = Schema.Struct({
     "paused",
     "resumed",
     "completed",
+    "blocked",
+    // Read-only migration compatibility with upstream state written before
+    // this fork aligned the public status name with native Codex.
     "unmet",
     "autoContinue",
     "checkpoint",
@@ -132,10 +159,16 @@ const CheckpointSchema = Schema.Struct({
   summary: Schema.String,
   timestamp: Schema.Number,
 })
+const ContinuationReservationSchema = Schema.Struct({
+  nonce: Schema.String,
+  promptGeneration: Schema.Number,
+  autoTurn: Schema.Number,
+  kind: Schema.Literal("continuation", "wrapup"),
+})
 const GoalSchema = Schema.Struct({
   sessionID: Schema.String,
   objective: Schema.String,
-  status: Schema.Literal("active", "paused", "budgetLimited", "usageLimited", "complete", "unmet"),
+  status: Schema.Literal("active", "paused", "blocked", "usageLimited", "budgetLimited", "complete", "unmet"),
   tokenBudget: NullableNumber,
   tokensUsed: Schema.Number,
   timeUsedSeconds: Schema.Number,
@@ -162,6 +195,20 @@ const GoalSchema = Schema.Struct({
   lastAssistantText: Schema.optionalWith(Schema.String, { default: () => "" }),
   lastAssistantMessageID: Schema.optionalWith(Schema.String, { default: () => "" }),
   lastPromptAgent: Schema.optionalWith(NullableString, { default: () => null }),
+  lastPromptModel: Schema.optionalWith(
+    Schema.NullOr(Schema.Struct({ providerID: Schema.String, modelID: Schema.String })),
+    { default: () => null },
+  ),
+  promptGeneration: Schema.optionalWith(Schema.Number, { default: () => 1 }),
+  blockedAuditTurns: Schema.optionalWith(Schema.Number, { default: () => 1 }),
+  accountedMessageTokens: Schema.optionalWith(Schema.Record({ key: Schema.String, value: Schema.Number }), {
+    default: () => ({}),
+  }),
+  accountedMessageExact: Schema.optionalWith(Schema.Record({ key: Schema.String, value: Schema.Boolean }), {
+    default: () => ({}),
+  }),
+  accountedMessageOrder: Schema.optionalWith(Schema.Array(Schema.String), { default: () => [] }),
+  continuationReservation: Schema.optionalWith(Schema.NullOr(ContinuationReservationSchema), { default: () => null }),
   awaitingContinuationProgress: Schema.optionalWith(Schema.Boolean, { default: () => false }),
   continuationBaselineMessageID: Schema.optionalWith(Schema.String, { default: () => "" }),
   continuationBaselineSummary: Schema.optionalWith(Schema.String, { default: () => "" }),
@@ -171,7 +218,15 @@ const StateSchema = Schema.Struct({
   goals: Schema.Record({ key: Schema.String, value: GoalSchema }),
 })
 
-export type GoalSnapshot = Omit<Goal, "lastAccountedAt" | "autoTurns" | "lastContinuationAt"> & {
+export type GoalSnapshot = Omit<
+  Goal,
+  | "lastAccountedAt"
+  | "autoTurns"
+  | "lastContinuationAt"
+  | "accountedMessageTokens"
+  | "accountedMessageExact"
+  | "accountedMessageOrder"
+> & {
   remainingTokens: number | null
   sampledAt: number
   autoTurns: number
@@ -182,7 +237,7 @@ function defaultStateFile() {
   const dataHome =
     process.env.XDG_DATA_HOME ||
     (process.platform === "win32" && process.env.APPDATA ? process.env.APPDATA : join(homedir(), ".local", "share"))
-  return join(dataHome, "opencode-goal-plugin", "goals.json")
+  return join(dataHome, "slash-goal-for-opencode", "goals.json")
 }
 
 export function statePath() {
@@ -199,6 +254,10 @@ function emptyState(): State {
 
 function isMissingStateFile(error: unknown) {
   return typeof error === "object" && error !== null && (error as NodeJS.ErrnoException).code === "ENOENT"
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null
 }
 
 function mutableState(state: Schema.Schema.Type<typeof StateSchema>): State {
@@ -237,12 +296,31 @@ function writeStateEffect(state: State) {
       const file = statePath()
       await mkdir(dirname(file), { recursive: true, mode: 0o700 })
       const tmp = `${file}.${process.pid}.${Date.now()}.tmp`
-      await writeFile(tmp, JSON.stringify(state, null, 2) + "\n", { mode: 0o600 })
-      await rename(tmp, file)
-      await chmod(file, 0o600).catch(() => undefined)
+      try {
+        await writeFile(tmp, JSON.stringify(state, null, 2) + "\n", { mode: 0o600 })
+        await renameWithRetry(tmp, file)
+        if (process.platform !== "win32") await chmod(file, 0o600)
+      } catch (error) {
+        await unlink(tmp).catch(() => undefined)
+        throw error
+      }
     },
     catch: (cause) => new StateWriteError({ cause }),
   })
+}
+
+async function renameWithRetry(from: string, to: string) {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await rename(from, to)
+      return
+    } catch (error) {
+      const code = isRecord(error) && typeof error.code === "string" ? error.code : ""
+      const transientWindowsError = process.platform === "win32" && ["EACCES", "EBUSY", "EPERM"].includes(code)
+      if (!transientWindowsError || attempt >= 7) throw error
+      await new Promise((resolve) => setTimeout(resolve, 10 * 2 ** attempt))
+    }
+  }
 }
 
 async function readState(): Promise<State> {
@@ -261,8 +339,73 @@ function readStateSync(): State {
 
 let mutationQueue: Promise<void> = Promise.resolve()
 
+const STATE_LOCK_WAIT_MS = 15_000
+const STATE_LOCK_BUSY_TIMEOUT_MS = 50
+
+async function withStateFileLock<T>(operation: () => Promise<T>) {
+  const file = statePath()
+  const lock = `${file}.lock.sqlite`
+  await mkdir(dirname(file), { recursive: true, mode: 0o700 })
+  const database = new Database(lock, { create: true, strict: true })
+  const deadline = Date.now() + STATE_LOCK_WAIT_MS
+  database.exec(`PRAGMA busy_timeout = ${STATE_LOCK_BUSY_TIMEOUT_MS}`)
+
+  let transactionOpen = false
+  try {
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        // SQLite's write transaction is the cross-process mutex. The OS drops
+        // it automatically if an owner crashes, so stale recovery never needs
+        // a stat/unlink race and a previous owner cannot release a successor.
+        database.exec("BEGIN IMMEDIATE")
+        transactionOpen = true
+        break
+      } catch (error) {
+        if (transactionOpen) {
+          database.exec("ROLLBACK")
+          transactionOpen = false
+        }
+        if (!isSqliteBusy(error) || Date.now() >= deadline) {
+          if (isSqliteBusy(error)) throw new Error(`timed out waiting for goal state lock: ${lock}`, { cause: error })
+          throw error
+        }
+        await new Promise((resolve) => setTimeout(resolve, Math.min(100, 5 * 2 ** Math.min(attempt, 5))))
+      }
+    }
+
+    try {
+      const result = await operation()
+      // COMMIT releases only this connection's transaction. There is no shared
+      // lock record to unlink, so an old owner cannot release a newer owner.
+      database.exec("COMMIT")
+      transactionOpen = false
+      return result
+    } catch (error) {
+      if (transactionOpen) {
+        database.exec("ROLLBACK")
+        transactionOpen = false
+      }
+      throw error
+    }
+  } finally {
+    if (transactionOpen) database.exec("ROLLBACK")
+    database.close()
+  }
+}
+
+function isSqliteBusy(error: unknown) {
+  if (!isRecord(error)) return false
+  return error.code === "SQLITE_BUSY" || error.code === "SQLITE_LOCKED" || error.errno === 5 || error.errno === 6
+}
+
+/** @internal Test seam for deterministic cross-process lock contention. */
+export async function withStateFileLockForTest<T>(operation: () => Promise<T>) {
+  return withStateFileLock(operation)
+}
+
 function enqueueMutation<T>(operation: () => Promise<T>) {
-  const current = mutationQueue.then(operation, operation)
+  const locked = () => withStateFileLock(operation)
+  const current = mutationQueue.then(locked, locked)
   mutationQueue = current.then(
     () => undefined,
     () => undefined,
@@ -306,12 +449,42 @@ function normalizeState(state: State): State {
 }
 
 function normalizeGoal(goal: Goal) {
+  if ((goal.status as string) === "unmet") goal.status = "blocked"
+  goal.history = (goal.history ?? []).map((entry) =>
+    (entry.type as string) === "unmet" ? { ...entry, type: "blocked" as const } : entry,
+  )
   goal.history = (goal.history ?? []).slice(-MAX_HISTORY_ENTRIES)
   goal.checkpoints = (goal.checkpoints ?? []).slice(-MAX_CHECKPOINTS)
   goal.lastCheckpoint = goal.lastCheckpoint ?? goal.checkpoints.at(-1) ?? null
   goal.lastAssistantText ??= ""
   goal.lastAssistantMessageID ??= ""
   goal.lastPromptAgent ??= null
+  goal.lastPromptModel ??= null
+  goal.promptGeneration = Math.max(1, nonNegativeInteger(goal.promptGeneration, 1))
+  goal.blockedAuditTurns = Math.max(1, nonNegativeInteger(goal.blockedAuditTurns, 1))
+  goal.accountedMessageTokens = Object.fromEntries(
+    Object.entries(goal.accountedMessageTokens ?? {})
+      .filter(([messageID, tokens]) => Boolean(messageID) && Number.isFinite(tokens) && tokens >= 0)
+      .map(([messageID, tokens]) => [messageID, Math.floor(tokens)]),
+  )
+  const orderedMessageIDs: string[] = []
+  const orderedSet = new Set<string>()
+  for (const messageID of goal.accountedMessageOrder ?? []) {
+    if (typeof messageID !== "string" || !(messageID in goal.accountedMessageTokens) || orderedSet.has(messageID)) continue
+    orderedMessageIDs.push(messageID)
+    orderedSet.add(messageID)
+  }
+  for (const messageID of Object.keys(goal.accountedMessageTokens)) {
+    if (!orderedSet.has(messageID)) {
+      orderedMessageIDs.push(messageID)
+      orderedSet.add(messageID)
+    }
+  }
+  goal.accountedMessageOrder = orderedMessageIDs
+  goal.accountedMessageExact = Object.fromEntries(
+    Object.keys(goal.accountedMessageTokens).map((messageID) => [messageID, goal.accountedMessageExact?.[messageID] === true]),
+  )
+  goal.continuationReservation = normalizeContinuationReservation(goal.continuationReservation)
   goal.awaitingContinuationProgress = goal.awaitingContinuationProgress === true
   goal.continuationBaselineMessageID ??= ""
   goal.continuationBaselineSummary ??= ""
@@ -326,6 +499,13 @@ function normalizeGoal(goal: Goal) {
   return goal
 }
 
+function normalizeContinuationReservation(value: ContinuationReservation | null | undefined) {
+  if (!value || !value.nonce.trim()) return null
+  const promptGeneration = Math.max(1, nonNegativeInteger(value.promptGeneration, 1))
+  const autoTurn = nonNegativeInteger(value.autoTurn, 0)
+  return { nonce: value.nonce, promptGeneration, autoTurn, kind: value.kind } satisfies ContinuationReservation
+}
+
 function normalizeCreateOptions(input?: number | null | CreateGoalOptions): Required<CreateGoalOptions> {
   if (typeof input === "number" || input === null) {
     return {
@@ -335,6 +515,10 @@ function normalizeCreateOptions(input?: number | null | CreateGoalOptions): Requ
       noProgressTokenThreshold: DEFAULT_NO_PROGRESS_TOKEN_THRESHOLD,
       maxNoProgressTurns: DEFAULT_MAX_NO_PROGRESS_TURNS,
       agent: null,
+      model: null,
+      accountingMessageID: null,
+      accountingMessageTokens: null,
+      accountingMessageAccuracy: null,
       initialStatus: "active",
     }
   }
@@ -345,6 +529,22 @@ function normalizeCreateOptions(input?: number | null | CreateGoalOptions): Requ
     noProgressTokenThreshold: positiveIntegerOrNull(input?.noProgressTokenThreshold) ?? DEFAULT_NO_PROGRESS_TOKEN_THRESHOLD,
     maxNoProgressTurns: positiveIntegerOrNull(input?.maxNoProgressTurns) ?? DEFAULT_MAX_NO_PROGRESS_TURNS,
     agent: typeof input?.agent === "string" && input.agent.trim() ? input.agent.trim() : null,
+    model:
+      input?.model && input.model.providerID.trim() && input.model.modelID.trim()
+        ? { providerID: input.model.providerID.trim(), modelID: input.model.modelID.trim() }
+        : null,
+    accountingMessageID:
+      typeof input?.accountingMessageID === "string" && input.accountingMessageID.trim()
+        ? input.accountingMessageID.trim()
+        : null,
+    accountingMessageTokens:
+      typeof input?.accountingMessageTokens === "number" && Number.isFinite(input.accountingMessageTokens)
+        ? Math.max(0, Math.floor(input.accountingMessageTokens))
+        : null,
+    accountingMessageAccuracy:
+      input?.accountingMessageAccuracy === "estimated" || input?.accountingMessageAccuracy === "exact"
+        ? input.accountingMessageAccuracy
+        : null,
     initialStatus: input?.initialStatus === "paused" ? "paused" : "active",
   }
 }
@@ -358,7 +558,7 @@ function nonNegativeInteger(value: unknown, fallback: number) {
 }
 
 function isClosed(status: GoalStatus) {
-  return status === "complete" || status === "unmet"
+  return status === "complete"
 }
 
 function canContinue(status: GoalStatus) {
@@ -402,6 +602,10 @@ export function snapshot(goal: Goal): GoalSnapshot {
     lastAssistantText: goal.lastAssistantText,
     lastAssistantMessageID: goal.lastAssistantMessageID,
     lastPromptAgent: goal.lastPromptAgent,
+    lastPromptModel: goal.lastPromptModel,
+    promptGeneration: goal.promptGeneration,
+    blockedAuditTurns: goal.blockedAuditTurns,
+    continuationReservation: goal.continuationReservation,
     awaitingContinuationProgress: goal.awaitingContinuationProgress,
     continuationBaselineMessageID: goal.continuationBaselineMessageID,
     continuationBaselineSummary: goal.continuationBaselineSummary,
@@ -464,6 +668,22 @@ export async function createGoal(sessionID: string, objective: string, options?:
       lastAssistantText: "",
       lastAssistantMessageID: "",
       lastPromptAgent: normalizedOptions.agent,
+      lastPromptModel: normalizedOptions.model,
+      promptGeneration: 1,
+      blockedAuditTurns: 1,
+      accountedMessageTokens:
+        normalizedOptions.accountingMessageID && normalizedOptions.accountingMessageTokens != null
+          ? { [normalizedOptions.accountingMessageID]: normalizedOptions.accountingMessageTokens }
+          : {},
+      accountedMessageExact:
+        normalizedOptions.accountingMessageID && normalizedOptions.accountingMessageTokens != null
+          ? { [normalizedOptions.accountingMessageID]: normalizedOptions.accountingMessageAccuracy !== "estimated" }
+          : {},
+      accountedMessageOrder:
+        normalizedOptions.accountingMessageID && normalizedOptions.accountingMessageTokens != null
+          ? [normalizedOptions.accountingMessageID]
+          : [],
+      continuationReservation: null,
       awaitingContinuationProgress: false,
       continuationBaselineMessageID: "",
       continuationBaselineSummary: "",
@@ -497,6 +717,14 @@ export async function updateGoalObjective(
     goal.closedAt = null
     goal.stopReason = planModePause ? PLAN_MODE_STOP_REASON : null
     goal.budgetWrapupSent = false
+    goal.blockedAuditTurns = 1
+    goal.continuationFailures = 0
+    goal.noProgressTurns = 0
+    goal.continuationReservation = null
+    goal.awaitingContinuationProgress = false
+    goal.continuationBaselineMessageID = ""
+    goal.continuationBaselineSummary = ""
+    goal.lastContinuationAt = null
     if (agent) goal.lastPromptAgent = agent
     goal.lastStatus = planModePause
       ? "Goal objective updated; execution paused while the session is in Plan mode."
@@ -522,11 +750,57 @@ export async function recordPromptAgent(sessionID: string, agent: string) {
   })
 }
 
+export async function recordPromptRuntime(
+  sessionID: string,
+  input: { agent?: string | null; model?: GoalModel | null; countGoalTurn?: boolean },
+) {
+  const agent = typeof input.agent === "string" && input.agent.trim() ? input.agent.trim() : null
+  const model =
+    input.model && input.model.providerID.trim() && input.model.modelID.trim()
+      ? { providerID: input.model.providerID.trim(), modelID: input.model.modelID.trim() }
+      : null
+  return mutate((state) => {
+    const goal = state.goals[sessionID]
+    if (!goal || isClosed(goal.status)) return goal ? snapshot(goal) : null
+    if (goal.continuationReservation) cancelReservation(goal, goal.continuationReservation)
+    goal.awaitingContinuationProgress = false
+    if (agent) goal.lastPromptAgent = agent
+    if (model) goal.lastPromptModel = model
+    goal.promptGeneration += 1
+    if (input.countGoalTurn === true && goal.status === "active") goal.blockedAuditTurns += 1
+    goal.updatedAt = nowSeconds()
+    return snapshot(goal)
+  })
+}
+
+export async function recordContinuationPromptRuntime(
+  sessionID: string,
+  reservation: ContinuationReservation,
+  input: { agent?: string | null; model?: GoalModel | null; countGoalTurn?: boolean },
+) {
+  const agent = typeof input.agent === "string" && input.agent.trim() ? input.agent.trim() : null
+  const model =
+    input.model && input.model.providerID.trim() && input.model.modelID.trim()
+      ? { providerID: input.model.providerID.trim(), modelID: input.model.modelID.trim() }
+      : null
+  return mutate((state) => {
+    const goal = state.goals[sessionID]
+    if (!goal || !sameReservation(goal.continuationReservation, reservation)) return goal ? snapshot(goal) : null
+    if (agent) goal.lastPromptAgent = agent
+    if (model) goal.lastPromptModel = model
+    if (input.countGoalTurn === true && goal.status === "active") goal.blockedAuditTurns += 1
+    goal.updatedAt = nowSeconds()
+    return snapshot(goal)
+  })
+}
+
 export async function pauseGoalForPlanMode(sessionID: string) {
   return mutate((state) => {
     const goal = state.goals[sessionID]
     if (!goal || goal.status !== "active") return goal ? snapshot(goal) : null
     accountWallClock(goal)
+    goal.continuationReservation = null
+    goal.awaitingContinuationProgress = false
     goal.status = "paused"
     goal.lastAccountedAt = null
     goal.stopReason = PLAN_MODE_STOP_REASON
@@ -552,6 +826,16 @@ export async function setGoalStatus(sessionID: string, status: MutableGoalStatus
     goal.stopReason = status === "active" ? null : "paused"
     goal.budgetWrapupSent = status === "active" ? false : goal.budgetWrapupSent
     goal.blocker = status === "active" ? null : goal.blocker
+    goal.continuationReservation = null
+    if (status !== "active") goal.awaitingContinuationProgress = false
+    if (status === "active") {
+      goal.blockedAuditTurns = 1
+      goal.closedAt = null
+      goal.completionEvidence = null
+      goal.awaitingContinuationProgress = false
+      goal.continuationBaselineMessageID = ""
+      goal.continuationBaselineSummary = ""
+    }
     if (agentValue) goal.lastPromptAgent = agentValue
     goal.lastStatus = status === "active" ? "Goal resumed." : "Goal paused."
     pushHistory(goal, status === "active" ? "resumed" : "paused", goal.lastStatus)
@@ -564,11 +848,11 @@ export async function closeGoal(
   input:
     | {
         status: "complete"
-        evidence: string
+        evidence?: string
       }
-    | {
-        status: "unmet"
-        blocker: string
+      | {
+        status: "blocked"
+        blocker?: string
       },
 ) {
   return mutate((state) => {
@@ -580,29 +864,62 @@ export async function closeGoal(
     goal.updatedAt = now
     goal.closedAt = now
     goal.lastAccountedAt = null
+    goal.continuationReservation = null
+    goal.awaitingContinuationProgress = false
     goal.stopReason = input.status === "complete" ? null : "blocked"
     if (input.status === "complete") {
-      goal.completionEvidence = validateEvidence(input.evidence, "completion evidence")
+      goal.completionEvidence = input.evidence?.trim() ? validateEvidence(input.evidence, "completion evidence") : null
       goal.blocker = null
       goal.lastStatus = "Goal completed."
       pushHistory(goal, "completed", goal.completionEvidence)
     } else {
-      goal.blocker = validateEvidence(input.blocker, "blocker")
+      if (goal.blockedAuditTurns < 3) {
+        throw new Error(
+          `cannot mark the goal blocked before the blocker has repeated for at least three consecutive goal turns (${goal.blockedAuditTurns}/3)`,
+        )
+      }
+      goal.blocker = input.blocker?.trim() ? validateEvidence(input.blocker, "blocker") : "Blocked after the required three-turn audit."
       goal.completionEvidence = null
-      goal.lastStatus = "Goal marked unmet."
-      pushHistory(goal, "unmet", goal.blocker)
+      goal.lastStatus = "Goal marked blocked."
+      pushHistory(goal, "blocked", goal.blocker)
     }
     return snapshot(goal)
   })
 }
 
-export async function completeGoal(sessionID: string, evidence: string) {
+export async function completeGoal(sessionID: string, evidence?: string) {
   return closeGoal(sessionID, { status: "complete", evidence })
 }
 
-export async function markGoalUnmet(sessionID: string, blocker: string) {
-  return closeGoal(sessionID, { status: "unmet", blocker })
+export async function markGoalBlocked(sessionID: string, blocker?: string) {
+  return closeGoal(sessionID, { status: "blocked", blocker })
 }
+
+export async function pauseGoalForUserInterrupt(sessionID: string, detail?: string) {
+  return mutate((state) => {
+    const goal = state.goals[sessionID]
+    if (!goal || (goal.status !== "active" && goal.status !== "budgetLimited")) {
+      return goal ? snapshot(goal) : null
+    }
+    accountWallClock(goal)
+    goal.status = "paused"
+    goal.updatedAt = nowSeconds()
+    goal.lastAccountedAt = null
+    goal.stopReason = USER_INTERRUPT_STOP_REASON
+    goal.blocker = USER_INTERRUPT_BLOCKER
+    goal.continuationReservation = null
+    goal.awaitingContinuationProgress = false
+    goal.continuationBaselineMessageID = ""
+    goal.continuationBaselineSummary = ""
+    const reason = summarizeText(detail ?? "", 400)
+    goal.lastStatus = reason ? `Goal paused after user interruption: ${reason}` : "Goal paused after user interruption."
+    pushHistory(goal, "paused", goal.lastStatus)
+    return snapshot(goal)
+  })
+}
+
+/** @deprecated Internal compatibility alias; the persisted/native status is blocked. */
+export const markGoalUnmet = markGoalBlocked
 
 export async function clearGoal(sessionID: string) {
   return mutate((state) => {
@@ -622,6 +939,88 @@ export async function accountUsage(sessionID: string, tokensUsed?: number) {
     }
     maybeStopForBudget(goal)
     goal.updatedAt = nowSeconds()
+    return snapshot(goal)
+  })
+}
+
+/**
+ * Account the cumulative uncached-input + output usage for one assistant
+ * message. OpenCode may report the same message repeatedly while it streams;
+ * persisting per-message totals makes those observations idempotent across
+ * events, compaction, and process restarts.
+ */
+export async function accountMessageUsage(
+  sessionID: string,
+  messageID: string,
+  messageTokens: number,
+  accuracy: MessageUsageAccuracy = "exact",
+) {
+  const id = messageID.trim()
+  const total = Number.isFinite(messageTokens) ? Math.max(0, Math.floor(messageTokens)) : 0
+  if (!id) return null
+  return mutate((state) => {
+    const goal = state.goals[sessionID]
+    if (!goal || (goal.status !== "active" && goal.status !== "budgetLimited")) {
+      return goal ? snapshot(goal) : null
+    }
+    accountWallClock(goal)
+    const alreadyAccounted = Object.hasOwn(goal.accountedMessageTokens, id)
+    const previous = alreadyAccounted ? goal.accountedMessageTokens[id]! : 0
+    const previousWasExact = goal.accountedMessageExact[id] === true
+    const shouldReplace =
+      !alreadyAccounted ||
+      (accuracy === "exact" && (!previousWasExact || total > previous)) ||
+      (accuracy === "estimated" && !previousWasExact && total > previous)
+    if (shouldReplace) {
+      goal.tokensUsed = Math.max(0, goal.tokensUsed + total - previous)
+      goal.accountedMessageTokens[id] = total
+      goal.accountedMessageExact[id] = accuracy === "exact"
+    }
+    if (!goal.accountedMessageOrder.includes(id)) goal.accountedMessageOrder.push(id)
+    restoreGoalAfterBudgetCorrection(goal)
+    maybeStopForBudget(goal)
+    goal.updatedAt = nowSeconds()
+    return snapshot(goal)
+  })
+}
+
+export async function cancelContinuationReservation(sessionID: string, reservation: ContinuationReservation) {
+  return mutate((state) => {
+    const goal = state.goals[sessionID]
+    if (!goal || !cancelReservation(goal, reservation)) {
+      return goal ? snapshot(goal) : null
+    }
+    goal.lastStatus = "Stale auto-continue cancelled because a newer prompt started."
+    goal.updatedAt = nowSeconds()
+    return snapshot(goal)
+  })
+}
+
+export async function stopGoalForRuntimeError(
+  sessionID: string,
+  status: "blocked" | "usageLimited",
+  detail: string,
+) {
+  return mutate((state) => {
+    const goal = state.goals[sessionID]
+    if (!goal || (goal.status !== "active" && goal.status !== "budgetLimited")) {
+      return goal ? snapshot(goal) : null
+    }
+    accountWallClock(goal)
+    const now = nowSeconds()
+    const reason = summarizeText(detail, 1000) || (status === "usageLimited" ? "Usage limit reached." : "Goal turn failed.")
+    goal.status = status
+    goal.updatedAt = now
+    goal.closedAt = now
+    goal.lastAccountedAt = null
+    goal.stopReason = status === "usageLimited" ? "usage limit" : "turn error"
+    goal.blocker = reason
+    goal.continuationReservation = null
+    goal.awaitingContinuationProgress = false
+    goal.continuationBaselineMessageID = ""
+    goal.continuationBaselineSummary = ""
+    goal.lastStatus = status === "usageLimited" ? "Goal stopped by a usage limit." : "Goal stopped after a turn error."
+    pushHistory(goal, status === "usageLimited" ? "limited" : "error", reason)
     return snapshot(goal)
   })
 }
@@ -658,7 +1057,7 @@ export async function recordAssistantProgress(sessionID: string, input: Assistan
       goal.awaitingContinuationProgress = false
       const lowOutput = outputTokens > 0 && outputTokens < (threshold ?? DEFAULT_NO_PROGRESS_TOKEN_THRESHOLD)
       const changedSinceContinuation = Boolean(summary && summary !== goal.continuationBaselineSummary)
-      if (lowOutput && !changedSinceContinuation) {
+      if (maxNoProgressTurns != null && lowOutput && !changedSinceContinuation) {
         goal.noProgressTurns += 1
         if (maxNoProgressTurns && goal.noProgressTurns >= maxNoProgressTurns) {
           accountWallClock(goal)
@@ -682,10 +1081,17 @@ export async function recordAssistantProgress(sessionID: string, input: Assistan
   })
 }
 
-export async function reserveContinuation(sessionID: string, maxAutoTurns: number, minIntervalSeconds: number) {
+export async function reserveContinuation(
+  sessionID: string,
+  maxAutoTurns: number,
+  minIntervalSeconds: number,
+  expectedPromptGeneration?: number,
+) {
   return mutate((state) => {
     const goal = state.goals[sessionID]
     if (!goal) return null
+    if (expectedPromptGeneration != null && goal.promptGeneration !== expectedPromptGeneration) return null
+    if (goal.continuationReservation) return null
     if (goal.status === "budgetLimited" || goal.status === "usageLimited") return reserveWrapup(goal)
     if (!canContinue(goal.status)) return null
     const now = nowSeconds()
@@ -699,6 +1105,7 @@ export async function reserveContinuation(sessionID: string, maxAutoTurns: numbe
     // continuation prompt was actually delivered.
     goal.continuationBaselineMessageID = goal.lastAssistantMessageID
     goal.continuationBaselineSummary = summarizeText(goal.lastAssistantText)
+    goal.continuationReservation = newContinuationReservation(goal, "continuation")
     goal.lastStatus = `Auto-continue ${goal.autoTurns} reserved.`
     pushHistory(goal, "autoContinue", goal.lastStatus)
     goal.updatedAt = now
@@ -706,15 +1113,28 @@ export async function reserveContinuation(sessionID: string, maxAutoTurns: numbe
   })
 }
 
-export async function recordContinuationResult(sessionID: string, result: "success" | "failure", maxFailures: number) {
+export async function recordContinuationResult(
+  sessionID: string,
+  reservation: ContinuationReservation,
+  result: "success" | "failure",
+  maxFailures: number,
+) {
   return mutate((state) => {
     const goal = state.goals[sessionID]
-    if (!goal || isClosed(goal.status)) return goal ? snapshot(goal) : null
+    if (
+      !goal ||
+      isClosed(goal.status) ||
+      !sameReservation(goal.continuationReservation, reservation) ||
+      goal.promptGeneration !== reservation.promptGeneration
+    ) {
+      return goal ? snapshot(goal) : null
+    }
     const now = nowSeconds()
     goal.updatedAt = now
+    goal.continuationReservation = null
     if (result === "success") {
       goal.continuationFailures = 0
-      if (goal.status === "active") {
+      if (goal.status === "active" && reservation.kind === "continuation") {
         goal.lastStatus = "Auto-continue prompt sent."
         goal.awaitingContinuationProgress = true
       }
@@ -738,11 +1158,52 @@ export async function recordContinuationResult(sessionID: string, result: "succe
 }
 
 function reserveWrapup(goal: Goal) {
-  if (goal.budgetWrapupSent) return null
+  if (goal.budgetWrapupSent || goal.continuationReservation) return null
   goal.budgetWrapupSent = true
+  goal.continuationReservation = newContinuationReservation(goal, "wrapup")
   goal.updatedAt = nowSeconds()
   pushHistory(goal, "limited", `${goal.status}: ${goal.stopReason ?? "goal limit reached"}; requested final handoff.`)
   return snapshot(goal)
+}
+
+function newContinuationReservation(goal: Goal, kind: ContinuationReservation["kind"]): ContinuationReservation {
+  return {
+    nonce: randomUUID(),
+    promptGeneration: goal.promptGeneration,
+    autoTurn: goal.autoTurns,
+    kind,
+  }
+}
+
+function sameReservation(
+  current: ContinuationReservation | null | undefined,
+  expected: ContinuationReservation | null | undefined,
+) {
+  return (
+    current != null &&
+    expected != null &&
+    current.nonce === expected.nonce &&
+    current.promptGeneration === expected.promptGeneration &&
+    current.autoTurn === expected.autoTurn &&
+    current.kind === expected.kind
+  )
+}
+
+function cancelReservation(goal: Goal, reservation: ContinuationReservation) {
+  if (!sameReservation(goal.continuationReservation, reservation)) return false
+  goal.continuationReservation = null
+  goal.awaitingContinuationProgress = false
+  goal.continuationBaselineMessageID = ""
+  goal.continuationBaselineSummary = ""
+  if (reservation.kind === "continuation" && goal.autoTurns === reservation.autoTurn) {
+    goal.autoTurns = Math.max(0, goal.autoTurns - 1)
+    goal.lastContinuationAt = null
+    const last = goal.history.at(-1)
+    if (last?.type === "autoContinue" && last.detail === `Auto-continue ${reservation.autoTurn} reserved.`) goal.history.pop()
+  } else if (reservation.kind === "wrapup") {
+    goal.budgetWrapupSent = false
+  }
+  return true
 }
 
 function maybeStopForBudget(goal: Goal) {
@@ -754,6 +1215,19 @@ function maybeStopForBudget(goal: Goal) {
   goal.stopReason = `token budget reached (${goal.tokensUsed}/${goal.tokenBudget})`
   goal.lastStatus = `${goal.stopReason}; wrap-up required.`
   pushHistory(goal, "limited", goal.lastStatus)
+}
+
+function restoreGoalAfterBudgetCorrection(goal: Goal) {
+  if (goal.status !== "budgetLimited" || goal.tokenBudget == null || goal.tokensUsed >= goal.tokenBudget) return
+  goal.status = "active"
+  goal.lastAccountedAt = nowSeconds()
+  goal.stopReason = null
+  goal.blocker = null
+  goal.closedAt = null
+  goal.budgetWrapupSent = false
+  goal.continuationReservation = null
+  goal.lastStatus = `Exact message usage corrected the goal below its token budget (${goal.tokensUsed}/${goal.tokenBudget}).`
+  pushHistory(goal, "updated", goal.lastStatus)
 }
 
 function maybeStopForUsageLimit(goal: Goal, defaultMaxAutoTurns: number, now = nowSeconds()) {
@@ -815,7 +1289,7 @@ function goalLimitSummary(goal: Goal) {
     goal.maxAutoTurns == null ? null : `${goal.maxAutoTurns} auto-continue limit`,
     goal.maxDurationSeconds == null ? null : `${goal.maxDurationSeconds}s duration limit`,
   ].filter(Boolean)
-  return limits.length ? `Goal set with ${limits.join(", ")}.` : "Goal set with default continuation limits."
+  return limits.length ? `Goal set with ${limits.join(", ")}.` : "Goal set."
 }
 
 export function estimateTokensFromText(text: string) {
@@ -834,6 +1308,9 @@ export function formatGoal(goal: GoalSnapshot | null) {
   if (goal.remainingTokens != null) lines.push(`Tokens remaining: ${goal.remainingTokens}`)
   if (goal.maxDurationSeconds != null) lines.push(`Duration limit: ${goal.maxDurationSeconds}s`)
   if (goal.noProgressTurns > 0) lines.push(`No-progress turns: ${goal.noProgressTurns}`)
+  lines.push(`Blocked-audit turns: ${goal.blockedAuditTurns}/3`)
+  if (goal.lastPromptAgent) lines.push(`Pinned agent: ${goal.lastPromptAgent}`)
+  if (goal.lastPromptModel) lines.push(`Pinned model: ${goal.lastPromptModel.providerID}/${goal.lastPromptModel.modelID}`)
   if (goal.lastCheckpoint) lines.push(`Latest checkpoint: ${goal.lastCheckpoint.summary}`)
   if (goal.lastStatus) lines.push(`Last status: ${goal.lastStatus}`)
   if (goal.stopReason) lines.push(`Stop reason: ${goal.stopReason}`)

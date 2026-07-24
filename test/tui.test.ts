@@ -84,7 +84,7 @@ test("tui plugin registers goal sidebar and status command without hijacking /go
   expect(typeof sidebar?.({}, { session_id: "session" })).not.toBe("string")
 })
 
-test("reads goal state from pause and resume tool output", () => {
+test("reads goal state from native get_goal output", () => {
   const snapshot = goal({ status: "paused", objective: "paused goal", lastStatus: "Goal paused." })
   const api = {
     state: {
@@ -97,7 +97,7 @@ test("reads goal state from pause and resume tool output", () => {
         return [
           {
             type: "tool",
-            tool: "update_goal_status",
+            tool: "get_goal",
             state: { status: "completed", output: JSON.stringify({ goal: snapshot }) },
           },
         ]
@@ -268,7 +268,7 @@ test("restores the goal indicator from persistent tui cache when message history
   expect(goalStateFromSession(api as never, "kv-cache-session").goal?.objective).toBe("persisted goal")
 })
 
-test("clears the cached goal after clear_goal completes", () => {
+test("clears the cached goal after get_goal reports no goal", () => {
   const snapshot = goal({ sessionID: "clear-cache-session", objective: "goal to clear" })
   const messages = [{ id: "created" }]
   const partsByMessage = new Map([
@@ -299,7 +299,9 @@ test("clears the cached goal after clear_goal completes", () => {
   expect(goalStateFromSession(api as never, "clear-cache-session").goal?.objective).toBe("goal to clear")
 
   messages.push({ id: "cleared" })
-  partsByMessage.set("cleared", [{ type: "tool", tool: "clear_goal", state: { status: "completed", output: "" } }])
+  partsByMessage.set("cleared", [
+    { type: "tool", tool: "get_goal", state: { status: "completed", output: JSON.stringify({ goal: null }) } },
+  ])
 
   expect(goalStateFromSession(api as never, "clear-cache-session").goal).toBeNull()
 })

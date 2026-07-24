@@ -1,6 +1,6 @@
-# Contributing to OpenCode Goal Plugin
+# Contributing to slash/goal for OpenCode
 
-Thanks for your interest in improving `@prevalentware/opencode-goal-plugin`. This guide explains how to set up the project, make changes, and get them merged.
+Thanks for your interest in improving `slash-goal-for-opencode`. This guide explains how to set up the project, make changes, and prepare them for review.
 
 ## Prerequisites
 
@@ -10,8 +10,8 @@ Thanks for your interest in improving `@prevalentware/opencode-goal-plugin`. Thi
 ## Getting started
 
 ```bash
-git clone https://github.com/prevalentWare/opencode-goal-plugin.git
-cd opencode-goal-plugin
+git clone <your-fork-url>
+cd slash-goal-for-opencode
 bun install
 ```
 
@@ -31,7 +31,7 @@ Useful scripts:
 - `src/server.ts` — OpenCode server hooks, goal tools, auto-continuation.
 - `src/state.ts` — persistent goal state, budgets, history, checkpoints.
 - `src/prompts.ts` — continuation, wrap-up, and system reminder prompts.
-- `src/tui.tsx` — terminal UI goal indicator and command palette entry.
+- `src/tui.ts` — terminal UI goal indicator and command palette entry.
 - `test/` — Bun test suites mirroring the source modules.
 - `CONTEXT.md` — shared domain vocabulary for goal-mode behavior.
 
@@ -51,7 +51,7 @@ Useful scripts:
 
 ## Reporting bugs and requesting features
 
-Use the [issue templates](https://github.com/prevalentWare/opencode-goal-plugin/issues/new/choose). Include your OpenCode version, plugin version, install method, and reproduction steps for bugs.
+Use this repository's issue templates after the publication remote exists. Include your OpenCode version, plugin version, install method, and reproduction steps for bugs.
 
 For security issues, do not open a public issue — see [SECURITY.md](SECURITY.md).
 

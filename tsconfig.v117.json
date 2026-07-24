@@ -1,0 +1,11 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "baseUrl": ".",
+    "ignoreDeprecations": "6.0",
+    "paths": {
+      "@opencode-ai/plugin": ["node_modules/opencode-plugin-v117/dist/index.d.ts"],
+      "@opencode-ai/plugin/*": ["node_modules/opencode-plugin-v117/dist/*"]
+    }
+  }
+}

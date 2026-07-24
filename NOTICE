@@ -1,0 +1,20 @@
+slash/goal for OpenCode
+Copyright (c) 2026 slash/goal for OpenCode contributors
+
+This project is derived from:
+
+  OpenCode Goal Plugin
+  https://github.com/prevalentWare/opencode-goal-plugin
+  Copyright (c) 2026 Prevalentware
+  Licensed under the MIT License included in LICENSE.
+
+The upstream Git history and MIT copyright/license notice are preserved.
+
+Material modifications in this fork include the slash/goal for OpenCode name,
+the native Codex three-tool/status contract, deterministic slash-command state
+controls, strict completion and three-turn blocked steering, unbounded default
+continuation, provider/model pinning, Windows persistence hardening, OpenCode
+1.17/1.18 compatibility work, and corresponding tests/documentation.
+
+The OpenAI Codex project is used as a behavioral reference. This project is
+not affiliated with or endorsed by OpenAI, OpenCode, or Prevalentware.

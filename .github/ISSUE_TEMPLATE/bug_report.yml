@@ -8,7 +8,7 @@ body:
       value: |
         Thanks for taking the time to report a bug. Please fill in as much detail as you can — reproduction steps and environment info make fixes much faster.
 
-        If you believe this is a security issue, please do NOT file a public issue. Follow [SECURITY.md](https://github.com/prevalentWare/opencode-goal-plugin/blob/main/SECURITY.md) instead.
+        If you believe this is a security issue, please do NOT file a public issue. Follow the private-reporting instructions in the repository's SECURITY.md instead.
   - type: textarea
     id: description
     attributes:
@@ -30,7 +30,7 @@ body:
       label: Steps to reproduce
       description: Minimal steps to trigger the problem.
       placeholder: |
-        1. Install the plugin with `opencode plugin @prevalentware/opencode-goal-plugin`
+        1. Install this checkout using the local-plugin instructions in `README.md`
         2. Create a goal with `/goal ...`
         3. ...
     validations:
@@ -39,7 +39,7 @@ body:
     id: plugin-version
     attributes:
       label: Plugin version
-      placeholder: e.g. 0.1.21
+      placeholder: e.g. 0.1.0
     validations:
       required: true
   - type: input
@@ -53,7 +53,7 @@ body:
     id: os
     attributes:
       label: Operating system
-      placeholder: e.g. macOS 15, Ubuntu 24.04
+      placeholder: e.g. Windows 11, macOS 15, Ubuntu 24.04
   - type: input
     id: model
     attributes:

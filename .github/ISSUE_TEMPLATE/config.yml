@@ -1,5 +1,1 @@
 blank_issues_enabled: true
-contact_links:
-  - name: Security vulnerability
-    url: https://github.com/prevalentWare/opencode-goal-plugin/security/advisories/new
-    about: Please report security issues privately through a GitHub security advisory.

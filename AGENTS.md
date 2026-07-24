@@ -1,29 +1,34 @@
 # Agent Notes
 
-## Project Shape
+## Project shape
 
-This package is an OpenCode plugin with separate server and TUI entrypoints:
+`slash-goal-for-opencode` is an OpenCode v1 plugin with separate server and TUI entrypoints:
 
-- `src/server.ts` is the server plugin. It registers the `/goal` command, goal tools, chat/session hooks, usage accounting, compaction context, and idle auto-continuation.
-- `src/state.ts` owns goal persistence and lifecycle state. It stores JSON at `OPENCODE_GOAL_STATE_PATH` when set, otherwise under the user's OpenCode data location.
-- `src/tui.tsx` is the Solid/OpenTUI sidebar and command-palette UI. It is exported as source, so avoid adding heavy runtime dependencies here unless there is a strong reason.
-- `src/prompts.ts` contains the goal-mode continuation/system/compaction prompts.
-- `test/` covers state, server hooks/tools, and TUI behavior with Bun tests.
+- `src/server.ts`: `/goal`, the three native-aligned public tools, hooks, task deferral, model/agent pinning, and idle continuation.
+- `src/state.ts`: per-session goal lifecycle, usage accounting, legacy-state migration, and atomic persistence.
+- `src/prompts.ts`: continuation, objective-update, budget-limit, Plan-mode, and compaction steering aligned to current native Codex.
+- `src/tui.ts`: optional OpenTUI sidebar and command-palette UI.
+- `test/`: state, server hooks/tools/commands, package, and TUI tests.
+- `COMPATIBILITY.md`: supported OpenCode/API versions and the unavoidable command-turn gap.
 
-## Change Guidelines
+## Invariants
 
-- Preserve the public Promise-based state API (`getGoal`, `createGoal`, `completeGoal`, etc.) because OpenCode hooks and tests call it directly.
-- Keep `zod` for OpenCode tool argument schemas unless the OpenCode plugin API explicitly supports another schema format.
-- Effect is intentionally used in the state/persistence boundary. Do not spread Effect into the TUI unless the benefit clearly outweighs the extra runtime footprint.
-- If server code imports a runtime dependency that should be resolved from `dependencies`, externalize it in the Bun build script so the package does not silently bundle it.
-- State writes should remain atomic: write to a temp file, then `rename` into place.
-- Use `OPENCODE_GOAL_STATE_PATH` for tests and smoke runs so you do not touch a real user's goal state.
+- Keep the model-facing tool set exactly `get_goal`, `create_goal`, and `update_goal` unless native Codex changes.
+- Keep statuses `active`, `paused`, `blocked`, `usageLimited`, `budgetLimited`, and `complete`. `unmet` is accepted only as a persisted legacy migration value.
+- `create_goal` requires an explicit goal request; token budget is optional only when explicit.
+- The model may update only `complete` or `blocked`. User/runtime code owns edit, pause, resume, clear, and limit states.
+- Blocked requires at least three turns in the current run; resuming resets the audit.
+- Preserve Plan-mode safety, task/subagent deferral, compaction context, and agent/provider/model pinning.
+- Do not add an arbitrary default auto-turn or no-progress cap.
+- State writes remain same-directory atomic replacements with Windows transient-lock handling. Tests must use `OPENCODE_GOAL_STATE_PATH`.
+- Do not patch OpenCode source or modify a live OpenCode configuration as part of ordinary repository validation.
 
-## Local Validation
+## Local validation
 
-Before treating a code change as complete, run the relevant checks. For release-level changes, run the full local gate:
+Run the complete gate for release-level changes:
 
-```bash
+```powershell
+bun install
 bun run lint
 bun run typecheck
 bun test
@@ -31,27 +36,12 @@ bun run build
 bun run pack:dry-run
 ```
 
-`bun run build` writes `dist/server.js`. The package only publishes `dist`, `src/tui.tsx`, `LICENSE`, and `README.md`, so confirm `npm pack --dry-run` includes what runtime installation needs.
+Confirm the package contains `dist/server.js`, `src/tui.ts`, `README.md`, `COMPATIBILITY.md`, `NOTICE`, and `LICENSE`.
 
-## Publishing Flow
+## Compatibility
 
-This repo publishes from GitHub Actions on pushes to `main`. The workflow computes the next patch version from npm, builds, publishes, and creates a GitHub release.
+The peer range is `@opencode-ai/plugin >=1.17.1 <2`. The local compatibility targets are installed OpenCode `1.17.17` and current stable `@opencode-ai/plugin` `1.18.x`. Recheck both the hook types and behavior tests before changing the range.
 
-After pushing a release change, monitor the workflow with `gh run list --branch main` and `gh run watch <run-id> --exit-status`. Verify the release and package metadata after success:
+## Publishing
 
-```bash
-npm view @prevalentware/opencode-goal-plugin version dependencies
-gh release view v<version>
-```
-
-## End-To-End Plugin Test
-
-To test this plugin end to end, do not stop at unit tests. Run the local gates first: `bun run lint`, `bun run typecheck`, `bun test`, `bun run build`, and `bun run pack:dry-run`.
-
-After publishing, verify the exact npm version with `npm view @prevalentware/opencode-goal-plugin version dependencies`. Install that version in an isolated temp OpenCode project with `opencode plugin @prevalentware/opencode-goal-plugin@<version>`, run `opencode debug config` to confirm the package is loaded and the `goal` command is registered, then run a smoke test with an isolated state file, for example:
-
-```bash
-OPENCODE_GOAL_STATE_PATH="/tmp/opencode-goal-plugin-smoke/goals.json" opencode run "/goal create a smoke-test goal and then report the current goal state"
-```
-
-The smoke test should show `create_goal` and `get_goal` tool calls and report an active goal. Inspect the state file afterward if you need to confirm JSON persistence.
+The repository currently keeps only an `upstream` remote for the original Prevalentware project. Add the user's publication remote separately; do not rename or overwrite `upstream`. Update package repository/homepage/bugs metadata only after the final GitHub owner and URL are known.

@@ -1,4 +1,4 @@
-# OpenCode Goal Plugin
+# slash/goal for OpenCode
 
 This context defines the language for goal-mode behavior across OpenCode surfaces. It exists to keep server capabilities, terminal UI behavior, and browser/desktop UI expectations distinct.
 
