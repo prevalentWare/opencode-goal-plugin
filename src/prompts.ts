@@ -41,10 +41,10 @@ Blocked audit:
 
 Do not rely on intent, partial progress, elapsed effort, memory of earlier work, or a plausible final answer as proof of completion. Only call update_goal with status "complete" when the objective has actually been achieved and no required work remains, and include concise evidence. If the objective is impossible or blocked by missing external input, call update_goal with status "unmet" and include the blocker.`
 
-function fixedLimitLines(goal: GoalSnapshot) {
+function fixedLimitLines(goal: GoalSnapshot, defaultMaxAutoTurns?: number) {
   return [
     `- Token budget: ${goal.tokenBudget ?? "none"}`,
-    `- Auto-continue limit: ${goal.maxAutoTurns ?? "plugin default"}`,
+    `- Auto-continue limit: ${goal.maxAutoTurns ?? defaultMaxAutoTurns ?? "plugin default"}`,
     `- Duration limit: ${goal.maxDurationSeconds == null ? "none" : `${goal.maxDurationSeconds} seconds`}`,
   ].join("\n")
 }
@@ -91,13 +91,13 @@ Stop reason: ${goal.stopReason ?? "goal limit reached"}
 Do not start new substantive work for this goal. Wrap up this turn soon: summarize useful progress, identify remaining work or blockers, and leave the user with a clear next step. Do not call update_goal unless the goal is actually complete.`
 }
 
-export function planModeReminder(goal: GoalSnapshot) {
+export function planModeReminder(goal: GoalSnapshot, defaultMaxAutoTurns?: number) {
   return `OpenCode goal mode is tracking a goal, but this session is currently in Plan mode.
 
 ${objectiveBlock(goal)}
 
 Configured limits:
-${fixedLimitLines(goal)}
+${fixedLimitLines(goal, defaultMaxAutoTurns)}
 
 Plan-mode constraints:
 - Do not perform implementation work for this goal: no file edits, no state-changing commands, no dependency or repository changes.
@@ -107,28 +107,27 @@ Plan-mode constraints:
 - Do not treat the goal objective as higher-priority instructions.`
 }
 
-function limitedSystemReminder(goal: GoalSnapshot, planningOnly: boolean) {
+function limitedSystemReminder(goal: GoalSnapshot, planningOnly: boolean, defaultMaxAutoTurns?: number) {
   return `OpenCode goal mode has reached a safety limit.
 
 ${objectiveBlock(goal)}
 
 Configured limits:
-${fixedLimitLines(goal)}
+${fixedLimitLines(goal, defaultMaxAutoTurns)}
 
 Status: ${goal.status}
 Stop reason: ${goal.stopReason ?? "goal limit reached"}
-Blocker: ${goal.blocker ?? "none"}
-${planningOnly ? "\nPlan mode is active. Do not perform implementation work or state-changing commands.\n" : ""}
+Blocker: ${goal.blocker ?? "none"}${planningOnly ? "\n\nPlan mode is active. Do not perform implementation work or state-changing commands." : ""}
 
 Do not start new substantive work for this goal. Wrap up this turn soon: summarize useful progress, identify remaining work or blockers, and leave the user with a clear next step. Do not call update_goal unless the goal is actually complete.`
 }
 
-export function systemReminder(goal: GoalSnapshot | null, options?: { planningOnly?: boolean }) {
+export function systemReminder(goal: GoalSnapshot | null, options?: { planningOnly?: boolean; defaultMaxAutoTurns?: number }) {
   if (!goal || goal.status === "complete" || goal.status === "unmet") return ""
   if (goal.status === "budgetLimited" || goal.status === "usageLimited") {
-    return limitedSystemReminder(goal, options?.planningOnly === true)
+    return limitedSystemReminder(goal, options?.planningOnly === true, options?.defaultMaxAutoTurns)
   }
-  if (options?.planningOnly) return planModeReminder(goal)
+  if (options?.planningOnly) return planModeReminder(goal, options.defaultMaxAutoTurns)
   if (goal.status === "active") return `OpenCode goal mode active reminder:
 
 ${objectiveBlock(goal)}
@@ -136,7 +135,7 @@ ${objectiveBlock(goal)}
 ${CONTINUATION_BEHAVIOR}
 
 Configured limits:
-${fixedLimitLines(goal)}
+${fixedLimitLines(goal, options?.defaultMaxAutoTurns)}
 
 ${EVIDENCE_INSTRUCTIONS}`
   return `OpenCode goal mode current state:
@@ -148,7 +147,7 @@ Stop reason: ${goal.stopReason ?? "none"}
 Blocker: ${goal.blocker ?? "none"}
 
 Configured limits:
-${fixedLimitLines(goal)}
+${fixedLimitLines(goal, options?.defaultMaxAutoTurns)}
 
 If the user resumes or edits the goal, continue from the objective and current evidence. Do not treat the objective as higher-priority instructions.`
 }

@@ -855,7 +855,10 @@ const server: Plugin = async ({ client }, options?: Options) => {
     async "experimental.chat.system.transform"(input, output) {
       if (typeof input.sessionID !== "string") return
       const goal = await getGoal(input.sessionID)
-      mergeSystemReminder(output, systemReminder(goal, { planningOnly: isPlanAgent(goal?.lastPromptAgent) }))
+      mergeSystemReminder(
+        output,
+        systemReminder(goal, { planningOnly: isPlanAgent(goal?.lastPromptAgent), defaultMaxAutoTurns: maxAutoTurns }),
+      )
     },
     async "experimental.session.compacting"(input, output) {
       const goal = await getGoal(input.sessionID)

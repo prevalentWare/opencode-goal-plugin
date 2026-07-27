@@ -240,11 +240,32 @@ test("system transform preserves budget-limited safety guidance", async () => {
   )
   const output = { system: ["Base system prompt"] }
   await hooks["experimental.chat.system.transform"]!({ sessionID: "ses_1" } as never, output)
+  const stableReminder = output.system[0]
+  await hooks["experimental.chat.system.transform"]!({ sessionID: "ses_1" } as never, output)
+  await hooks["experimental.chat.messages.transform"]!(
+    {},
+    {
+      messages: [
+        {
+          info: { id: "msg_2", role: "assistant", sessionID: "ses_1" },
+          parts: [{ type: "step-finish", tokens: { input: 50, output: 50 } }],
+        },
+      ],
+    } as never,
+  )
+  const afterMoreUsage = { system: ["Base system prompt"] }
+  await hooks["experimental.chat.system.transform"]!({ sessionID: "ses_1" } as never, afterMoreUsage)
 
   expect(output.system[0]).toContain("reached a safety limit")
   expect(output.system[0]).toContain("Status: budgetLimited")
   expect(output.system[0]).toContain("Stop reason: token budget reached (11/10)")
   expect(output.system[0]).toContain("Do not start new substantive work")
+  expect(output.system[0]).toBe(stableReminder)
+  expect(output.system[0]?.match(/OpenCode goal mode/g)?.length).toBe(1)
+  expect(afterMoreUsage.system[0]).toBe(stableReminder)
+  expect(output.system[0]).not.toContain("Time spent")
+  expect(output.system[0]).not.toContain("Tokens used")
+  expect(output.system[0]).not.toContain("Auto-continues used")
   expect(output.system[0]).not.toContain("If the user resumes or edits the goal")
 })
 
@@ -257,13 +278,13 @@ test("system transform preserves usage-limited safety guidance", async () => {
         },
       },
     } as never,
-    { auto_continue: true, max_auto_turns: 5, min_continue_interval_seconds: 0 },
+    { auto_continue: true, max_auto_turns: 1, min_continue_interval_seconds: 0 },
   )
   const tools = hooks.tool
   if (!tools) throw new Error("expected goal tools to be registered")
   const context = { sessionID: "ses_1" } as never
 
-  await requireTool(tools.create_goal, "create_goal").execute({ objective: "finish", max_auto_turns: 1 }, context)
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "finish" }, context)
   await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_1" } } as never })
   await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_1" } } as never })
   const output = { system: ["Base system prompt"] }
@@ -271,6 +292,7 @@ test("system transform preserves usage-limited safety guidance", async () => {
 
   expect(output.system[0]).toContain("Status: usageLimited")
   expect(output.system[0]).toContain("Stop reason: max auto-continues reached (1)")
+  expect(output.system[0]).toContain("Auto-continue limit: 1")
   expect(output.system[0]).toContain("Do not start new substantive work")
   expect(output.system[0]).not.toContain("Status: paused")
 })
