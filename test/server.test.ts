@@ -131,7 +131,7 @@ test("server plugin registers goal as a desktop/web command by default", async (
   expect(config.command?.goal?.template).toContain('"edit "')
 })
 
-test("system transform keeps active goal context cache-stable as usage changes", async () => {
+test("system transform keeps active goal context and fixed limits cache-stable", async () => {
   const hooks = await plugin.server(
     {
       client: {
@@ -145,8 +145,13 @@ test("system transform keeps active goal context cache-stable as usage changes",
   const tools = hooks.tool
   if (!tools) throw new Error("expected goal tools to be registered")
 
-  await requireTool(tools.create_goal, "create_goal").execute({ objective: "finish" }, { sessionID: "ses_1" } as never)
+  await requireTool(tools.create_goal, "create_goal").execute(
+    { objective: "finish", token_budget: 500, max_auto_turns: 4, max_duration_seconds: 300 },
+    { sessionID: "ses_1" } as never,
+  )
   const first = { system: ["Base system prompt"] }
+  await hooks["experimental.chat.system.transform"]!({ sessionID: "ses_1" } as never, first)
+  const stableReminder = first.system[0]
   await hooks["experimental.chat.system.transform"]!({ sessionID: "ses_1" } as never, first)
   await hooks["experimental.chat.messages.transform"]!(
     {},
@@ -169,8 +174,146 @@ test("system transform keeps active goal context cache-stable as usage changes",
   expect(first.system).toHaveLength(1)
   expect(first.system[0]).toStartWith("Base system prompt")
   expect(first.system[0]).toContain("OpenCode goal mode")
+  expect(first.system[0]).toContain("Token budget: 500")
+  expect(first.system[0]).toContain("Auto-continue limit: 4")
+  expect(first.system[0]).toContain("Duration limit: 300 seconds")
+  expect(first.system[0]).toBe(stableReminder)
+  expect(first.system[0]?.match(/OpenCode goal mode/g)?.length).toBe(1)
+  expect(first.system[0]).not.toContain("Time spent")
   expect(first.system[0]).not.toContain("Tokens used")
+  expect(first.system[0]).not.toContain("Auto-continues used")
   expect(first.system[0]).not.toContain("Latest checkpoint")
+})
+
+test("system transform preserves paused goal state and reason", async () => {
+  const hooks = await plugin.server(
+    {
+      client: {
+        session: {
+          promptAsync: async () => {},
+        },
+      },
+    } as never,
+    { auto_continue: false },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+  const context = { sessionID: "ses_1" } as never
+
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "finish" }, context)
+  await requireTool(tools.update_goal_status, "update_goal_status").execute({ status: "paused" }, context)
+  const output = { system: ["Base system prompt"] }
+  await hooks["experimental.chat.system.transform"]!({ sessionID: "ses_1" } as never, output)
+
+  expect(output.system[0]).toContain("Status: paused")
+  expect(output.system[0]).toContain("Stop reason: paused")
+  expect(output.system[0]).toContain("Blocker: none")
+  expect(output.system[0]).not.toContain("reached a safety limit")
+})
+
+test("system transform preserves budget-limited safety guidance", async () => {
+  const hooks = await plugin.server(
+    {
+      client: {
+        session: {
+          promptAsync: async () => {},
+        },
+      },
+    } as never,
+    { auto_continue: false },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+  const context = { sessionID: "ses_1" } as never
+
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "finish", token_budget: 10 }, context)
+  await hooks["experimental.chat.messages.transform"]!(
+    {},
+    {
+      messages: [
+        {
+          info: { id: "msg_1", role: "assistant", sessionID: "ses_1" },
+          parts: [{ type: "step-finish", tokens: { input: 6, output: 5 } }],
+        },
+      ],
+    } as never,
+  )
+  const output = { system: ["Base system prompt"] }
+  await hooks["experimental.chat.system.transform"]!({ sessionID: "ses_1" } as never, output)
+
+  expect(output.system[0]).toContain("reached a safety limit")
+  expect(output.system[0]).toContain("Status: budgetLimited")
+  expect(output.system[0]).toContain("Stop reason: token budget reached (11/10)")
+  expect(output.system[0]).toContain("Do not start new substantive work")
+  expect(output.system[0]).not.toContain("If the user resumes or edits the goal")
+})
+
+test("system transform preserves usage-limited safety guidance", async () => {
+  const hooks = await plugin.server(
+    {
+      client: {
+        session: {
+          promptAsync: async () => {},
+        },
+      },
+    } as never,
+    { auto_continue: true, max_auto_turns: 5, min_continue_interval_seconds: 0 },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+  const context = { sessionID: "ses_1" } as never
+
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "finish", max_auto_turns: 1 }, context)
+  await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_1" } } as never })
+  await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_1" } } as never })
+  const output = { system: ["Base system prompt"] }
+  await hooks["experimental.chat.system.transform"]!({ sessionID: "ses_1" } as never, output)
+
+  expect(output.system[0]).toContain("Status: usageLimited")
+  expect(output.system[0]).toContain("Stop reason: max auto-continues reached (1)")
+  expect(output.system[0]).toContain("Do not start new substantive work")
+  expect(output.system[0]).not.toContain("Status: paused")
+})
+
+test("system transform preserves limited safety guidance in plan mode", async () => {
+  const hooks = await plugin.server(
+    {
+      client: {
+        session: {
+          promptAsync: async () => {},
+        },
+      },
+    } as never,
+    { auto_continue: false },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+  const context = { sessionID: "ses_1" } as never
+
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "finish", token_budget: 10 }, context)
+  await hooks["experimental.chat.messages.transform"]!(
+    {},
+    {
+      messages: [
+        {
+          info: { id: "msg_1", role: "assistant", sessionID: "ses_1" },
+          parts: [{ type: "step-finish", tokens: { input: 6, output: 5 } }],
+        },
+      ],
+    } as never,
+  )
+  await hooks["chat.message"]!(
+    { sessionID: "ses_1", agent: "plan" } as never,
+    { message: { sessionID: "ses_1", agent: "plan" }, parts: [] } as never,
+  )
+  const output = { system: ["Base system prompt"] }
+  await hooks["experimental.chat.system.transform"]!({ sessionID: "ses_1" } as never, output)
+
+  expect(output.system[0]).toContain("Plan mode")
+  expect(output.system[0]).toContain("Status: budgetLimited")
+  expect(output.system[0]).toContain("Stop reason: token budget reached (11/10)")
+  expect(output.system[0]).toContain("Do not start new substantive work")
+  expect(output.system[0]).not.toContain("switch to Build mode and resume")
 })
 
 test("compaction autocontinue is disabled while a goal is active", async () => {
