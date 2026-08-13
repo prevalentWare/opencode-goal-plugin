@@ -3,7 +3,13 @@ import { testRender } from "@opentui/solid"
 import { createSignal } from "solid-js"
 import { createStore, type Store } from "solid-js/store"
 import type { SessionMessageAssistantTool, SessionMessageInfo } from "@opencode-ai/client"
-import plugin, { goalFromV2Messages, liveTimeUsedSeconds, setupTuiV2 } from "../src/tui.ts"
+import plugin, {
+  goalFromV2Messages,
+  liveTimeUsedSeconds,
+  registerSlotV2,
+  setupTuiV2,
+  themeColorV2,
+} from "../src/tui.ts"
 
 type GoalSnapshot = Parameters<typeof liveTimeUsedSeconds>[0]
 
@@ -105,7 +111,13 @@ type MockContext = {
     }
   }
   attention: unknown
-  theme: { text: string; textMuted: string; primary: string }
+  theme: {
+    text: {
+      default: string
+      subdued: string
+      feedback: { success: { default: string } }
+    }
+  }
   markdown: unknown
   keymap: {
     layer: (input: () => MockKeymapLayer) => void
@@ -136,7 +148,7 @@ type MockContext = {
       current: () => { type: string; sessionID?: string }
     }
     tabs: unknown
-    slot: (name: string, render: (props: { sessionID: string }) => unknown) => () => void
+    slot: (options: { append: string; render: (props: { sessionID: string }) => unknown }) => () => void
   }
 }
 
@@ -185,7 +197,13 @@ function makeMockContext(overrides: Partial<MockContext> = {}): {
       },
     },
     attention: undefined,
-    theme: { text: "#ffffff", textMuted: "#888888", primary: "#00ff00" },
+    theme: {
+      text: {
+        default: "#ffffff",
+        subdued: "#888888",
+        feedback: { success: { default: "#00ff00" } },
+      },
+    },
     markdown: undefined,
     keymap: {
       layer(input) {
@@ -234,10 +252,12 @@ function makeMockContext(overrides: Partial<MockContext> = {}): {
         current: () => route,
       },
       tabs: undefined,
-      slot(name, render) {
-        slots.set(name, render)
+      // Current previews take a single options argument. Keep the arity at 1 so
+      // the plugin exercises the same call shape the real host uses.
+      slot(options) {
+        slots.set(options.append, options.render)
         return () => {
-          disposed.push(name)
+          disposed.push(options.append)
         }
       },
     },
@@ -273,6 +293,68 @@ test("V2 TUI definition exposes id and a setup function", () => {
   expect(plugin.id).toBe("local.goal-mode.tui")
   expect(typeof plugin.setup).toBe("function")
   expect(typeof plugin.tui).toBe("function")
+})
+
+test("registerSlotV2 uses the options argument when the host takes one parameter", () => {
+  const calls: Array<{ append: string; render: unknown }> = []
+  const context = {
+    ui: {
+      slot: (options: { append: string; render: () => unknown }) => {
+        calls.push(options)
+        return () => {}
+      },
+    },
+  }
+  const render = () => null
+
+  const dispose = registerSlotV2(context as never, "sidebar.content", render)
+
+  expect(calls).toEqual([{ append: "sidebar.content", render }])
+  expect(typeof dispose).toBe("function")
+})
+
+test("registerSlotV2 falls back to the positional form on earlier previews", () => {
+  const calls: Array<[string, unknown]> = []
+  const context = {
+    ui: {
+      slot: (name: string, render: () => unknown) => {
+        calls.push([name, render])
+        return () => {}
+      },
+    },
+  }
+  const render = () => null
+
+  registerSlotV2(context as never, "app", render)
+
+  expect(calls).toEqual([["app", render]])
+})
+
+test("registerSlotV2 tolerates hosts that do not return a disposer", () => {
+  const context = { ui: { slot: (_options: { append: string }) => undefined } }
+
+  const dispose = registerSlotV2(context as never, "sidebar.content", () => null)
+
+  expect(typeof dispose).toBe("function")
+  expect(() => dispose()).not.toThrow()
+})
+
+test("themeColorV2 resolves nested, grouped, and legacy flat theme colors", () => {
+  const nested = {
+    text: { default: "#ffffff", subdued: "#888888", feedback: { success: { default: "#00ff00" } } },
+  }
+  const flat = { text: "#eeeeee", textMuted: "#777777", primary: "#00cc00" }
+
+  expect(themeColorV2(nested, ["text", "default"], ["text"])).toBe("#ffffff")
+  expect(themeColorV2(nested, ["text", "subdued"], ["textMuted"])).toBe("#888888")
+  // A color group resolves to its `default` leaf rather than the group object.
+  expect(themeColorV2(nested, ["text", "feedback", "success"], ["primary"])).toBe("#00ff00")
+
+  expect(themeColorV2(flat, ["text", "default"], ["text"])).toBe("#eeeeee")
+  expect(themeColorV2(flat, ["text", "subdued"], ["textMuted"])).toBe("#777777")
+  expect(themeColorV2(flat, ["text", "feedback", "success"], ["primary"])).toBe("#00cc00")
+
+  expect(themeColorV2({}, ["text", "default"], ["text"])).toBeUndefined()
 })
 
 test("V2 setup registers sidebar.content and app slots and cleanup disposes them", () => {
@@ -441,6 +523,9 @@ test("V2 keymap layer registers the goal palette command when the app slot rende
     expect(command).toBeDefined()
     expect(command?.title).toBe("Goal")
     expect(command?.palette).toBe(true)
+    // Without an explicit global mode the host never surfaces the command in
+    // the palette, even while the layer itself is registered.
+    expect(layer?.mode).toBe("global")
     setup.renderer.destroy()
     destroyed = true
   } finally {
