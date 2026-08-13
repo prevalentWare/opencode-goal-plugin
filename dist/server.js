@@ -3,7 +3,7 @@
 import { z } from "zod";
 
 // src/state.ts
-import { chmod, mkdir, readFile, rename, writeFile } from "fs/promises";
+import { chmod, mkdir, open, readFile, rename } from "fs/promises";
 import { homedir } from "os";
 import { dirname, join } from "path";
 import { Data, Effect, Schema } from "effect";
@@ -109,8 +109,14 @@ function writeStateEffect(state) {
       const file = statePath();
       await mkdir(dirname(file), { recursive: true, mode: 448 });
       const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
-      await writeFile(tmp, JSON.stringify(state, null, 2) + `
-`, { mode: 384 });
+      const handle = await open(tmp, "w", 384);
+      try {
+        await handle.writeFile(JSON.stringify(state, null, 2) + `
+`);
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
       await rename(tmp, file);
       await chmod(file, 384).catch(() => {
         return;

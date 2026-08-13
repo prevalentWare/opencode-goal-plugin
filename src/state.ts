@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs"
-import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises"
+import { chmod, mkdir, open, readFile, rename } from "node:fs/promises"
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
 import { Data, Effect, Schema } from "effect"
@@ -237,7 +237,16 @@ function writeStateEffect(state: State) {
       const file = statePath()
       await mkdir(dirname(file), { recursive: true, mode: 0o700 })
       const tmp = `${file}.${process.pid}.${Date.now()}.tmp`
-      await writeFile(tmp, JSON.stringify(state, null, 2) + "\n", { mode: 0o600 })
+      // Write to a temp file and fsync it before renaming into place. On crash
+      // (power loss / BSOD) an fsync'd temp file is durable, so the rename never
+      // exposes an empty or partially-flushed state file.
+      const handle = await open(tmp, "w", 0o600)
+      try {
+        await handle.writeFile(JSON.stringify(state, null, 2) + "\n")
+        await handle.sync()
+      } finally {
+        await handle.close()
+      }
       await rename(tmp, file)
       await chmod(file, 0o600).catch(() => undefined)
     },
