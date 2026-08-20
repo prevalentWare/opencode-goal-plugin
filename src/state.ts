@@ -320,8 +320,7 @@ function decodeState(value: unknown) {
   )
 }
 
-function readStateEffect() {
-  const file = statePath()
+function readStateEffect(file = statePath()) {
   return Effect.tryPromise({
     try: () => readFile(file, "utf8"),
     catch: (cause) => new StateReadError({ cause }),
@@ -339,10 +338,9 @@ function readStateEffect() {
   )
 }
 
-function writeStateEffect(state: State) {
+function writeStateEffect(state: State, file = statePath()) {
   return Effect.tryPromise({
     try: async () => {
-      const file = statePath()
       await mkdir(dirname(file), { recursive: true, mode: 0o700 })
       // atomicWriteFile writes to a same-directory temp file, fsyncs it, then
       // renames it into place: the final path is only ever replaced by a
@@ -387,19 +385,20 @@ function enqueueMutation<T>(operation: () => Promise<T>) {
 }
 
 async function mutate<T>(fn: (state: State) => T | Promise<T>) {
-  return enqueueMutation(() =>
-    Effect.runPromise(
+  return enqueueMutation(() => {
+    const file = statePath()
+    return Effect.runPromise(
       Effect.gen(function* () {
-        const state = yield* readStateEffect()
+        const state = yield* readStateEffect(file)
         const result = yield* Effect.tryPromise({
           try: () => Promise.resolve(fn(state)),
           catch: (cause) => (cause instanceof Error ? cause : new Error(String(cause))),
         })
-        yield* writeStateEffect(state)
+        yield* writeStateEffect(state, file)
         return result
       }),
-    ),
-  )
+    )
+  })
 }
 
 export function validateObjective(objective: string) {

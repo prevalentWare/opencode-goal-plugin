@@ -55,6 +55,24 @@ test("creates, reads, pauses, resumes, completes, and clears a goal", async () =
   expect(await getGoal("ses_1")).toBeNull()
 })
 
+test("a mutation writes back to the state path it read", async () => {
+  const firstPath = process.env.OPENCODE_GOAL_STATE_PATH!
+  const secondPath = join(dir, "other-goals.json")
+  await createGoal("ses_path", "original objective", null)
+
+  const update = updateGoalObjective("ses_path", "updated objective")
+  queueMicrotask(() => {
+    process.env.OPENCODE_GOAL_STATE_PATH = secondPath
+  })
+  await update
+
+  process.env.OPENCODE_GOAL_STATE_PATH = firstPath
+  expect((await getGoal("ses_path"))?.objective).toBe("updated objective")
+  process.env.OPENCODE_GOAL_STATE_PATH = secondPath
+  expect(await getGoal("ses_path")).toBeNull()
+  process.env.OPENCODE_GOAL_STATE_PATH = firstPath
+})
+
 test("lists public goals across sessions by most recent update", async () => {
   expect(await getAllGoals()).toEqual({ goals: [], total: 0, truncated: false })
 

@@ -242,8 +242,7 @@ function parseStateText(raw, file) {
 function decodeState(value) {
   return Schema.decodeUnknown(StateSchema)(value).pipe(Effect.map(mutableState), Effect.map(normalizeState), Effect.mapError((cause) => new StateDecodeError({ cause })));
 }
-function readStateEffect() {
-  const file = statePath();
+function readStateEffect(file = statePath()) {
   return Effect.tryPromise({
     try: () => readFile(file, "utf8"),
     catch: (cause) => new StateReadError({ cause })
@@ -252,10 +251,9 @@ function readStateEffect() {
     catch: (cause) => new StateDecodeError({ cause })
   })), Effect.flatMap(decodeState), Effect.catchAll((error) => error._tag === "StateReadError" && isMissingStateFile(error.cause) ? Effect.succeed(emptyState()) : Effect.fail(error)));
 }
-function writeStateEffect(state) {
+function writeStateEffect(state, file = statePath()) {
   return Effect.tryPromise({
     try: async () => {
-      const file = statePath();
       await mkdir(dirname2(file), { recursive: true, mode: 448 });
       await atomicWriteFile(file, JSON.stringify(state, null, 2) + `
 `);
@@ -277,15 +275,18 @@ function enqueueMutation(operation) {
   return current;
 }
 async function mutate(fn) {
-  return enqueueMutation(() => Effect.runPromise(Effect.gen(function* () {
-    const state = yield* readStateEffect();
-    const result = yield* Effect.tryPromise({
-      try: () => Promise.resolve(fn(state)),
-      catch: (cause) => cause instanceof Error ? cause : new Error(String(cause))
-    });
-    yield* writeStateEffect(state);
-    return result;
-  })));
+  return enqueueMutation(() => {
+    const file = statePath();
+    return Effect.runPromise(Effect.gen(function* () {
+      const state = yield* readStateEffect(file);
+      const result = yield* Effect.tryPromise({
+        try: () => Promise.resolve(fn(state)),
+        catch: (cause) => cause instanceof Error ? cause : new Error(String(cause))
+      });
+      yield* writeStateEffect(state, file);
+      return result;
+    }));
+  });
 }
 function validateObjective(objective) {
   const value = objective.trim();

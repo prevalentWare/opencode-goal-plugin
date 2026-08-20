@@ -19,8 +19,8 @@ Useful scripts:
 
 | Script | What it does |
 | --- | --- |
-| `bun run test` | Run the unit test suite serially |
-| `bun run test:coverage` | Run the serial test suite with a coverage report |
+| `bun run test` | Run the unit test suite |
+| `bun run test:coverage` | Run the test suite with a coverage report |
 | `bun run lint` | ESLint over the repo |
 | `bun run typecheck` | TypeScript `--noEmit` check |
 | `bun run build` | Bundle `src/server.ts` into `dist/` |

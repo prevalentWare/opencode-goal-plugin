@@ -40,6 +40,15 @@ async function waitForContinuation(calls: unknown[]) {
 }
 
 let dir = ""
+const serverDisposers: Array<() => Promise<void>> = []
+
+async function setupServer(...args: Parameters<typeof plugin.server>) {
+  const hooks = await plugin.server(...args)
+  serverDisposers.push(async () => {
+    await hooks.dispose?.()
+  })
+  return hooks
+}
 
 beforeEach(async () => {
   dir = await mkdtemp(join(tmpdir(), "opencode-goal-plugin-"))
@@ -47,13 +56,14 @@ beforeEach(async () => {
 })
 
 afterEach(async () => {
+  for (const dispose of serverDisposers.splice(0).reverse()) await dispose()
   delete process.env.OPENCODE_GOAL_STATE_PATH
   await rm(dir, { recursive: true, force: true })
 })
 
 test("server plugin exposes Codex-style goal tools", async () => {
   const calls: unknown[] = []
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     {
       client: {
         session: {
@@ -99,7 +109,7 @@ test("server plugin exposes Codex-style goal tools", async () => {
 })
 
 test("list_all_goals returns goals from other sessions", async () => {
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     { client: { session: { promptAsync: async () => {} } } } as never,
     { auto_continue: false },
   )
@@ -125,7 +135,7 @@ test("list_all_goals returns goals from other sessions", async () => {
 })
 
 test("set goal lets the agent formulate the goal objective", async () => {
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     {
       client: {
         session: {
@@ -148,7 +158,7 @@ test("set goal lets the agent formulate the goal objective", async () => {
 })
 
 test("create_goal reuses the same active objective without mutating state", async () => {
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     { client: { session: { promptAsync: async () => {} } } } as never,
     { auto_continue: false },
   )
@@ -182,7 +192,7 @@ test("create_goal reuses the same active objective without mutating state", asyn
 })
 
 test("create_goal starts a fresh goal when the matching prior goal is closed", async () => {
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     { client: { session: { promptAsync: async () => {} } } } as never,
     { auto_continue: false },
   )
@@ -202,7 +212,7 @@ test("create_goal starts a fresh goal when the matching prior goal is closed", a
 })
 
 test("concurrent matching create_goal calls converge on one goal", async () => {
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     { client: { session: { promptAsync: async () => {} } } } as never,
     { auto_continue: false },
   )
@@ -219,7 +229,7 @@ test("concurrent matching create_goal calls converge on one goal", async () => {
 })
 
 test("duplicate limited goals retain the safety stop notice", async () => {
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     { client: { session: { promptAsync: async () => {} } } } as never,
     { auto_continue: false },
   )
@@ -235,7 +245,7 @@ test("duplicate limited goals retain the safety stop notice", async () => {
 })
 
 test("server plugin registers goal as a desktop/web command by default", async () => {
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     {
       client: {
         session: {
@@ -266,7 +276,7 @@ test("server plugin registers goal as a desktop/web command by default", async (
 
 test("system transform is byte-stable across the complete goal lifecycle", async () => {
   setSystemTime(new Date(100_000))
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     {
       client: {
         session: {
@@ -451,7 +461,7 @@ OpenCode goal mode policy:
 })
 
 test("compaction autocontinue is disabled while a goal is active", async () => {
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     {
       client: {
         session: {
@@ -472,7 +482,7 @@ test("compaction autocontinue is disabled while a goal is active", async () => {
 })
 
 test("goal objective can be edited and history can be reported", async () => {
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     {
       client: {
         session: {
@@ -500,7 +510,7 @@ test("goal objective can be edited and history can be reported", async () => {
 })
 
 test("goal status tool pauses and resumes a goal", async () => {
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     {
       client: {
         session: {
@@ -525,7 +535,7 @@ test("goal status tool pauses and resumes a goal", async () => {
 })
 
 test("server plugin does not overwrite an existing goal command", async () => {
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     {
       client: {
         session: {
@@ -551,7 +561,7 @@ test("server plugin does not overwrite an existing goal command", async () => {
 })
 
 test("server plugin can disable desktop/web command registration", async () => {
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     {
       client: {
         session: {
@@ -571,7 +581,7 @@ test("server plugin can disable desktop/web command registration", async () => {
 })
 
 test("update goal can close as unmet with a blocker", async () => {
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     {
       client: {
         session: {
@@ -597,7 +607,7 @@ test("update goal can close as unmet with a blocker", async () => {
 })
 
 test("message transform prefers exact step token usage", async () => {
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     {
       client: {
         session: {
@@ -640,7 +650,7 @@ test("message transform prefers exact step token usage", async () => {
 })
 
 test("message transform excludes session usage observed before goal work", async () => {
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     { client: { session: { promptAsync: async () => {} } } } as never,
     { auto_continue: false },
   )
@@ -675,7 +685,7 @@ test("message transform excludes session usage observed before goal work", async
 
 test("per-prompt chat hook recovers from an empty state file", async () => {
   await writeFile(process.env.OPENCODE_GOAL_STATE_PATH!, "", "utf8")
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     {
       client: {
         session: {
@@ -692,7 +702,7 @@ test("per-prompt chat hook recovers from an empty state file", async () => {
 })
 
 test("message transform records assistant checkpoints", async () => {
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     {
       client: {
         session: {
@@ -725,7 +735,7 @@ test("message transform records assistant checkpoints", async () => {
 
 test("compaction hook preserves active goal context", async () => {
   setSystemTime(new Date(100_000))
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     {
       client: {
         session: {
@@ -775,7 +785,7 @@ Preserve the goal objective, status, elapsed time, budget usage, latest checkpoi
 
 test("idle event auto-continues active goals when enabled", async () => {
   const calls: unknown[] = []
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     {
       client: {
         session: {
@@ -799,7 +809,7 @@ test("idle event auto-continues active goals when enabled", async () => {
 
 test("session status idle event auto-continues active goals", async () => {
   const calls: unknown[] = []
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     {
       client: {
         session: {
@@ -822,7 +832,7 @@ test("session status idle event auto-continues active goals", async () => {
 
 test("turn watchdog retries a busy active goal without consuming continuation budgets", async () => {
   const calls: { body?: { agent?: string; parts?: { text?: string }[] } }[] = []
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     {
       client: {
         session: {
@@ -879,7 +889,7 @@ test("turn watchdog retries a busy active goal without consuming continuation bu
 
 test("turn watchdog resets when another busy turn starts", async () => {
   const calls: unknown[] = []
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     {
       client: {
         session: {
@@ -910,7 +920,7 @@ test("turn watchdog resets when another busy turn starts", async () => {
 
 test("turn watchdog cancels on idle, retry, deletion, and dispose", async () => {
   const calls: unknown[] = []
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     {
       client: {
         session: {
@@ -961,7 +971,7 @@ test("turn watchdog cancels on idle, retry, deletion, and dispose", async () => 
 
 test("turn watchdog does not inject while tasks are active, the goal is paused, or the turn is restricted", async () => {
   const calls: unknown[] = []
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     {
       client: {
         session: {
@@ -1027,7 +1037,7 @@ test("turn watchdog does not inject while tasks are active, the goal is paused, 
 
 test("turn watchdog transport failures share the prompt-failure ceiling without charging auto-turns", async () => {
   const logs: unknown[] = []
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     {
       client: {
         app: { log: async (input: unknown) => logs.push(input) },
@@ -1080,7 +1090,7 @@ test("turn watchdog transport failures share the prompt-failure ceiling without 
 
 test("running task defers idle auto-continue", async () => {
   const calls: unknown[] = []
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     {
       client: {
         session: {
@@ -1111,7 +1121,7 @@ test("running task defers idle auto-continue", async () => {
 
 test("running task deferral does not record repeated assistant messages as no-progress", async () => {
   const calls: unknown[] = []
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     {
       client: {
         session: {
@@ -1155,7 +1165,7 @@ test("running task deferral does not record repeated assistant messages as no-pr
 })
 
 test("low-output tool-call messages do not pause an active goal without continuations", async () => {
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     {
       client: {
         session: {
@@ -1206,7 +1216,7 @@ test("auto-continue pauses only after a low-progress continuation turn", async (
       { type: "step-finish", tokens: { input: 10, output: 200 } },
     ],
   }
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     {
       client: {
         session: {
@@ -1255,7 +1265,7 @@ test("auto-continue pauses only after a low-progress continuation turn", async (
 
 test("terminal task waits for orchestrator assistant turn before goal continuation", async () => {
   const calls: unknown[] = []
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     {
       client: {
         session: {
@@ -1300,7 +1310,7 @@ test("terminal task waits for orchestrator assistant turn before goal continuati
 
 test("terminal-only task output defers until orchestrator reconciles it", async () => {
   const calls: unknown[] = []
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     {
       client: {
         session: {
@@ -1353,7 +1363,7 @@ test("terminal-only task output defers until orchestrator reconciles it", async 
 
 test("synthetic terminal task message defers until orchestrator reconciles it", async () => {
   const calls: unknown[] = []
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     {
       client: {
         session: {
@@ -1391,7 +1401,7 @@ test("synthetic terminal task message defers until orchestrator reconciles it", 
 
 test("live child session status blocks goal continuation when task launch was missed", async () => {
   const calls: unknown[] = []
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     {
       client: {
         session: {
@@ -1416,7 +1426,7 @@ test("live child session status blocks goal continuation when task launch was mi
 
 test("idle live child session uses bounded deferral when task launch was missed", async () => {
   const calls: unknown[] = []
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     {
       client: {
         session: {
@@ -1443,7 +1453,7 @@ test("idle live child session uses bounded deferral when task launch was missed"
 
 test("idle live child bounded retry does not inject while parent session is busy", async () => {
   const calls: unknown[] = []
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     {
       client: {
         session: {
@@ -1479,7 +1489,7 @@ test("idle live child bounded retry does not inject while parent session is busy
 test("tracked running child absent from live children stops blocking after grace period", async () => {
   const calls: unknown[] = []
   let children = [{ id: "task_1" }]
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     {
       client: {
         session: {
@@ -1510,7 +1520,7 @@ test("tracked running child absent from live children stops blocking after grace
 
 test("task deferral can be disabled with config", async () => {
   const calls: unknown[] = []
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     {
       client: {
         session: {
@@ -1537,7 +1547,7 @@ test("task deferral can be disabled with config", async () => {
 
 test("auto-continue failures pause after configured retry limit", async () => {
   const logs: unknown[] = []
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     {
       client: {
         app: {
@@ -1566,7 +1576,7 @@ test("auto-continue failures pause after configured retry limit", async () => {
 
 test("set_goal from the plan agent records a paused goal instead of an active one", async () => {
   const calls: unknown[] = []
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     {
       client: {
         session: {
@@ -1596,7 +1606,7 @@ test("set_goal from the plan agent records a paused goal instead of an active on
 })
 
 test("create_goal from the plan agent records a paused goal", async () => {
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     {
       client: {
         session: {
@@ -1626,7 +1636,7 @@ test("create_goal from the plan agent records a paused goal", async () => {
 })
 
 test("plan-created goal cannot resume from plan but resumes from build", async () => {
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     {
       client: {
         session: {
@@ -1659,7 +1669,7 @@ test("plan-created goal cannot resume from plan but resumes from build", async (
 })
 
 test("update_goal_objective cannot activate a goal from the plan agent", async () => {
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     {
       client: {
         session: {
@@ -1689,7 +1699,7 @@ test("update_goal_objective cannot activate a goal from the plan agent", async (
 
 test("idle continuation is blocked when the latest assistant turn ran under plan", async () => {
   const calls: unknown[] = []
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     {
       client: {
         session: {
@@ -1726,7 +1736,7 @@ test("idle continuation is blocked when the latest assistant turn ran under plan
 
 test("build resume of a plan-created goal restores auto-continue pinned to build", async () => {
   const calls: { body?: { agent?: string } }[] = []
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     {
       client: {
         session: {
@@ -1760,7 +1770,7 @@ test("build resume of a plan-created goal restores auto-continue pinned to build
 
 test("idle continuation is suppressed and pauses the goal after a plan-mode prompt", async () => {
   const calls: unknown[] = []
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     {
       client: {
         session: {
@@ -1793,7 +1803,7 @@ test("idle continuation is suppressed and pauses the goal after a plan-mode prom
 
 test("auto-continue pins the continuation prompt to the recorded agent", async () => {
   const calls: { body?: { agent?: string } }[] = []
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     {
       client: {
         session: {
@@ -1819,7 +1829,7 @@ test("auto-continue pins the continuation prompt to the recorded agent", async (
 })
 
 test("system reminder remains invariant after a plan-mode prompt", async () => {
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     {
       client: {
         session: {
@@ -1853,7 +1863,7 @@ test("system reminder remains invariant after a plan-mode prompt", async () => {
 })
 
 test("allow_goal_execution_from_plan restores active goal creation from plan", async () => {
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     {
       client: {
         session: {
@@ -1876,7 +1886,7 @@ test("allow_goal_execution_from_plan restores active goal creation from plan", a
 })
 
 test("restricted_agents option extends plan-mode protection to custom agents", async () => {
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     {
       client: {
         session: {
@@ -1901,7 +1911,7 @@ test("restricted_agents option extends plan-mode protection to custom agents", a
 test("idle handler skips overlapping continuations for the same session", async () => {
   let release: (() => void) | undefined
   const calls: unknown[] = []
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     {
       client: {
         session: {
@@ -1931,7 +1941,7 @@ test("idle handler skips overlapping continuations for the same session", async 
 
 test("auto-continue retries are bounded: three failed attempts, no fourth", async () => {
   const logs: unknown[] = []
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     {
       client: {
         app: { log: async (input: unknown) => logs.push(input) },
@@ -1962,7 +1972,7 @@ test("auto-continue retries are bounded: three failed attempts, no fourth", asyn
 
 test("failed continuation retries wait for the configured minimum interval", async () => {
   const logs: unknown[] = []
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     {
       client: {
         app: { log: async (input: unknown) => logs.push(input) },
@@ -2005,7 +2015,7 @@ test("recognized transport error strings accumulate as continuation failures", a
     "Provider response headers timed out after 10000ms",
   ]
   for (const [index, message] of errors.entries()) {
-    const hooks = await plugin.server(
+    const hooks = await setupServer(
       {
         client: {
           session: {
@@ -2038,7 +2048,7 @@ test("recognized transport error strings accumulate as continuation failures", a
 })
 
 test("failed tool output does not reset prompt failures; successful tool output does", async () => {
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     {
       client: {
         session: {
@@ -2075,7 +2085,7 @@ test("failed tool output does not reset prompt failures; successful tool output 
 
 test("duplicate idle events before any busy never count a failure or send a duplicate", async () => {
   const calls: unknown[] = []
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     {
       client: {
         session: {
@@ -2112,7 +2122,7 @@ test("duplicate idle events before any busy never count a failure or send a dupl
 
 test("paired idle events after a busy count exactly one unresolved failure and pause at the ceiling", async () => {
   const calls: unknown[] = []
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     {
       client: {
         session: {
@@ -2156,7 +2166,7 @@ test("paired idle events after a busy count exactly one unresolved failure and p
 })
 
 test("concurrent session.error transport events count at most one failure per pending attempt", async () => {
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     {
       client: {
         session: {
@@ -2215,7 +2225,7 @@ test("concurrent session.error transport events count at most one failure per pe
 
 test("auto_continue false never schedules a retry after a transport event", async () => {
   const calls: unknown[] = []
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     {
       client: {
         session: {
@@ -2252,7 +2262,7 @@ test("a repeated old assistant message cannot hide a no-response failure", async
     info: { id: "msg_old", role: "assistant", sessionID: "ses_old_message" },
     parts: [{ type: "text", text: "Earlier progress" }],
   }
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     {
       client: {
         session: {
@@ -2288,7 +2298,7 @@ test("a repeated old assistant message cannot hide a no-response failure", async
 test("non-transport prompt errors do not count toward the ceiling or auto-retry", async () => {
   const logs: unknown[] = []
   let calls = 0
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     {
       client: {
         app: { log: async (input: unknown) => logs.push(input) },
@@ -2321,7 +2331,7 @@ test("non-transport prompt errors do not count toward the ceiling or auto-retry"
 
 test("session.error without a pending attempt schedules recovery without a phantom failure", async () => {
   const calls: unknown[] = []
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     {
       client: {
         session: {
@@ -2362,7 +2372,7 @@ test("session.error without a pending attempt schedules recovery without a phant
 
 test("restart resolves a persisted started pending attempt at the next idle", async () => {
   const firstCalls: unknown[] = []
-  const hooks1 = await plugin.server(
+  const hooks1 = await setupServer(
     {
       client: {
         session: {
@@ -2389,7 +2399,7 @@ test("restart resolves a persisted started pending attempt at the next idle", as
   // A fresh instance reads the same persisted state: the started=true pending
   // attempt must be resolvable by the next idle after the restart.
   const calls2: unknown[] = []
-  const hooks2 = await plugin.server(
+  const hooks2 = await setupServer(
     {
       client: {
         session: {
@@ -2415,7 +2425,7 @@ test("restart resolves a persisted started pending attempt at the next idle", as
 })
 
 test("persisted started=false pending attempts go stale after restart", async () => {
-  const hooks1 = await plugin.server(
+  const hooks1 = await setupServer(
     {
       client: {
         session: {
@@ -2451,7 +2461,7 @@ test("persisted started=false pending attempts go stale after restart", async ()
   await hooks1.dispose?.()
 
   const calls: unknown[] = []
-  const hooks2 = await plugin.server(
+  const hooks2 = await setupServer(
     {
       client: {
         session: {
@@ -2477,7 +2487,7 @@ test("persisted started=false pending attempts go stale after restart", async ()
 
 test("a locally delivered unstarted attempt never becomes a false no-response failure", async () => {
   const calls: unknown[] = []
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     {
       client: {
         session: {
@@ -2521,7 +2531,7 @@ test("a locally delivered unstarted attempt never becomes a false no-response fa
 
 test("a built-in retry status cancels scheduled transport recovery", async () => {
   const calls: unknown[] = []
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     {
       client: {
         session: {
@@ -2557,7 +2567,7 @@ test("a built-in retry status cancels scheduled transport recovery", async () =>
 
 test("a native retry status suppresses a later session.error until busy or idle ends the episode", async () => {
   const calls: unknown[] = []
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     {
       client: {
         session: {
@@ -2608,7 +2618,7 @@ test("a native retry status suppresses a later session.error until busy or idle 
 
 test("an error during a native retry episode does not fail the pending attempt", async () => {
   const calls: unknown[] = []
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     {
       client: {
         session: {
@@ -2660,7 +2670,7 @@ test("an error during a native retry episode does not fail the pending attempt",
 
 test("assistant progress cancels no-pending transport recovery", async () => {
   const calls: unknown[] = []
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     {
       client: {
         session: {
@@ -2702,7 +2712,7 @@ test("assistant progress cancels no-pending transport recovery", async () => {
 
 test("successful tool progress cancels no-pending transport recovery", async () => {
   const calls: unknown[] = []
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     {
       client: {
         session: {
@@ -2736,7 +2746,7 @@ test("successful tool progress cancels no-pending transport recovery", async () 
 
 test("interrupted connection messages are not classified as transport recovery", async () => {
   const calls: unknown[] = []
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     {
       client: {
         session: {
@@ -2768,7 +2778,7 @@ test("interrupted connection messages are not classified as transport recovery",
 })
 
 test("tool progress honors completed states and never resets on failed or incomplete tools", async () => {
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     {
       client: {
         session: {
@@ -2826,7 +2836,7 @@ test("tool progress honors completed states and never resets on failed or incomp
 })
 
 test("delayed tool output from a prior turn cannot clear a newer pending attempt", async () => {
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     {
       client: {
         session: {
@@ -2880,7 +2890,7 @@ test("delayed tool output from a prior turn cannot clear a newer pending attempt
 
 test("watchdog rescues at most once per busy episode", async () => {
   const calls: unknown[] = []
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     {
       client: {
         session: {
@@ -2922,7 +2932,7 @@ test("watchdog rescues at most once per busy episode", async () => {
 test("a busy that races prompt resolution correlates to the persisted attempt", async () => {
   let resolvePrompt: (() => void) | undefined
   const calls: unknown[] = []
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     {
       client: {
         session: {
@@ -2968,7 +2978,7 @@ test("a busy that races prompt resolution correlates to the persisted attempt", 
 test("dispose prevents an in-flight continuation from scheduling retries or committing turns", async () => {
   let resolvePrompt: (() => void) | undefined
   const calls: unknown[] = []
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     {
       client: {
         session: {
@@ -3007,7 +3017,7 @@ test("dispose while a prompt is in flight rolls back on rejection without a fail
   let resolvePrompt: (() => void) | undefined
   const logs: unknown[] = []
   const calls: unknown[] = []
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     {
       client: {
         app: { log: async (input: unknown) => logs.push(input) },
@@ -3049,7 +3059,7 @@ test("dispose while a prompt is in flight rolls back on rejection without a fail
 })
 
 test("the public goal tool result never exposes internal pending attempt fields", async () => {
-  const hooks = await plugin.server(
+  const hooks = await setupServer(
     {
       client: {
         session: {

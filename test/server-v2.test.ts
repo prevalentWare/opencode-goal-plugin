@@ -180,6 +180,21 @@ async function createGoalViaV2Tool(mock: MockContext, objective: string, agent =
 }
 
 let dir = ""
+const setupDisposers: Array<() => void | Promise<void>> = []
+
+async function setupPlugin(...args: Parameters<typeof plugin.setup>) {
+  const cleanup = await plugin.setup(...args)
+  let disposed = false
+  const dispose = async () => {
+    if (disposed) return
+    disposed = true
+    const index = setupDisposers.indexOf(dispose)
+    if (index >= 0) setupDisposers.splice(index, 1)
+    await cleanup()
+  }
+  setupDisposers.push(dispose)
+  return dispose
+}
 
 beforeEach(async () => {
   dir = await mkdtemp(join(tmpdir(), "opencode-goal-plugin-v2-"))
@@ -187,6 +202,7 @@ beforeEach(async () => {
 })
 
 afterEach(async () => {
+  for (const dispose of setupDisposers.splice(0).reverse()) await dispose()
   delete process.env.OPENCODE_GOAL_STATE_PATH
   await rm(dir, { recursive: true, force: true })
 })
@@ -199,7 +215,7 @@ test("default export exposes both V1 server and V2 setup", () => {
 
 test("V2 setup registers goal tools with JSON Schema inputs, codemode:false, and {content} executors", async () => {
   const mock = makeMockContext({ auto_continue: false })
-  const cleanup = await plugin.setup(mock as never)
+  const cleanup = await setupPlugin(mock as never)
 
   expect(mock.tools.map((tool) => tool.name).sort()).toEqual(TOOL_NAMES)
 
@@ -230,7 +246,7 @@ test("V2 setup registers goal tools with JSON Schema inputs, codemode:false, and
 
 test("V2 list_all_goals returns goals from other sessions", async () => {
   const mock = makeMockContext({ auto_continue: false })
-  const cleanup = await plugin.setup(mock as never)
+  const cleanup = await setupPlugin(mock as never)
   await goalTool(mock, "create_goal").execute(
     { objective: "first V2 session goal" },
     toolContext("ses_first"),
@@ -253,7 +269,7 @@ test("V2 list_all_goals returns goals from other sessions", async () => {
 test("V2 create_goal recovers from a zero-filled state file", async () => {
   await writeFile(process.env.OPENCODE_GOAL_STATE_PATH!, "\u0000\u0000", "utf8")
   const mock = makeMockContext({ auto_continue: false })
-  const cleanup = await plugin.setup(mock as never)
+  const cleanup = await setupPlugin(mock as never)
 
   const created = await createGoalViaV2Tool(mock, "recover V2 state")
 
@@ -265,7 +281,7 @@ test("V2 create_goal recovers from a zero-filled state file", async () => {
 
 test("V2 create_goal reuses the same active objective without reinitializing state", async () => {
   const mock = makeMockContext({ auto_continue: false })
-  const cleanup = await plugin.setup(mock as never)
+  const cleanup = await setupPlugin(mock as never)
   await goalTool(mock, "create_goal").execute(
     { objective: "finish V2 safely", token_budget: 100 },
     toolContext(),
@@ -292,7 +308,7 @@ test("V2 create_goal reuses the same active objective without reinitializing sta
 
 test("V2 setup registers the /goal command via command transform", async () => {
   const mock = makeMockContext({ auto_continue: false })
-  const cleanup = await plugin.setup(mock as never)
+  const cleanup = await setupPlugin(mock as never)
 
   const command = mock.commandDraft.get("goal")
   expect(command).toBeDefined()
@@ -307,7 +323,7 @@ test("V2 setup registers the /goal command via command transform", async () => {
 
 test("V2 setup skips command registration when register_command is false", async () => {
   const mock = makeMockContext({ auto_continue: false, register_command: false })
-  const cleanup = await plugin.setup(mock as never)
+  const cleanup = await setupPlugin(mock as never)
 
   expect(mock.commandDraft.get("goal")).toBeUndefined()
   expect(mock.disposals).not.toContain("command.transform")
@@ -318,7 +334,7 @@ test("V2 setup skips command registration when register_command is false", async
 
 test("V2 session context hook injects the goal-mode system reminder", async () => {
   const mock = makeMockContext({ auto_continue: false })
-  const cleanup = await plugin.setup(mock as never)
+  const cleanup = await setupPlugin(mock as never)
 
   const contextHook = mock.hooks["context"]!
   expect(contextHook).toBeTypeOf("function")
@@ -336,7 +352,7 @@ test("V2 session context hook injects the goal-mode system reminder", async () =
 
 test("V2 setup registers tool execute hooks", async () => {
   const mock = makeMockContext({ auto_continue: false })
-  const cleanup = await plugin.setup(mock as never)
+  const cleanup = await setupPlugin(mock as never)
 
   expect(mock.hooks["execute.before"]).toBeTypeOf("function")
   expect(mock.hooks["execute.after"]).toBeTypeOf("function")
@@ -355,7 +371,7 @@ test("V2 setup registers tool execute hooks", async () => {
 
 test("V2 events account usage and checkpoints from step/usage events", async () => {
   const mock = makeMockContext({ auto_continue: false })
-  const cleanup = await plugin.setup(mock as never)
+  const cleanup = await setupPlugin(mock as never)
   await createGoalViaV2Tool(mock, "account usage from events")
 
   // Step events drive per-step token sums and checkpoints.
@@ -426,7 +442,7 @@ test("V2 events account usage and checkpoints from step/usage events", async () 
 
 test("V2 step accounting excludes steps observed before goal creation", async () => {
   const mock = makeMockContext({ auto_continue: false })
-  const cleanup = await plugin.setup(mock as never)
+  const cleanup = await setupPlugin(mock as never)
 
   mock.stream.push({
     type: "session.step.ended",
@@ -462,7 +478,7 @@ test("V2 step accounting excludes steps observed before goal creation", async ()
 
 test("V2 step and session sources do not double-count when session usage arrives first", async () => {
   const mock = makeMockContext({ auto_continue: false })
-  const cleanup = await plugin.setup(mock as never)
+  const cleanup = await setupPlugin(mock as never)
   await createGoalViaV2Tool(mock, "reconcile usage sources")
 
   mock.stream.push({
@@ -494,7 +510,7 @@ test("V2 step and session sources do not double-count when session usage arrives
 
 test("V2 failed steps account usage and replace stale assistant progress", async () => {
   const mock = makeMockContext({ auto_continue: false })
-  const cleanup = await plugin.setup(mock as never)
+  const cleanup = await setupPlugin(mock as never)
   await createGoalViaV2Tool(mock, "survive a failed model step")
 
   mock.stream.push({
@@ -529,7 +545,7 @@ test("V2 failed steps account usage and replace stale assistant progress", async
 
 test("V2 idle event triggers auto-continue via ctx.session.prompt", async () => {
   const mock = makeMockContext({ auto_continue: true, min_continue_interval_seconds: 0, max_auto_turns: 5 })
-  const cleanup = await plugin.setup(mock as never)
+  const cleanup = await setupPlugin(mock as never)
   await createGoalViaV2Tool(mock, "auto-continue from idle events")
 
   mock.stream.push({ type: "session.idle", created: Date.now(), data: { sessionID: "ses_v2" } })
@@ -548,7 +564,7 @@ test("V2 idle event triggers auto-continue via ctx.session.prompt", async () => 
 
 test("V2 idle continuation waits for a running child session", async () => {
   const mock = makeMockContext({ min_continue_interval_seconds: 1 })
-  const cleanup = await plugin.setup(mock as never)
+  const cleanup = await setupPlugin(mock as never)
   await createGoalViaV2Tool(mock, "wait for delegated work")
 
   mock.stream.push({ type: "session.created", created: 100, data: { sessionID: "child", parentID: "ses_v2" } })
@@ -566,7 +582,7 @@ test("V2 idle continuation waits for a running child session", async () => {
 
 test("V2 idle auto-continue is suppressed for plan-agent goals", async () => {
   const mock = makeMockContext({ auto_continue: true, min_continue_interval_seconds: 0, max_auto_turns: 5 })
-  const cleanup = await plugin.setup(mock as never)
+  const cleanup = await setupPlugin(mock as never)
   await createGoalViaV2Tool(mock, "plan-mode goal must stay paused", "plan")
 
   mock.stream.push({ type: "session.idle", created: Date.now(), data: { sessionID: "ses_v2" } })
@@ -582,7 +598,7 @@ test("V2 idle auto-continue is suppressed for plan-agent goals", async () => {
 
 test("V2 cleanup disposes registrations and stops the event consumer", async () => {
   const mock = makeMockContext({ auto_continue: false })
-  const cleanup = await plugin.setup(mock as never)
+  const cleanup = await setupPlugin(mock as never)
   await createGoalViaV2Tool(mock, "cleanup lifecycle")
 
   mock.stream.end()
@@ -604,7 +620,7 @@ test("V2 cleanup disposes registrations and stops the event consumer", async () 
 
 test("V2 session.error schedules bounded recovery without a phantom failure", async () => {
   const mock = makeMockContext({ auto_continue: true, min_continue_interval_seconds: 0, max_auto_turns: 5 })
-  const cleanup = await plugin.setup(mock as never)
+  const cleanup = await setupPlugin(mock as never)
   await createGoalViaV2Tool(mock, "recover from a transport error")
 
   mock.stream.push({
@@ -630,7 +646,7 @@ test("V2 idle after a started pending attempt counts one unresolved failure and 
     max_auto_turns: 5,
     max_prompt_failures: 1,
   })
-  const cleanup = await plugin.setup(mock as never)
+  const cleanup = await setupPlugin(mock as never)
   await createGoalViaV2Tool(mock, "detect a no response")
 
   mock.stream.push({ type: "session.idle", created: 1, data: { sessionID: "ses_v2" } })
@@ -659,7 +675,7 @@ test("V2 persists the attempt before the prompt resolves so a later busy can cor
       resolvePrompt = resolve
     })
   }
-  const cleanup = await plugin.setup(mock as never)
+  const cleanup = await setupPlugin(mock as never)
   await createGoalViaV2Tool(mock, "correlate a racing busy")
 
   void mock.stream.push({ type: "session.idle", created: 1, data: { sessionID: "ses_v2" } })
@@ -686,7 +702,7 @@ test("V2 persists the attempt before the prompt resolves so a later busy can cor
 
 test("V2 retry status cancels scheduled transport recovery", async () => {
   const mock = makeMockContext({ auto_continue: true, min_continue_interval_seconds: 0 })
-  const cleanup = await plugin.setup(mock as never)
+  const cleanup = await setupPlugin(mock as never)
   await createGoalViaV2Tool(mock, "let the native retry win")
 
   mock.stream.push({
@@ -706,7 +722,7 @@ test("V2 retry status cancels scheduled transport recovery", async () => {
 
 test("V2 successful tool progress cancels no-pending transport recovery", async () => {
   const mock = makeMockContext({ auto_continue: true, min_continue_interval_seconds: 0 })
-  const cleanup = await plugin.setup(mock as never)
+  const cleanup = await setupPlugin(mock as never)
   await createGoalViaV2Tool(mock, "cancel recovery via tool progress")
 
   mock.stream.push({
@@ -755,7 +771,7 @@ test("V2 successful tool progress cancels no-pending transport recovery", async 
 
 test("V2 assistant progress cancels no-pending transport recovery", async () => {
   const mock = makeMockContext({ auto_continue: true, min_continue_interval_seconds: 0 })
-  const cleanup = await plugin.setup(mock as never)
+  const cleanup = await setupPlugin(mock as never)
   await createGoalViaV2Tool(mock, "cancel recovery via assistant progress")
 
   mock.stream.push({
@@ -789,7 +805,7 @@ test("V2 assistant progress cancels no-pending transport recovery", async () => 
 
 test("V2 watchdog rescues a busy active goal without consuming auto-turn budgets", async () => {
   const mock = makeMockContext({ auto_continue: false, max_turn_time: 0.02, max_prompt_failures: 5, max_auto_turns: 1 })
-  const cleanup = await plugin.setup(mock as never)
+  const cleanup = await setupPlugin(mock as never)
   await createGoalViaV2Tool(mock, "watchdog should not eat the budget")
 
   mock.stream.push({ type: "session.status", created: Date.now(), data: { sessionID: "ses_v2", status: { type: "busy" } } })
@@ -807,7 +823,7 @@ test("V2 non-transport prompt errors do not count toward the ceiling or retry", 
   mock.session.prompt = async () => {
     throw new Error("invalid provider configuration")
   }
-  const cleanup = await plugin.setup(mock as never)
+  const cleanup = await setupPlugin(mock as never)
   await createGoalViaV2Tool(mock, "non-transport must be ignored")
 
   mock.stream.push({ type: "session.idle", created: Date.now(), data: { sessionID: "ses_v2" } })
@@ -823,7 +839,7 @@ test("V2 non-transport prompt errors do not count toward the ceiling or retry", 
 
 test("V2 a native retry status suppresses a later session.error until busy ends the episode", async () => {
   const mock = makeMockContext({ auto_continue: true, min_continue_interval_seconds: 0, max_prompt_failures: 3 })
-  const cleanup = await plugin.setup(mock as never)
+  const cleanup = await setupPlugin(mock as never)
   await createGoalViaV2Tool(mock, "native retry must win")
 
   // retry arrives before the transport error; the error is suppressed while
@@ -857,7 +873,7 @@ test("V2 a native retry status suppresses a later session.error until busy ends 
 
 test("V2 watchdog no-response counts a failure on idle even with auto_continue false", async () => {
   const mock = makeMockContext({ auto_continue: false, max_turn_time: 0.02, max_prompt_failures: 5, max_auto_turns: 1 })
-  const cleanup = await plugin.setup(mock as never)
+  const cleanup = await setupPlugin(mock as never)
   await createGoalViaV2Tool(mock, "watchdog no response with auto-continue disabled")
 
   mock.stream.push({ type: "session.status", created: Date.now(), data: { sessionID: "ses_v2", status: { type: "busy" } } })
@@ -885,7 +901,7 @@ test("V2 watchdog no-response counts a failure on idle even with auto_continue f
 
 test("V2 delayed tool output from a prior turn cannot clear a newer pending attempt", async () => {
   const mock = makeMockContext({ auto_continue: false })
-  const cleanup = await plugin.setup(mock as never)
+  const cleanup = await setupPlugin(mock as never)
   await createGoalViaV2Tool(mock, "correlate tool progress to the attempt")
 
   // The tool call starts while attempt A is pending; the before hook captures
@@ -937,7 +953,7 @@ test("V2 dispose during an in-flight prompt rolls back the reserved attempt on r
     })
     throw new Error("network down")
   }
-  const cleanup = await plugin.setup(mock as never)
+  const cleanup = await setupPlugin(mock as never)
   await createGoalViaV2Tool(mock, "dispose mid-flight rejection")
 
   void mock.stream.push({ type: "session.idle", created: 1, data: { sessionID: "ses_v2" } })
@@ -967,7 +983,7 @@ test("V2 commits an accepted prompt when its recovery timer is canceled in fligh
       resolvePrompt = resolve
     })
   }
-  const cleanup = await plugin.setup(mock as never)
+  const cleanup = await setupPlugin(mock as never)
   await createGoalViaV2Tool(mock, "commit accepted recovery")
 
   mock.stream.push({
@@ -999,7 +1015,7 @@ test("V2 commits an accepted prompt when its recovery timer is canceled in fligh
 
 test("V2 completed tool failures do not clear retry state", async () => {
   const mock = makeMockContext({ auto_continue: false })
-  const cleanup = await plugin.setup(mock as never)
+  const cleanup = await setupPlugin(mock as never)
   await createGoalViaV2Tool(mock, "keep failed tools from masking recovery")
 
   await reserveContinuation("ses_v2", 10, 0)
