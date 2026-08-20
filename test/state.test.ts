@@ -273,7 +273,14 @@ test("writes state with owner-only file permissions", async () => {
 
   const mode = (await stat(process.env.OPENCODE_GOAL_STATE_PATH!)).mode & 0o777
 
-  expect(mode).toBe(0o600)
+  if (process.platform === "win32") {
+    // Windows cannot express POSIX mode bits: Node reports writable files as
+    // 0o666 (0o444 when read-only). Assert the file is not read-only there,
+    // while POSIX keeps the exact 0600 assertion.
+    expect(mode & 0o222).not.toBe(0)
+  } else {
+    expect(mode).toBe(0o600)
+  }
 })
 
 test("does not overwrite corrupt persisted state", async () => {

@@ -225,7 +225,11 @@ If `XDG_DATA_HOME` is not set, the default is:
 
 Set `OPENCODE_GOAL_STATE_PATH` to use a custom file.
 
-The state file is written atomically with owner-only permissions when the host filesystem supports it. Existing active goals recover from disk with their full objective, budget, history, and checkpoint metadata.
+The state file is written atomically through a same-directory temp file: the final path is only ever replaced by a fully-flushed file, so after a crash the state is the previous or the new valid version, never a torn one. The file is created with owner-only permissions where the host filesystem supports them, and the temp name is a random UUID opened exclusively so concurrent writers cannot collide.
+
+Ordinary fsync improves crash consistency but is not `F_FULLFSYNC`, so sudden power loss on macOS/APFS is not an absolute durability guarantee; where the platform cannot fsync the parent directory, a crash may leave the old or the new state file (both valid), never a partially-written one. Existing active goals recover from disk with their full objective, budget, history, and checkpoint metadata.
+
+If the rename succeeds but syncing the parent directory reports a genuine I/O error, the mutation reports a write failure even though the new valid state may already be present. This avoids claiming durability that the filesystem did not confirm.
 
 ## Credits
 

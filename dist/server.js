@@ -3,11 +3,120 @@
 import { z } from "zod";
 
 // src/state.ts
-import { chmod, mkdir, open, readFile, rename } from "fs/promises";
+import { mkdir, readFile } from "fs/promises";
 import { homedir } from "os";
-import { dirname, join } from "path";
+import { dirname as dirname2, join } from "path";
 import { Data, Effect, Schema } from "effect";
 
+// src/atomic-write.ts
+import { randomUUID } from "crypto";
+import { chmod, open, rename, unlink } from "fs/promises";
+import { dirname } from "path";
+function isUnsupportedSyncDirError(error, platform) {
+  const code = error?.code;
+  return code === "EINVAL" || code === "ENOTSUP" || code === "EOPNOTSUPP" || code === "EISDIR" || platform === "win32" && (code === "EPERM" || code === "EACCES" || code === "EBADF");
+}
+function isTransientRenameError(error, platform) {
+  if (platform !== "win32")
+    return false;
+  const code = error?.code;
+  return code === "EPERM" || code === "EACCES" || code === "EBUSY";
+}
+async function bestEffort(action) {
+  try {
+    await action();
+  } catch {}
+}
+var defaultSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+var defaultDirOpenOps = {
+  async open(dir, flags) {
+    const handle = await open(dir, flags);
+    return {
+      sync: () => handle.sync(),
+      close: () => handle.close()
+    };
+  }
+};
+async function syncDirectory(dir, ops = defaultDirOpenOps, platform = process.platform) {
+  let fsHandle = null;
+  try {
+    const handle = await ops.open(dir, "r");
+    fsHandle = handle;
+    await handle.sync();
+  } catch (error) {
+    if (!isUnsupportedSyncDirError(error, platform))
+      throw error;
+  } finally {
+    const cleanupHandle = fsHandle;
+    if (cleanupHandle)
+      await bestEffort(() => cleanupHandle.close());
+  }
+}
+var defaultAtomicWriteOps = {
+  platform: process.platform,
+  async open(path, flags, mode) {
+    const handle = await open(path, flags, mode);
+    return {
+      write: (data) => handle.writeFile(data),
+      sync: () => handle.sync(),
+      close: () => handle.close()
+    };
+  },
+  rename,
+  chmod,
+  unlink,
+  syncDir: (dir, platform) => syncDirectory(dir, defaultDirOpenOps, platform),
+  sleep: defaultSleep
+};
+var RENAME_ATTEMPTS = 3;
+var RENAME_RETRY_DELAY_MS = 20;
+async function renameWithRetry(ops, from, to) {
+  let attempt = 0;
+  for (;; ) {
+    try {
+      await ops.rename(from, to);
+      return;
+    } catch (error) {
+      attempt += 1;
+      if (!isTransientRenameError(error, ops.platform) || attempt >= RENAME_ATTEMPTS)
+        throw error;
+      const delay = RENAME_RETRY_DELAY_MS * attempt;
+      await ops.sleep(delay);
+    }
+  }
+}
+async function atomicWriteFile(file, data, ops = defaultAtomicWriteOps) {
+  const tmp = `${file}.${randomUUID()}.tmp`;
+  let handle = null;
+  let created = false;
+  let renamed = false;
+  try {
+    handle = await ops.open(tmp, "wx", 384);
+    created = true;
+    await handle.write(data);
+    await handle.sync();
+    await handle.close();
+    handle = null;
+    await renameWithRetry(ops, tmp, file);
+    renamed = true;
+    await bestEffort(() => ops.chmod(file, 384));
+    try {
+      await ops.syncDir(dirname(file), ops.platform);
+    } catch (error) {
+      if (!isUnsupportedSyncDirError(error, ops.platform))
+        throw error;
+    }
+  } catch (error) {
+    const cleanupHandle = handle;
+    if (cleanupHandle)
+      await bestEffort(() => cleanupHandle.close());
+    if (created && !renamed)
+      await bestEffort(() => ops.unlink(tmp));
+    throw error;
+  }
+}
+
+// src/state.ts
 class StateReadError extends Data.TaggedError("StateReadError") {
 }
 
@@ -117,20 +226,9 @@ function writeStateEffect(state) {
   return Effect.tryPromise({
     try: async () => {
       const file = statePath();
-      await mkdir(dirname(file), { recursive: true, mode: 448 });
-      const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
-      const handle = await open(tmp, "w", 384);
-      try {
-        await handle.writeFile(JSON.stringify(state, null, 2) + `
+      await mkdir(dirname2(file), { recursive: true, mode: 448 });
+      await atomicWriteFile(file, JSON.stringify(state, null, 2) + `
 `);
-        await handle.sync();
-      } finally {
-        await handle.close();
-      }
-      await rename(tmp, file);
-      await chmod(file, 384).catch(() => {
-        return;
-      });
     },
     catch: (cause) => new StateWriteError({ cause })
   });
