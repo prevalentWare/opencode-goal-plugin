@@ -34,6 +34,15 @@ var CheckpointSchema = Schema.Struct({
   summary: Schema.String,
   timestamp: Schema.Number
 });
+var PendingAttemptSchema = Schema.Struct({
+  id: Schema.String,
+  reservedAt: Schema.Number,
+  started: Schema.Boolean,
+  delivered: Schema.Boolean,
+  committed: Schema.Boolean,
+  armNoProgress: Schema.Boolean,
+  previousLastContinuationAt: Schema.NullOr(Schema.Number)
+});
 var GoalSchema = Schema.Struct({
   sessionID: Schema.String,
   objective: Schema.String,
@@ -50,6 +59,7 @@ var GoalSchema = Schema.Struct({
   autoTurns: Schema.Number,
   lastContinuationAt: NullableNumber,
   continuationFailures: Schema.optionalWith(Schema.Number, { default: () => 0 }),
+  pendingAttempt: Schema.optionalWith(Schema.NullOr(PendingAttemptSchema), { default: () => null }),
   lastStatus: Schema.optionalWith(NullableString, { default: () => null }),
   maxAutoTurns: Schema.optionalWith(NullableNumber, { default: () => null }),
   maxDurationSeconds: Schema.optionalWith(NullableNumber, { default: () => null }),
@@ -178,6 +188,8 @@ function normalizeGoal(goal) {
   goal.lastAssistantMessageID ??= "";
   goal.lastPromptAgent ??= null;
   goal.awaitingContinuationProgress = goal.awaitingContinuationProgress === true;
+  goal.lastContinuationAt = typeof goal.lastContinuationAt === "number" && Number.isFinite(goal.lastContinuationAt) ? Math.floor(goal.lastContinuationAt >= 1000000000000 ? goal.lastContinuationAt / 1000 : goal.lastContinuationAt) : null;
+  goal.pendingAttempt = normalizePendingAttempt(goal.pendingAttempt);
   goal.continuationBaselineMessageID ??= "";
   goal.continuationBaselineSummary ??= "";
   goal.noProgressTurns = nonNegativeInteger(goal.noProgressTurns, 0);
@@ -189,6 +201,22 @@ function normalizeGoal(goal) {
   goal.budgetWrapupSent = goal.budgetWrapupSent === true;
   goal.stopReason ??= null;
   return goal;
+}
+function normalizePendingAttempt(attempt) {
+  if (!attempt || typeof attempt !== "object")
+    return null;
+  return {
+    id: typeof attempt.id === "string" && attempt.id ? attempt.id : randomId(),
+    reservedAt: typeof attempt.reservedAt === "number" && Number.isFinite(attempt.reservedAt) ? attempt.reservedAt : Date.now(),
+    started: attempt.started === true,
+    delivered: attempt.delivered === true,
+    committed: attempt.committed === true,
+    armNoProgress: attempt.armNoProgress !== false,
+    previousLastContinuationAt: typeof attempt.previousLastContinuationAt === "number" && Number.isFinite(attempt.previousLastContinuationAt) ? attempt.previousLastContinuationAt : null
+  };
+}
+function randomId() {
+  return `att_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
 }
 function normalizeCreateOptions(input) {
   if (typeof input === "number" || input === null) {
@@ -268,10 +296,18 @@ function snapshot(goal) {
     sampledAt
   };
 }
+function snapshotInternal(goal) {
+  return { ...snapshot(goal), pendingAttempt: goal.pendingAttempt };
+}
 async function getGoal(sessionID) {
   const state = await readState();
   const goal = state.goals[sessionID];
   return goal ? snapshot(goal) : null;
+}
+async function getGoalInternal(sessionID) {
+  const state = await readState();
+  const goal = state.goals[sessionID];
+  return goal ? snapshotInternal(goal) : null;
 }
 async function createGoal(sessionID, objective, options) {
   const value = validateObjective(objective);
@@ -299,6 +335,7 @@ async function createGoal(sessionID, objective, options) {
       autoTurns: 0,
       lastContinuationAt: null,
       continuationFailures: 0,
+      pendingAttempt: null,
       lastStatus: paused ? "Goal recorded from Plan mode; execution paused until resumed from Build mode." : "Goal set.",
       maxAutoTurns: normalizedOptions.maxAutoTurns,
       maxDurationSeconds: normalizedOptions.maxDurationSeconds,
@@ -342,6 +379,11 @@ async function updateGoalObjective(sessionID, objective, status = "active", opti
     goal.closedAt = null;
     goal.stopReason = planModePause ? PLAN_MODE_STOP_REASON : null;
     goal.budgetWrapupSent = false;
+    if (goal.status === "active") {
+      goal.continuationFailures = 0;
+      goal.pendingAttempt = null;
+      goal.awaitingContinuationProgress = false;
+    }
     if (agent)
       goal.lastPromptAgent = agent;
     goal.lastStatus = planModePause ? "Goal objective updated; execution paused while the session is in Plan mode." : goal.status === "active" ? "Goal objective updated and resumed." : "Goal objective updated and paused.";
@@ -393,6 +435,7 @@ async function setGoalStatus(sessionID, status, agent) {
     goal.updatedAt = nowSeconds();
     goal.lastAccountedAt = status === "active" ? goal.updatedAt : null;
     goal.continuationFailures = status === "active" ? 0 : goal.continuationFailures;
+    goal.pendingAttempt = status === "active" ? null : goal.pendingAttempt;
     goal.noProgressTurns = status === "active" ? 0 : goal.noProgressTurns;
     goal.stopReason = status === "active" ? null : "paused";
     goal.budgetWrapupSent = status === "active" ? false : goal.budgetWrapupSent;
@@ -468,6 +511,7 @@ async function recordAssistantProgress(sessionID, input) {
     const threshold = positiveIntegerOrNull(input.noProgressTokenThreshold) ?? goal.noProgressTokenThreshold;
     const maxNoProgressTurns = positiveIntegerOrNull(input.maxNoProgressTurns) ?? goal.maxNoProgressTurns;
     const summary = summarizeText(text);
+    const substantive = /[\p{L}\p{N}]/u.test(text);
     const previousSummary = summarizeText(goal.lastAssistantText);
     const repeatedMessage = Boolean(messageID && messageID === goal.lastAssistantMessageID);
     const changed = Boolean(summary && summary !== previousSummary);
@@ -477,9 +521,18 @@ async function recordAssistantProgress(sessionID, input) {
       goal.lastAssistantText = text;
     if (messageID)
       goal.lastAssistantMessageID = messageID;
-    const continuationTurnCompleted = input.evaluateContinuation === true && goal.awaitingContinuationProgress && Boolean(messageID) && messageID !== goal.continuationBaselineMessageID;
+    if (substantive && summary && (!repeatedMessage || changed)) {
+      const attempt = goal.pendingAttempt;
+      if (attempt == null || input.completedAt == null || input.completedAt >= attempt.reservedAt) {
+        goal.continuationFailures = 0;
+        goal.pendingAttempt = null;
+      }
+    }
+    const attemptForCompletion = goal.pendingAttempt;
+    const continuationTurnCompleted = input.evaluateContinuation === true && goal.awaitingContinuationProgress && Boolean(messageID) && messageID !== goal.continuationBaselineMessageID && (input.completedAt == null || attemptForCompletion == null || input.completedAt >= attemptForCompletion.reservedAt);
     if (continuationTurnCompleted) {
       goal.awaitingContinuationProgress = false;
+      goal.pendingAttempt = null;
       const lowOutput = outputTokens > 0 && outputTokens < (threshold ?? DEFAULT_NO_PROGRESS_TOKEN_THRESHOLD);
       const changedSinceContinuation = Boolean(summary && summary !== goal.continuationBaselineSummary);
       if (lowOutput && !changedSinceContinuation) {
@@ -520,32 +573,84 @@ async function reserveContinuation(sessionID, maxAutoTurns, minIntervalSeconds) 
     if (goal.lastContinuationAt && now - goal.lastContinuationAt < minIntervalSeconds)
       return null;
     goal.autoTurns += 1;
+    const previousLastContinuationAt = goal.lastContinuationAt;
     goal.lastContinuationAt = now;
     goal.continuationBaselineMessageID = goal.lastAssistantMessageID;
     goal.continuationBaselineSummary = summarizeText(goal.lastAssistantText);
+    goal.pendingAttempt = {
+      id: randomId(),
+      reservedAt: Date.now(),
+      started: false,
+      delivered: false,
+      committed: true,
+      armNoProgress: true,
+      previousLastContinuationAt
+    };
+    goal.awaitingContinuationProgress = false;
     goal.lastStatus = `Auto-continue ${goal.autoTurns} reserved.`;
     pushHistory(goal, "autoContinue", goal.lastStatus);
     goal.updatedAt = now;
-    return snapshot(goal);
+    return snapshotInternal(goal);
   });
 }
-async function recordContinuationResult(sessionID, result, maxFailures) {
+async function rollbackContinuationAttempt(sessionID) {
+  return mutate((state) => {
+    const goal = state.goals[sessionID];
+    if (!goal)
+      return false;
+    const attempt = goal.pendingAttempt;
+    if (!attempt || attempt.delivered || !attempt.committed) {
+      if (attempt && !attempt.delivered)
+        goal.pendingAttempt = null;
+      return false;
+    }
+    goal.autoTurns = Math.max(0, goal.autoTurns - 1);
+    goal.lastContinuationAt = attempt.previousLastContinuationAt;
+    goal.pendingAttempt = null;
+    goal.awaitingContinuationProgress = false;
+    goal.lastStatus = "Auto-continue attempt canceled before delivery.";
+    goal.updatedAt = nowSeconds();
+    return true;
+  });
+}
+async function recordContinuationResult(sessionID, result, maxFailures, options) {
   return mutate((state) => {
     const goal = state.goals[sessionID];
     if (!goal || isClosed(goal.status))
-      return goal ? snapshot(goal) : null;
+      return goal ? snapshotInternal(goal) : null;
     const now = nowSeconds();
     goal.updatedAt = now;
     if (result === "success") {
-      goal.continuationFailures = 0;
       if (goal.status === "active") {
+        const attempt = goal.pendingAttempt;
+        if (attempt) {
+          attempt.delivered = true;
+          attempt.started = attempt.started || options?.started === true;
+          attempt.armNoProgress = options?.armNoProgress ?? attempt.armNoProgress;
+          if (attempt.armNoProgress)
+            goal.awaitingContinuationProgress = true;
+        } else {
+          goal.pendingAttempt = {
+            id: randomId(),
+            reservedAt: Date.now(),
+            started: options?.started === true,
+            delivered: true,
+            committed: false,
+            armNoProgress: options?.armNoProgress !== false,
+            previousLastContinuationAt: goal.lastContinuationAt
+          };
+          if (goal.pendingAttempt.armNoProgress)
+            goal.awaitingContinuationProgress = true;
+        }
         goal.lastStatus = "Auto-continue prompt sent.";
-        goal.awaitingContinuationProgress = true;
       }
-      return snapshot(goal);
+      return snapshotInternal(goal);
     }
+    if (options?.requirePending && goal.pendingAttempt == null)
+      return null;
     goal.continuationFailures += 1;
     goal.awaitingContinuationProgress = false;
+    goal.pendingAttempt = null;
     goal.lastStatus = `Auto-continue failed ${goal.continuationFailures} time(s).`;
     pushHistory(goal, "error", goal.lastStatus);
     if (goal.continuationFailures >= maxFailures) {
@@ -557,7 +662,44 @@ async function recordContinuationResult(sessionID, result, maxFailures) {
       goal.blocker = "Auto-continue prompt failed repeatedly. Resume the goal to retry.";
       pushHistory(goal, "paused", goal.lastStatus);
     }
-    return snapshot(goal);
+    return snapshotInternal(goal);
+  });
+}
+async function markPendingContinuationStarted(sessionID) {
+  const state = await readState();
+  const current = state.goals[sessionID];
+  if (!current || current.status !== "active")
+    return current ? snapshotInternal(current) : null;
+  if (current.pendingAttempt == null || current.pendingAttempt.started)
+    return snapshotInternal(current);
+  return mutate((state2) => {
+    const goal = state2.goals[sessionID];
+    if (!goal || goal.status !== "active")
+      return goal ? snapshotInternal(goal) : null;
+    if (goal.pendingAttempt == null || goal.pendingAttempt.started)
+      return snapshotInternal(goal);
+    goal.pendingAttempt.started = true;
+    goal.updatedAt = nowSeconds();
+    return snapshotInternal(goal);
+  });
+}
+async function recordToolProgress(sessionID, text, expectedAttemptID) {
+  return mutate((state) => {
+    const goal = state.goals[sessionID];
+    if (!goal || goal.status !== "active")
+      return goal ? snapshotInternal(goal) : null;
+    const value = text?.trim() ?? "";
+    if (!value)
+      return snapshotInternal(goal);
+    if (goal.continuationFailures === 0 && goal.pendingAttempt == null)
+      return snapshotInternal(goal);
+    if (goal.pendingAttempt != null && expectedAttemptID !== undefined && expectedAttemptID !== goal.pendingAttempt.id) {
+      return snapshotInternal(goal);
+    }
+    goal.continuationFailures = 0;
+    goal.pendingAttempt = null;
+    goal.updatedAt = nowSeconds();
+    return snapshotInternal(goal);
   });
 }
 function reserveWrapup(goal) {
@@ -566,7 +708,7 @@ function reserveWrapup(goal) {
   goal.budgetWrapupSent = true;
   goal.updatedAt = nowSeconds();
   pushHistory(goal, "limited", `${goal.status}: ${goal.stopReason ?? "goal limit reached"}; requested final handoff.`);
-  return snapshot(goal);
+  return snapshotInternal(goal);
 }
 function maybeStopForBudget(goal) {
   if (goal.status !== "active")
@@ -789,6 +931,11 @@ var DEFAULT_RESTRICTED_AGENTS = ["plan"];
 var TASK_SETTLE_DELAY_MS = 25;
 var SNAPSHOT_IDLE_HOLD_MS = 250;
 var MAX_TIMER_DELAY_MS = 2147483647;
+var STALE_PENDING_MS = 30000;
+var RETRY_SETTLE_MS = 25;
+var TRANSPORT_ERROR_PATTERN = /\b(?:network|fetch|socket|connect|connection|timeout|timed out|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|EPIPE|transport|stream|websocket|offline|internet|request failed|proxy)\b/i;
+var NON_TRANSPORT_TERMINAL_PATTERN = /\b(?:abort(?:ed)?|interrupt(?:ed|ion)?)\b/i;
+var NON_PROGRESS_TOOLS = new Set(["get_goal", "get_goal_history"]);
 var TASK_TERMINAL_STATES = new Set(["completed", "error", "cancelled"]);
 var PLAN_MODE_CREATE_NOTICE = 'Goal recorded while the session is in Plan mode, so execution is paused. Do not start implementation work now. Ask the user to switch to Build mode and resume the goal (for example with "/goal resume") to begin execution.';
 var LIMITED_GOAL_NOTICE = "Safety limit reached. Do not start or continue substantive work for this goal. Summarize useful progress, remaining work, and blockers, then wait for the user to resume or edit the goal.";
@@ -830,6 +977,9 @@ function commandNameFromOptions(options) {
 }
 function positiveIntegerOrNull2(value) {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : null;
+}
+function nonNegativeIntegerOrNull(value) {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
 }
 function timeoutMillisecondsFromSeconds(value) {
   if (typeof value !== "number" || !Number.isFinite(value) || value <= 0)
@@ -999,6 +1149,103 @@ function isIdleEvent(event) {
     return true;
   const status = event.properties?.status;
   return event.type === "session.status" && typeof status === "object" && status !== null && status.type === "idle";
+}
+function isTransportError(error) {
+  const message = error instanceof Error ? error.message : typeof error === "string" ? error : "";
+  if (!message || NON_TRANSPORT_TERMINAL_PATTERN.test(message))
+    return false;
+  if (TRANSPORT_ERROR_PATTERN.test(message))
+    return true;
+  return false;
+}
+function transportErrorMessageFromEvent(props) {
+  for (const candidate of [props.error, props.message, props.reason]) {
+    if (typeof candidate === "string" && candidate.trim())
+      return candidate.trim();
+    if (isRecord(candidate)) {
+      for (const key of ["message", "error", "reason", "description"]) {
+        const value = candidate[key];
+        if (typeof value === "string" && value.trim())
+          return value.trim();
+      }
+    }
+  }
+  return "";
+}
+function continuationRetryDelayMs(minIntervalSeconds, attemptAt, now = Date.now()) {
+  return Math.max(0, attemptAt + minIntervalSeconds * 1000 - now) + RETRY_SETTLE_MS;
+}
+function continuationDelayFromSnapshot(minIntervalSeconds, lastContinuationAt, now = Date.now()) {
+  if (lastContinuationAt == null)
+    return RETRY_SETTLE_MS;
+  return Math.max(0, (lastContinuationAt + minIntervalSeconds + 1) * 1000 - now) + RETRY_SETTLE_MS;
+}
+function pendingAttemptOf(goal) {
+  return goal?.pendingAttempt ?? null;
+}
+function pendingReadyForFailure(attempt, deliveredLocally, now = Date.now()) {
+  if (!attempt)
+    return false;
+  if (attempt.started)
+    return true;
+  if (deliveredLocally)
+    return false;
+  return now - attempt.reservedAt >= STALE_PENDING_MS;
+}
+async function reconcileLocalMarkerAfterProgress(locallyDelivered, sessionID, goal) {
+  if (!goal || goal.continuationFailures !== 0)
+    return;
+  const internal = await getGoalInternal(sessionID);
+  if (internal && internal.pendingAttempt == null)
+    locallyDelivered.delete(sessionID);
+}
+var TOOL_FAILURE_STATES = new Set([
+  "failed",
+  "failure",
+  "error",
+  "cancelled",
+  "canceled",
+  "aborted",
+  "abort",
+  "interrupted",
+  "running",
+  "pending",
+  "in_progress",
+  "in-progress",
+  "incomplete",
+  "partial",
+  "timeout",
+  "timed_out"
+]);
+function toolOutputFailed(output) {
+  if (!isRecord(output))
+    return true;
+  if (typeof output.error === "string" && output.error.trim())
+    return true;
+  if (output.success === false)
+    return true;
+  const text = typeof output.output === "string" ? output.output.trim() : "";
+  const state = output.state ?? output.status;
+  if (typeof state === "string") {
+    const normalized = state.trim().toLowerCase();
+    if (TOOL_FAILURE_STATES.has(normalized))
+      return true;
+    if (["completed", "complete", "success", "succeeded", "ok", "done"].includes(normalized))
+      return false;
+  }
+  if (isRecord(output.metadata)) {
+    const metaState = output.metadata.state ?? output.metadata.status;
+    if (typeof metaState === "string" && TOOL_FAILURE_STATES.has(metaState.trim().toLowerCase()))
+      return true;
+  }
+  const taskState = parseTaskState(text);
+  if (taskState)
+    return taskState !== "completed";
+  if (/^state:\s*(failed|failure|error|cancelled|canceled|aborted|abort|interrupted|running|pending|incomplete|partial|timeout|timed_out)\b/im.test(text))
+    return true;
+  if (/^<error>/i.test(text) || /^<tool-error>/i.test(text) || /^error:/i.test(text))
+    return true;
+  return false;
 }
 function sessionIDFromEvent(event) {
   const direct = event.properties?.sessionID;
@@ -1283,15 +1530,21 @@ class TaskTracker {
 }
 async function recordAssistantMessage(sessionID, message, options, evaluateContinuation = false) {
   if (!message)
-    return;
-  await recordAssistantProgress(sessionID, {
-    messageID: messageID(message),
-    text: textFromMessage(message),
+    return { goal: null, progressed: false };
+  const before = await getGoal(sessionID);
+  const id = messageID(message) ?? "";
+  const text = textFromMessage(message);
+  const progressed = Boolean(/[\p{L}\p{N}]/u.test(text) && (id !== (before?.lastAssistantMessageID ?? "") || text !== (before?.lastAssistantText ?? "")));
+  const goal = await recordAssistantProgress(sessionID, {
+    messageID: id,
+    text,
     outputTokens: outputTokensFromMessage(message) ?? null,
     noProgressTokenThreshold: positiveIntegerOrNull2(options.no_progress_token_threshold),
     maxNoProgressTurns: positiveIntegerOrNull2(options.max_no_progress_turns),
-    evaluateContinuation
+    evaluateContinuation,
+    completedAt: messageCompletedAt(message)
   });
+  return { goal, progressed };
 }
 function mergeSystemReminder(output, reminder) {
   if (!reminder.trim())
@@ -1373,11 +1626,20 @@ function textFromToolResult(result) {
   }
   return;
 }
+function toolAttemptKey(sessionID, callID) {
+  return `${sessionID}\x00${callID}`;
+}
+function clearToolAttemptsForSession(attempts, sessionID) {
+  for (const key of [...attempts.keys()]) {
+    if (key.startsWith(`${sessionID}\x00`))
+      attempts.delete(key);
+  }
+}
 var server = async ({ client }, options) => {
   const autoContinue = options?.auto_continue ?? true;
   const deferWhileTasksActive = options?.defer_while_tasks_active ?? true;
   const maxAutoTurns = positiveIntegerOrNull2(options?.max_auto_turns) ?? DEFAULT_MAX_AUTO_TURNS;
-  const minInterval = positiveIntegerOrNull2(options?.min_continue_interval_seconds) ?? DEFAULT_CONTINUE_INTERVAL_SECONDS;
+  const minInterval = nonNegativeIntegerOrNull(options?.min_continue_interval_seconds) ?? DEFAULT_CONTINUE_INTERVAL_SECONDS;
   const maxTurnTimeMs = timeoutMillisecondsFromSeconds(options?.max_turn_time);
   const maxPromptFailures = positiveIntegerOrNull2(options?.max_prompt_failures) ?? DEFAULT_MAX_PROMPT_FAILURES;
   const registerCommand = options?.register_command ?? true;
@@ -1387,9 +1649,14 @@ var server = async ({ client }, options) => {
   const scheduledContinuations = new Map;
   const turnWatchdogs = new Map;
   const busySessions = new Set;
+  const nativeRetrySessions = new Set;
+  const locallyDeliveredPendingSessions = new Set;
+  const toolAttempts = new Map;
+  const watchdogRescuedSessions = new Set;
   const planAgents = restrictedAgentSet(options);
   const isPlanAgent = (agent) => typeof agent === "string" && planAgents.has(agent.trim().toLowerCase());
   const goalServices = { options: options ?? {}, isPlanAgent };
+  let disposed = false;
   async function taskBlockStatus(sessionID) {
     if (!deferWhileTasksActive)
       return false;
@@ -1409,6 +1676,8 @@ var server = async ({ client }, options) => {
   function armTurnWatchdog(sessionID) {
     if (maxTurnTimeMs == null)
       return;
+    if (watchdogRescuedSessions.has(sessionID))
+      return;
     clearTurnWatchdog(sessionID);
     const watchdog = {
       timer: setTimeout(() => void runTurnWatchdog(sessionID, watchdog), maxTurnTimeMs)
@@ -1421,7 +1690,9 @@ var server = async ({ client }, options) => {
   async function runTurnWatchdog(sessionID, watchdog) {
     let claimedContinuation = false;
     try {
-      if (turnWatchdogs.get(sessionID) !== watchdog || !busySessions.has(sessionID))
+      if (disposed)
+        return;
+      if (turnWatchdogs.get(sessionID) !== watchdog || !busySessions.has(sessionID) || watchdogRescuedSessions.has(sessionID))
         return;
       const goal = await getGoal(sessionID);
       if (turnWatchdogs.get(sessionID) !== watchdog || !busySessions.has(sessionID))
@@ -1434,6 +1705,8 @@ var server = async ({ client }, options) => {
       const latestTurnAgent = agentFromMessage(latestAssistant);
       if (isPlanAgent(latestTurnAgent))
         return;
+      const observedBeforeRescue = await recordAssistantMessage(sessionID, latestAssistant, options ?? {});
+      await reconcileLocalMarkerAfterProgress(locallyDeliveredPendingSessions, sessionID, observedBeforeRescue.goal);
       const taskStatus = await taskBlockStatus(sessionID);
       if (turnWatchdogs.get(sessionID) !== watchdog || !busySessions.has(sessionID))
         return;
@@ -1447,9 +1720,16 @@ var server = async ({ client }, options) => {
       turnWatchdogs.delete(sessionID);
       activeContinuations.add(sessionID);
       claimedContinuation = true;
+      watchdogRescuedSessions.add(sessionID);
       await sendContinuation(client, sessionID, continuationPrompt(current), current.lastPromptAgent ?? latestTurnAgent ?? null);
+      await recordContinuationResult(sessionID, "success", maxPromptFailures, { armNoProgress: false, started: true });
+      locallyDeliveredPendingSessions.add(sessionID);
+      clearTurnWatchdog(sessionID);
     } catch (error) {
       try {
+        if (claimedContinuation && isTransportError(error)) {
+          await recordContinuationResult(sessionID, "failure", maxPromptFailures);
+        }
         await client.app?.log?.({
           body: {
             service: "opencode-goal-plugin",
@@ -1468,38 +1748,74 @@ var server = async ({ client }, options) => {
         turnWatchdogs.delete(sessionID);
     }
   }
-  function scheduleSettledContinuation(sessionID, delayMs = TASK_SETTLE_DELAY_MS) {
-    if (scheduledContinuations.has(sessionID))
+  function cancelScheduledContinuation(sessionID) {
+    const scheduled = scheduledContinuations.get(sessionID);
+    if (scheduled)
+      clearTimeout(scheduled.timer);
+    scheduledContinuations.delete(sessionID);
+  }
+  function scheduleSettledContinuation(sessionID, delayMs = TASK_SETTLE_DELAY_MS, replace = false, purpose = "settle") {
+    if (disposed)
       return;
-    const timer = setTimeout(() => {
-      scheduledContinuations.delete(sessionID);
-      runAutoContinue(sessionID, true);
+    if (!replace && scheduledContinuations.has(sessionID))
+      return;
+    if (replace)
+      cancelScheduledContinuation(sessionID);
+    const scheduled = {};
+    const timer = setTimeout(async () => {
+      try {
+        if (scheduledContinuations.get(sessionID) !== scheduled || nativeRetrySessions.has(sessionID))
+          return;
+        if (purpose === "retry") {
+          const goal = await getGoalInternal(sessionID);
+          if (!goal || goal.continuationFailures === 0 && goal.pendingAttempt == null)
+            return;
+        }
+        if (scheduledContinuations.get(sessionID) !== scheduled || nativeRetrySessions.has(sessionID))
+          return;
+        await runAutoContinue(sessionID, true, scheduled);
+      } finally {
+        if (scheduledContinuations.get(sessionID) === scheduled)
+          scheduledContinuations.delete(sessionID);
+      }
     }, Math.max(0, delayMs));
+    scheduled.timer = timer;
+    scheduled.purpose = purpose;
     const maybeUnref = timer;
     if (typeof maybeUnref.unref === "function")
       maybeUnref.unref();
-    scheduledContinuations.set(sessionID, timer);
+    scheduledContinuations.set(sessionID, scheduled);
   }
-  async function runAutoContinue(sessionID, fromTaskDeferral = false) {
+  async function runAutoContinue(sessionID, fromTaskDeferral = false, scheduled) {
+    if (disposed)
+      return;
     if (busySessions.has(sessionID))
       return;
     if (activeContinuations.has(sessionID))
       return;
     activeContinuations.add(sessionID);
+    let attemptReservedAt = Date.now();
     try {
       const latestAssistant = await fetchLatestAssistant(client, sessionID);
       taskTracker.observeAssistantMessage(sessionID, latestAssistant);
       const taskStatus = await taskBlockStatus(sessionID);
       if (taskStatus && taskStatus.blocked) {
         taskDeferredSessions.add(sessionID);
-        if (taskStatus.retryAt != null)
-          scheduleSettledContinuation(sessionID, taskStatus.retryAt - Date.now());
+        if (taskStatus.retryAt != null) {
+          scheduleSettledContinuation(sessionID, taskStatus.retryAt - Date.now(), scheduled != null);
+        }
         return;
       }
       if (busySessions.has(sessionID))
         return;
-      await recordAssistantMessage(sessionID, latestAssistant, options ?? {}, true);
-      const current = await getGoal(sessionID);
+      const observed = await recordAssistantMessage(sessionID, latestAssistant, options ?? {}, true);
+      await reconcileLocalMarkerAfterProgress(locallyDeliveredPendingSessions, sessionID, observed.goal);
+      const queued = scheduledContinuations.get(sessionID);
+      if (observed.progressed && queued?.purpose !== "settle")
+        cancelScheduledContinuation(sessionID);
+      if (scheduled && scheduledContinuations.get(sessionID) !== scheduled)
+        return;
+      const current = await getGoalInternal(sessionID);
       if (!current)
         return;
       const latestTurnAgent = agentFromMessage(latestAssistant);
@@ -1515,13 +1831,64 @@ var server = async ({ client }, options) => {
         return;
       }
       taskDeferredSessions.delete(sessionID);
+      const attempt = pendingAttemptOf(current);
+      if (current.status === "active" && attempt != null) {
+        const deliveredLocally = locallyDeliveredPendingSessions.has(sessionID);
+        if (!pendingReadyForFailure(attempt, deliveredLocally)) {
+          return;
+        }
+        const afterFailure = await recordContinuationResult(sessionID, "failure", maxPromptFailures, {
+          requirePending: true
+        });
+        if (afterFailure)
+          locallyDeliveredPendingSessions.delete(sessionID);
+        if (autoContinue && afterFailure?.status === "active") {
+          scheduleSettledContinuation(sessionID, continuationRetryDelayMs(minInterval, attempt.reservedAt), true, "retry");
+        }
+        return;
+      }
+      const queuedBeforeReserve = scheduledContinuations.get(sessionID);
+      if (queuedBeforeReserve && queuedBeforeReserve !== scheduled)
+        return;
+      if (!autoContinue)
+        return;
+      if (nativeRetrySessions.has(sessionID))
+        return;
       const goal = await reserveContinuation(sessionID, maxAutoTurns, minInterval);
       if (!goal)
         return;
+      attemptReservedAt = goal.pendingAttempt?.reservedAt ?? Date.now();
+      if (nativeRetrySessions.has(sessionID)) {
+        await rollbackContinuationAttempt(sessionID);
+        return;
+      }
+      if (scheduled && scheduledContinuations.get(sessionID) !== scheduled) {
+        await rollbackContinuationAttempt(sessionID);
+        return;
+      }
       await sendContinuation(client, sessionID, goal.status === "active" ? continuationPrompt(goal) : limitPrompt(goal), goal.lastPromptAgent ?? latestTurnAgent ?? null);
-      await recordContinuationResult(sessionID, "success", maxPromptFailures);
+      if (disposed) {
+        await rollbackContinuationAttempt(sessionID);
+        return;
+      }
+      const delivered = await recordContinuationResult(sessionID, "success", maxPromptFailures);
+      locallyDeliveredPendingSessions.add(sessionID);
+      if (!delivered?.pendingAttempt?.delivered) {
+        await rollbackContinuationAttempt(sessionID);
+      }
     } catch (error) {
-      await recordContinuationResult(sessionID, "failure", maxPromptFailures);
+      if (disposed) {
+        await rollbackContinuationAttempt(sessionID);
+        return;
+      }
+      if (isTransportError(error)) {
+        const afterFailure = await recordContinuationResult(sessionID, "failure", maxPromptFailures);
+        if (autoContinue && afterFailure?.status === "active") {
+          scheduleSettledContinuation(sessionID, continuationRetryDelayMs(minInterval, attemptReservedAt), true, "retry");
+        }
+      } else {
+        await rollbackContinuationAttempt(sessionID);
+      }
       await client.app?.log?.({
         body: {
           service: "opencode-goal-plugin",
@@ -1536,12 +1903,17 @@ var server = async ({ client }, options) => {
   }
   return {
     async dispose() {
-      for (const timer of scheduledContinuations.values())
-        clearTimeout(timer);
+      disposed = true;
+      for (const scheduled of scheduledContinuations.values())
+        clearTimeout(scheduled.timer);
       scheduledContinuations.clear();
       for (const watchdog of turnWatchdogs.values())
         clearTimeout(watchdog.timer);
       turnWatchdogs.clear();
+      watchdogRescuedSessions.clear();
+      locallyDeliveredPendingSessions.clear();
+      nativeRetrySessions.clear();
+      toolAttempts.clear();
     },
     async config(config) {
       if (!registerCommand)
@@ -1628,9 +2000,41 @@ var server = async ({ client }, options) => {
     },
     async "tool.execute.before"(input) {
       taskTracker.noteTaskCall(input);
+      const sessionID = typeof input?.sessionID === "string" ? input.sessionID : undefined;
+      const callID = typeof input?.callID === "string" ? input.callID : undefined;
+      if (sessionID && callID) {
+        const goal = await getGoalInternal(sessionID);
+        toolAttempts.set(toolAttemptKey(sessionID, callID), goal?.pendingAttempt?.id ?? null);
+      }
     },
     async "tool.execute.after"(input, output) {
       taskTracker.noteTaskOutput(input, output);
+      const sessionID = typeof input?.sessionID === "string" ? input.sessionID : undefined;
+      const callID = typeof input?.callID === "string" ? input.callID : undefined;
+      const attemptKey = sessionID && callID ? toolAttemptKey(sessionID, callID) : undefined;
+      const expectedAttemptID = attemptKey ? toolAttempts.get(attemptKey) : undefined;
+      if (attemptKey)
+        toolAttempts.delete(attemptKey);
+      if (!sessionID)
+        return;
+      if (typeof input?.tool === "string" && NON_PROGRESS_TOOLS.has(input.tool.toLowerCase()))
+        return;
+      const toolResult = output;
+      if (toolOutputFailed(toolResult))
+        return;
+      const text = typeof toolResult.output === "string" ? toolResult.output : undefined;
+      if (!text)
+        return;
+      const before = await getGoalInternal(sessionID);
+      const scheduled = scheduledContinuations.get(sessionID);
+      const hasFailureEpisode = Boolean(before && (before.continuationFailures > 0 || before.pendingAttempt != null));
+      if (!before || !hasFailureEpisode && scheduled?.purpose !== "recovery")
+        return;
+      const progressed = await recordToolProgress(sessionID, text, expectedAttemptID);
+      if (progressed?.continuationFailures === 0 && progressed.pendingAttempt == null) {
+        locallyDeliveredPendingSessions.delete(sessionID);
+        cancelScheduledContinuation(sessionID);
+      }
     },
     async "chat.message"(input, output) {
       const sessionID = typeof input?.sessionID === "string" ? input.sessionID : output.message?.sessionID;
@@ -1645,7 +2049,11 @@ var server = async ({ client }, options) => {
       if (!sessionID)
         return;
       await accountUsage(sessionID, tokensFromMessages(output.messages));
-      await recordAssistantMessage(sessionID, latestAssistantMessage(output.messages), options ?? {});
+      const observed = await recordAssistantMessage(sessionID, latestAssistantMessage(output.messages), options ?? {});
+      await reconcileLocalMarkerAfterProgress(locallyDeliveredPendingSessions, sessionID, observed.goal);
+      const scheduled = scheduledContinuations.get(sessionID);
+      if (observed.progressed && scheduled?.purpose !== "settle")
+        cancelScheduledContinuation(sessionID);
     },
     async "experimental.chat.system.transform"(input, output) {
       if (typeof input.sessionID !== "string")
@@ -1672,43 +2080,90 @@ var server = async ({ client }, options) => {
       if (sessionID && eventType === "session.status") {
         const status = event.properties?.status;
         if (isRecord(status) && typeof status.type === "string") {
-          if (status.type === "busy")
+          if (status.type === "busy") {
             busySessions.add(sessionID);
+            nativeRetrySessions.delete(sessionID);
+          }
           if (status.type === "busy")
             armTurnWatchdog(sessionID);
+          if (status.type === "busy")
+            await markPendingContinuationStarted(sessionID);
           if (status.type === "idle") {
             busySessions.delete(sessionID);
+            nativeRetrySessions.delete(sessionID);
             clearTurnWatchdog(sessionID);
+            watchdogRescuedSessions.delete(sessionID);
           }
-          if (status.type === "retry")
+          if (status.type === "retry") {
+            nativeRetrySessions.add(sessionID);
             clearTurnWatchdog(sessionID);
+            cancelScheduledContinuation(sessionID);
+          }
           taskTracker.observeSessionStatus(sessionID, status.type);
         }
       }
       if (sessionID && eventType === "session.idle") {
         busySessions.delete(sessionID);
+        nativeRetrySessions.delete(sessionID);
         clearTurnWatchdog(sessionID);
+        watchdogRescuedSessions.delete(sessionID);
         taskTracker.observeSessionStatus(sessionID, "idle");
+      }
+      if (sessionID && eventType === "session.error") {
+        const inNativeRetry = nativeRetrySessions.has(sessionID);
+        busySessions.delete(sessionID);
+        clearTurnWatchdog(sessionID);
+        if (inNativeRetry)
+          return;
+        nativeRetrySessions.delete(sessionID);
+        watchdogRescuedSessions.delete(sessionID);
+        const props = event.properties ?? {};
+        const errorMessage = transportErrorMessageFromEvent(props);
+        if (errorMessage && isTransportError(errorMessage)) {
+          const goal = await getGoalInternal(sessionID);
+          if (goal?.status === "active") {
+            const attempt = pendingAttemptOf(goal);
+            if (attempt != null) {
+              const afterFailure = await recordContinuationResult(sessionID, "failure", maxPromptFailures, {
+                requirePending: true
+              });
+              if (afterFailure)
+                locallyDeliveredPendingSessions.delete(sessionID);
+              if (autoContinue && afterFailure?.status === "active") {
+                scheduleSettledContinuation(sessionID, continuationRetryDelayMs(minInterval, attempt.reservedAt), true, "retry");
+              }
+            } else if (autoContinue) {
+              scheduleSettledContinuation(sessionID, continuationDelayFromSnapshot(minInterval, goal.lastContinuationAt), false, "recovery");
+            }
+          }
+        }
       }
       if (sessionID && eventType === "session.deleted") {
         busySessions.delete(sessionID);
         clearTurnWatchdog(sessionID);
-        const scheduled = scheduledContinuations.get(sessionID);
-        if (scheduled)
-          clearTimeout(scheduled);
-        scheduledContinuations.delete(sessionID);
+        watchdogRescuedSessions.delete(sessionID);
+        locallyDeliveredPendingSessions.delete(sessionID);
+        nativeRetrySessions.delete(sessionID);
+        cancelScheduledContinuation(sessionID);
         taskDeferredSessions.delete(sessionID);
+        clearToolAttemptsForSession(toolAttempts, sessionID);
         taskTracker.observeSessionDeleted(sessionID);
       }
       if (sessionID && event.type === "message.updated") {
         const props = event.properties ?? {};
         const message = [props.info, props.message].find((value) => value && typeof value === "object");
         taskTracker.observeAssistantMessage(sessionID, message);
-        await recordAssistantMessage(sessionID, message, options ?? {});
+        const observed = await recordAssistantMessage(sessionID, message, options ?? {});
+        await reconcileLocalMarkerAfterProgress(locallyDeliveredPendingSessions, sessionID, observed.goal);
+        const scheduled = scheduledContinuations.get(sessionID);
+        if (observed.progressed && scheduled?.purpose !== "settle")
+          cancelScheduledContinuation(sessionID);
       }
-      if (!autoContinue || !isIdleEvent(event))
+      if (!isIdleEvent(event))
         return;
       if (!sessionID)
+        return;
+      if (!autoContinue && (await getGoalInternal(sessionID))?.pendingAttempt == null)
         return;
       await runAutoContinue(sessionID);
     }
@@ -1724,7 +2179,7 @@ async function setupV2(context) {
   const autoContinue = options.auto_continue ?? true;
   const deferWhileTasksActive = options.defer_while_tasks_active ?? true;
   const maxAutoTurns = positiveIntegerOrNull2(options.max_auto_turns) ?? DEFAULT_MAX_AUTO_TURNS;
-  const minInterval = positiveIntegerOrNull2(options.min_continue_interval_seconds) ?? DEFAULT_CONTINUE_INTERVAL_SECONDS;
+  const minInterval = nonNegativeIntegerOrNull(options.min_continue_interval_seconds) ?? DEFAULT_CONTINUE_INTERVAL_SECONDS;
   const maxTurnTimeMs = timeoutMillisecondsFromSeconds(options.max_turn_time);
   const maxPromptFailures = positiveIntegerOrNull2(options.max_prompt_failures) ?? DEFAULT_MAX_PROMPT_FAILURES;
   const registerCommand = options.register_command ?? true;
@@ -1734,6 +2189,10 @@ async function setupV2(context) {
   const scheduledContinuations = new Map;
   const turnWatchdogs = new Map;
   const busySessions = new Set;
+  const nativeRetrySessions = new Set;
+  const locallyDeliveredPendingSessions = new Set;
+  const watchdogRescuedSessions = new Set;
+  const toolAttempts = new Map;
   const planAgents = restrictedAgentSet(options);
   const isPlanAgent = (agent) => typeof agent === "string" && planAgents.has(agent.trim().toLowerCase());
   const goalServices = { options, isPlanAgent };
@@ -1742,6 +2201,7 @@ async function setupV2(context) {
   const stepTextBuffers = new Map;
   const stepTokenSums = new Map;
   const registrations = [];
+  let disposed = false;
   function stepKey(sessionID, messageID2) {
     return `${sessionID}\x00${messageID2}`;
   }
@@ -1770,6 +2230,8 @@ async function setupV2(context) {
   function armTurnWatchdog(sessionID) {
     if (maxTurnTimeMs == null)
       return;
+    if (watchdogRescuedSessions.has(sessionID))
+      return;
     clearTurnWatchdog(sessionID);
     const watchdog = {
       timer: setTimeout(() => void runTurnWatchdog(sessionID, watchdog), maxTurnTimeMs)
@@ -1782,7 +2244,9 @@ async function setupV2(context) {
   async function runTurnWatchdog(sessionID, watchdog) {
     let claimedContinuation = false;
     try {
-      if (turnWatchdogs.get(sessionID) !== watchdog || !busySessions.has(sessionID))
+      if (disposed)
+        return;
+      if (turnWatchdogs.get(sessionID) !== watchdog || !busySessions.has(sessionID) || watchdogRescuedSessions.has(sessionID))
         return;
       const goal = await getGoal(sessionID);
       if (turnWatchdogs.get(sessionID) !== watchdog || !busySessions.has(sessionID))
@@ -1797,7 +2261,7 @@ async function setupV2(context) {
         return;
       if (taskStatus && taskStatus.blocked)
         return;
-      const current = await getGoal(sessionID);
+      const current = await getGoalInternal(sessionID);
       if (turnWatchdogs.get(sessionID) !== watchdog || !busySessions.has(sessionID))
         return;
       if (current?.status !== "active" || isPlanAgent(current.lastPromptAgent) || activeContinuationsV2.has(sessionID))
@@ -1805,9 +2269,20 @@ async function setupV2(context) {
       turnWatchdogs.delete(sessionID);
       activeContinuationsV2.add(sessionID);
       claimedContinuation = true;
+      watchdogRescuedSessions.add(sessionID);
       await sendContinuation2(sessionID, continuationPrompt(current), current.lastPromptAgent ?? latestStep?.agent ?? null);
+      await recordContinuationResult(sessionID, "success", maxPromptFailures, { armNoProgress: false, started: true });
+      locallyDeliveredPendingSessions.add(sessionID);
+      clearTurnWatchdog(sessionID);
     } catch (error) {
-      v2ErrorLog("Turn watchdog retry failed", error);
+      try {
+        if (claimedContinuation && isTransportError(error)) {
+          await recordContinuationResult(sessionID, "failure", maxPromptFailures);
+        }
+        v2ErrorLog("Turn watchdog retry failed", error);
+      } catch {
+        return;
+      }
     } finally {
       if (claimedContinuation)
         activeContinuationsV2.delete(sessionID);
@@ -1815,24 +2290,53 @@ async function setupV2(context) {
         turnWatchdogs.delete(sessionID);
     }
   }
-  function scheduleSettledContinuation(sessionID, delayMs = TASK_SETTLE_DELAY_MS) {
-    if (scheduledContinuations.has(sessionID))
+  function cancelScheduledContinuation(sessionID) {
+    const scheduled = scheduledContinuations.get(sessionID);
+    if (scheduled)
+      clearTimeout(scheduled.timer);
+    scheduledContinuations.delete(sessionID);
+  }
+  function scheduleSettledContinuation(sessionID, delayMs = TASK_SETTLE_DELAY_MS, replace = false, purpose = "settle") {
+    if (disposed)
       return;
-    const timer = setTimeout(() => {
-      scheduledContinuations.delete(sessionID);
-      runAutoContinue(sessionID, true);
+    if (!replace && scheduledContinuations.has(sessionID))
+      return;
+    if (replace)
+      cancelScheduledContinuation(sessionID);
+    const scheduled = {};
+    const timer = setTimeout(async () => {
+      try {
+        if (scheduledContinuations.get(sessionID) !== scheduled || nativeRetrySessions.has(sessionID))
+          return;
+        if (purpose === "retry") {
+          const goal = await getGoalInternal(sessionID);
+          if (!goal || goal.continuationFailures === 0 && goal.pendingAttempt == null)
+            return;
+        }
+        if (scheduledContinuations.get(sessionID) !== scheduled || nativeRetrySessions.has(sessionID))
+          return;
+        await runAutoContinue(sessionID, true, scheduled);
+      } finally {
+        if (scheduledContinuations.get(sessionID) === scheduled)
+          scheduledContinuations.delete(sessionID);
+      }
     }, Math.max(0, delayMs));
+    scheduled.timer = timer;
+    scheduled.purpose = purpose;
     const maybeUnref = timer;
     if (typeof maybeUnref.unref === "function")
       maybeUnref.unref();
-    scheduledContinuations.set(sessionID, timer);
+    scheduledContinuations.set(sessionID, scheduled);
   }
-  async function runAutoContinue(sessionID, fromTaskDeferral = false) {
+  async function runAutoContinue(sessionID, fromTaskDeferral = false, scheduled) {
+    if (disposed)
+      return;
     if (busySessions.has(sessionID))
       return;
     if (activeContinuationsV2.has(sessionID))
       return;
     activeContinuationsV2.add(sessionID);
+    let attemptReservedAt = Date.now();
     try {
       const latestStep = latestStepBySession.get(sessionID);
       if (latestStep?.messageID) {
@@ -1841,23 +2345,33 @@ async function setupV2(context) {
       const taskStatus = taskBlockStatus(sessionID);
       if (taskStatus && taskStatus.blocked) {
         taskDeferredSessions.add(sessionID);
-        if (taskStatus.retryAt != null)
-          scheduleSettledContinuation(sessionID, taskStatus.retryAt - Date.now());
+        if (taskStatus.retryAt != null) {
+          scheduleSettledContinuation(sessionID, taskStatus.retryAt - Date.now(), scheduled != null);
+        }
         return;
       }
       if (busySessions.has(sessionID))
         return;
       if (latestStep) {
-        await recordAssistantProgress(sessionID, {
+        const beforeProgress = await getGoalInternal(sessionID);
+        const after = await recordAssistantProgress(sessionID, {
           messageID: latestStep.messageID,
           text: latestStep.text,
           outputTokens: latestStep.outputTokens,
           noProgressTokenThreshold: positiveIntegerOrNull2(options.no_progress_token_threshold),
           maxNoProgressTurns: positiveIntegerOrNull2(options.max_no_progress_turns),
-          evaluateContinuation: true
+          evaluateContinuation: true,
+          completedAt: latestStep.completedAt
         });
+        await reconcileLocalMarkerAfterProgress(locallyDeliveredPendingSessions, sessionID, after);
+        const progressed = Boolean(after && (after.lastAssistantMessageID !== (beforeProgress?.lastAssistantMessageID ?? "") || after.lastAssistantText !== (beforeProgress?.lastAssistantText ?? "")));
+        const queuedAfterProgress = scheduledContinuations.get(sessionID);
+        if (progressed && queuedAfterProgress?.purpose !== "settle")
+          cancelScheduledContinuation(sessionID);
       }
-      const current = await getGoal(sessionID);
+      if (scheduled && scheduledContinuations.get(sessionID) !== scheduled)
+        return;
+      const current = await getGoalInternal(sessionID);
       if (!current)
         return;
       const latestTurnAgent = latestStep?.agent;
@@ -1873,13 +2387,64 @@ async function setupV2(context) {
         return;
       }
       taskDeferredSessions.delete(sessionID);
+      const attempt = pendingAttemptOf(current);
+      if (current.status === "active" && attempt != null) {
+        const deliveredLocally = locallyDeliveredPendingSessions.has(sessionID);
+        if (!pendingReadyForFailure(attempt, deliveredLocally)) {
+          return;
+        }
+        const afterFailure = await recordContinuationResult(sessionID, "failure", maxPromptFailures, {
+          requirePending: true
+        });
+        if (afterFailure)
+          locallyDeliveredPendingSessions.delete(sessionID);
+        if (autoContinue && afterFailure?.status === "active") {
+          scheduleSettledContinuation(sessionID, continuationRetryDelayMs(minInterval, attempt.reservedAt), true, "retry");
+        }
+        return;
+      }
+      const queuedBeforeReserve = scheduledContinuations.get(sessionID);
+      if (queuedBeforeReserve && queuedBeforeReserve !== scheduled)
+        return;
+      if (!autoContinue)
+        return;
+      if (nativeRetrySessions.has(sessionID))
+        return;
       const goal = await reserveContinuation(sessionID, maxAutoTurns, minInterval);
       if (!goal)
         return;
+      attemptReservedAt = goal.pendingAttempt?.reservedAt ?? Date.now();
+      if (nativeRetrySessions.has(sessionID)) {
+        await rollbackContinuationAttempt(sessionID);
+        return;
+      }
+      if (scheduled && scheduledContinuations.get(sessionID) !== scheduled) {
+        await rollbackContinuationAttempt(sessionID);
+        return;
+      }
       await sendContinuation2(sessionID, goal.status === "active" ? continuationPrompt(goal) : limitPrompt(goal), goal.lastPromptAgent ?? latestTurnAgent ?? null);
-      await recordContinuationResult(sessionID, "success", maxPromptFailures);
+      if (disposed) {
+        await rollbackContinuationAttempt(sessionID);
+        return;
+      }
+      const delivered = await recordContinuationResult(sessionID, "success", maxPromptFailures);
+      locallyDeliveredPendingSessions.add(sessionID);
+      if (!delivered?.pendingAttempt?.delivered) {
+        await rollbackContinuationAttempt(sessionID);
+      }
     } catch (error) {
-      await recordContinuationResult(sessionID, "failure", maxPromptFailures);
+      if (disposed) {
+        await rollbackContinuationAttempt(sessionID);
+        return;
+      }
+      if (isTransportError(error)) {
+        const afterFailure = await recordContinuationResult(sessionID, "failure", maxPromptFailures);
+        if (autoContinue && afterFailure?.status === "active") {
+          scheduleSettledContinuation(sessionID, continuationRetryDelayMs(minInterval, attemptReservedAt), true, "retry");
+        }
+      } else {
+        await rollbackContinuationAttempt(sessionID);
+      }
       v2ErrorLog("Auto-continue failed", error);
     } finally {
       activeContinuationsV2.delete(sessionID);
@@ -1899,31 +2464,76 @@ async function setupV2(context) {
       case "session.status": {
         const status = data.status;
         if (sessionID && isRecord(status) && typeof status.type === "string") {
-          if (status.type === "busy")
+          if (status.type === "busy") {
             busySessions.add(sessionID);
-          if (status.type === "busy")
+            nativeRetrySessions.delete(sessionID);
             armTurnWatchdog(sessionID);
+            await markPendingContinuationStarted(sessionID);
+          }
           if (status.type === "idle") {
             busySessions.delete(sessionID);
+            nativeRetrySessions.delete(sessionID);
             clearTurnWatchdog(sessionID);
+            watchdogRescuedSessions.delete(sessionID);
           }
-          if (status.type === "retry")
+          if (status.type === "retry") {
+            nativeRetrySessions.add(sessionID);
             clearTurnWatchdog(sessionID);
+            cancelScheduledContinuation(sessionID);
+          }
           taskTracker.observeSessionStatus(sessionID, status.type);
-        }
-        if (autoContinue && sessionID && isRecord(status) && status.type === "idle") {
-          await runAutoContinue(sessionID);
+          if (status.type === "idle") {
+            const goal = await getGoalInternal(sessionID);
+            if (autoContinue || goal?.pendingAttempt != null)
+              await runAutoContinue(sessionID);
+          }
         }
         return;
       }
       case "session.idle": {
         if (sessionID) {
           busySessions.delete(sessionID);
+          nativeRetrySessions.delete(sessionID);
           clearTurnWatchdog(sessionID);
+          watchdogRescuedSessions.delete(sessionID);
           taskTracker.observeSessionStatus(sessionID, "idle");
         }
-        if (autoContinue && sessionID)
-          await runAutoContinue(sessionID);
+        if (sessionID) {
+          const goal = await getGoalInternal(sessionID);
+          if (autoContinue || goal?.pendingAttempt != null)
+            await runAutoContinue(sessionID);
+        }
+        return;
+      }
+      case "session.error": {
+        if (!sessionID)
+          return;
+        const inNativeRetry = nativeRetrySessions.has(sessionID);
+        busySessions.delete(sessionID);
+        clearTurnWatchdog(sessionID);
+        if (inNativeRetry)
+          return;
+        nativeRetrySessions.delete(sessionID);
+        watchdogRescuedSessions.delete(sessionID);
+        const errorMessage = transportErrorMessageFromEvent(data);
+        if (errorMessage && isTransportError(errorMessage)) {
+          const goal = await getGoalInternal(sessionID);
+          if (goal?.status === "active") {
+            const attempt = pendingAttemptOf(goal);
+            if (attempt != null) {
+              const afterFailure = await recordContinuationResult(sessionID, "failure", maxPromptFailures, {
+                requirePending: true
+              });
+              if (afterFailure)
+                locallyDeliveredPendingSessions.delete(sessionID);
+              if (autoContinue && afterFailure?.status === "active") {
+                scheduleSettledContinuation(sessionID, continuationRetryDelayMs(minInterval, attempt.reservedAt), true, "retry");
+              }
+            } else if (autoContinue) {
+              scheduleSettledContinuation(sessionID, continuationDelayFromSnapshot(minInterval, goal.lastContinuationAt), false, "recovery");
+            }
+          }
+        }
         return;
       }
       case "session.deleted": {
@@ -1931,11 +2541,15 @@ async function setupV2(context) {
           return;
         busySessions.delete(sessionID);
         clearTurnWatchdog(sessionID);
+        watchdogRescuedSessions.delete(sessionID);
+        locallyDeliveredPendingSessions.delete(sessionID);
+        nativeRetrySessions.delete(sessionID);
         const scheduled = scheduledContinuations.get(sessionID);
         if (scheduled)
-          clearTimeout(scheduled);
+          clearTimeout(scheduled.timer);
         scheduledContinuations.delete(sessionID);
         taskDeferredSessions.delete(sessionID);
+        clearToolAttemptsForSession(toolAttempts, sessionID);
         taskTracker.observeSessionDeleted(sessionID);
         latestStepBySession.delete(sessionID);
         stepTokenSums.delete(sessionID);
@@ -1962,7 +2576,7 @@ async function setupV2(context) {
         });
         if (!stepTextBuffers.has(stepKey(sessionID, messageID2)))
           stepTextBuffers.set(stepKey(sessionID, messageID2), "");
-        latestStepBySession.set(sessionID, { messageID: messageID2, agent, text: "", outputTokens: null });
+        latestStepBySession.set(sessionID, { messageID: messageID2, agent, text: "", outputTokens: null, completedAt: event.created });
         return;
       }
       case "session.text.delta": {
@@ -1991,18 +2605,26 @@ async function setupV2(context) {
         const text = stepTextBuffers.get(stepKey(sessionID, messageID2)) ?? "";
         stepTextBuffers.delete(stepKey(sessionID, messageID2));
         const outputTokens = outputTokensFromRecord(data.tokens) ?? null;
-        await recordAssistantProgress(sessionID, {
+        const afterStep = await recordAssistantProgress(sessionID, {
           messageID: messageID2,
           text,
           outputTokens,
           noProgressTokenThreshold: positiveIntegerOrNull2(options.no_progress_token_threshold),
-          maxNoProgressTurns: positiveIntegerOrNull2(options.max_no_progress_turns)
+          maxNoProgressTurns: positiveIntegerOrNull2(options.max_no_progress_turns),
+          completedAt: event.created
         });
+        await reconcileLocalMarkerAfterProgress(locallyDeliveredPendingSessions, sessionID, afterStep);
+        if (/[\p{L}\p{N}]/u.test(text)) {
+          const scheduled = scheduledContinuations.get(sessionID);
+          if (scheduled?.purpose === "recovery")
+            cancelScheduledContinuation(sessionID);
+        }
         latestStepBySession.set(sessionID, {
           messageID: messageID2,
           agent: latestStepBySession.get(sessionID)?.agent,
           text,
-          outputTokens
+          outputTokens,
+          completedAt: event.created
         });
         return;
       }
@@ -2019,18 +2641,26 @@ async function setupV2(context) {
         const text = stepTextBuffers.get(stepKey(sessionID, messageID2)) ?? "";
         stepTextBuffers.delete(stepKey(sessionID, messageID2));
         const outputTokens = outputTokensFromRecord(data.tokens) ?? null;
-        await recordAssistantProgress(sessionID, {
+        const afterStep = await recordAssistantProgress(sessionID, {
           messageID: messageID2,
           text,
           outputTokens,
           noProgressTokenThreshold: positiveIntegerOrNull2(options.no_progress_token_threshold),
-          maxNoProgressTurns: positiveIntegerOrNull2(options.max_no_progress_turns)
+          maxNoProgressTurns: positiveIntegerOrNull2(options.max_no_progress_turns),
+          completedAt: event.created
         });
+        await reconcileLocalMarkerAfterProgress(locallyDeliveredPendingSessions, sessionID, afterStep);
+        if (/[\p{L}\p{N}]/u.test(text)) {
+          const scheduled = scheduledContinuations.get(sessionID);
+          if (scheduled?.purpose === "recovery")
+            cancelScheduledContinuation(sessionID);
+        }
         latestStepBySession.set(sessionID, {
           messageID: messageID2,
           agent: latestStepBySession.get(sessionID)?.agent,
           text,
-          outputTokens
+          outputTokens,
+          completedAt: event.created
         });
         return;
       }
@@ -2058,13 +2688,44 @@ async function setupV2(context) {
     for (const tool of goalToolsV2(goalServices))
       draft.add(tool);
   }));
-  registrations.push(await context.tool.hook("execute.before", (input) => {
+  registrations.push(await context.tool.hook("execute.before", async (input) => {
     taskTracker.noteTaskCall({ tool: input.tool, sessionID: input.sessionID, callID: input.id });
+    const sessionID = typeof input.sessionID === "string" ? input.sessionID : undefined;
+    const callID = typeof input.id === "string" ? input.id : undefined;
+    if (sessionID && callID) {
+      const goal = await getGoalInternal(sessionID);
+      toolAttempts.set(toolAttemptKey(sessionID, callID), goal?.pendingAttempt?.id ?? null);
+    }
   }));
-  registrations.push(await context.tool.hook("execute.after", (input) => {
+  registrations.push(await context.tool.hook("execute.after", async (input) => {
+    const sessionID = typeof input.sessionID === "string" ? input.sessionID : undefined;
+    const callID = typeof input.id === "string" ? input.id : undefined;
+    const attemptKey = sessionID && callID ? toolAttemptKey(sessionID, callID) : undefined;
+    const expectedAttemptID = attemptKey ? toolAttempts.get(attemptKey) : undefined;
+    if (attemptKey)
+      toolAttempts.delete(attemptKey);
     if (input.status !== "completed")
       return;
+    const text = textFromToolResult(input.result);
     taskTracker.noteTaskOutput({ tool: input.tool, sessionID: input.sessionID, callID: input.id }, { output: textFromToolResult(input.result) });
+    if (!sessionID || typeof input.tool !== "string")
+      return;
+    if (NON_PROGRESS_TOOLS.has(input.tool.toLowerCase()))
+      return;
+    if (toolOutputFailed(input.result))
+      return;
+    if (!text)
+      return;
+    const before = await getGoalInternal(sessionID);
+    const scheduled = scheduledContinuations.get(sessionID);
+    const hasFailureEpisode = Boolean(before && (before.continuationFailures > 0 || before.pendingAttempt != null));
+    if (!before || !hasFailureEpisode && scheduled?.purpose !== "recovery")
+      return;
+    const progressed = await recordToolProgress(sessionID, text, expectedAttemptID);
+    if (progressed?.continuationFailures === 0 && progressed.pendingAttempt == null) {
+      locallyDeliveredPendingSessions.delete(sessionID);
+      cancelScheduledContinuation(sessionID);
+    }
   }));
   registrations.push(await context.session.hook("context", (sessionContext) => {
     const reminder = systemReminder();
@@ -2091,14 +2752,19 @@ async function setupV2(context) {
     }
   })();
   return async () => {
+    disposed = true;
     abortController.abort();
-    for (const timer of scheduledContinuations.values())
-      clearTimeout(timer);
+    for (const scheduled of scheduledContinuations.values())
+      clearTimeout(scheduled.timer);
     scheduledContinuations.clear();
     for (const watchdog of turnWatchdogs.values())
       clearTimeout(watchdog.timer);
     turnWatchdogs.clear();
     activeContinuationsV2.clear();
+    nativeRetrySessions.clear();
+    locallyDeliveredPendingSessions.clear();
+    watchdogRescuedSessions.clear();
+    toolAttempts.clear();
     for (const registration of registrations)
       await registration.dispose();
     const termination = Promise.allSettled([consumer, eventIterator?.return?.()]);

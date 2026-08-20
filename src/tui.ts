@@ -111,6 +111,61 @@ function box(props: Record<string, unknown>, children: ElementChild[] = []) {
   return element("box", props, children)
 }
 
+type SlotRender = (props: { sessionID: string }) => unknown
+type SlotDispose = () => void
+
+const noopDispose: SlotDispose = () => {}
+
+/**
+ * Registers a V2 TUI slot across both plugin-context generations.
+ *
+ * Early V2 previews exposed `ui.slot(name, render)`. Current previews expose a
+ * single options argument, `ui.slot({ append, render })`, and silently register
+ * nothing when handed the positional pair — which is how the goal sidebar and
+ * the palette keymap layer both disappeared. Branch on the callback arity so
+ * either host works, and tolerate hosts that return no disposer.
+ */
+export function registerSlotV2(context: TuiPluginV2.Context, name: string, render: SlotRender): SlotDispose {
+  const slot = context.ui.slot as unknown as (...args: unknown[]) => unknown
+  const dispose = slot.length <= 1 ? slot({ append: name, render }) : slot(name, render)
+  return typeof dispose === "function" ? (dispose as SlotDispose) : noopDispose
+}
+
+/**
+ * Reads a theme color by trying each candidate path in order, descending into a
+ * `default` leaf when the resolved node is a color group.
+ *
+ * Current previews expose a nested theme (`text.default`, `text.subdued`,
+ * `text.feedback.success`), while earlier previews and the V1 TUI expose flat
+ * keys (`text`, `textMuted`, `primary`). Passing a color *group* as `fg`
+ * renders nothing useful, so resolve to a leaf before handing it to OpenTUI.
+ */
+export function themeColorV2(theme: unknown, ...paths: readonly (readonly string[])[]): unknown {
+  for (const path of paths) {
+    let cursor: unknown = theme
+    for (const key of path) {
+      if (cursor === null || typeof cursor !== "object") {
+        cursor = undefined
+        break
+      }
+      cursor = (cursor as Record<string, unknown>)[key]
+    }
+    if (cursor !== null && typeof cursor === "object" && "default" in (cursor as Record<string, unknown>)) {
+      cursor = (cursor as Record<string, unknown>).default
+    }
+    if (cursor !== undefined && cursor !== null) return cursor
+  }
+  return undefined
+}
+
+function goalColorsV2(theme: unknown) {
+  return {
+    text: themeColorV2(theme, ["text", "default"], ["text"]),
+    muted: themeColorV2(theme, ["text", "subdued"], ["textMuted"]),
+    achieved: themeColorV2(theme, ["text", "feedback", "success"], ["primary"], ["text", "default"], ["text"]),
+  }
+}
+
 function goalSnapshotKey(sessionID: string) {
   return `goal-mode.snapshot.${sessionID}`
 }
@@ -498,7 +553,7 @@ async function showSummaryV2(api: TuiPluginV2.Context, sessionID: string, goal: 
 }
 
 function GoalSidebarV2(api: TuiPluginV2.Context, sessionID: string) {
-  const theme = api.theme
+  const colors = goalColorsV2(api.theme)
   const [cache, setCache] = api.storage.memory<{ goal: GoalSnapshot | null }>(`goal-mode.v2.${sessionID}`, {
     initial: { goal: null },
   })
@@ -523,26 +578,27 @@ function GoalSidebarV2(api: TuiPluginV2.Context, sessionID: string) {
     if (!snapshot) return null
     if (snapshot.status === "complete" || snapshot.status === "unmet") {
       const elapsed = liveTimeUsedSeconds(snapshot)
-      return text({ fg: snapshot.status === "complete" ? theme.primary : theme.textMuted }, [
+      return text({ fg: snapshot.status === "complete" ? colors.achieved : colors.muted }, [
         `${snapshot.status === "complete" ? "Goal achieved" : "Goal unmet"} (${formatDurationBadge(elapsed)})`,
       ])
     }
     return box({}, [
-      text({ fg: theme.text }, ["Goal"]),
-      text({ fg: theme.textMuted }, [`Status: ${snapshot.status}`]),
-      text({ fg: theme.textMuted }, [`Time: ${formatDuration(liveTimeUsedSeconds(snapshot, nowSeconds()))}`]),
-      text({ fg: theme.textMuted }, [`Tokens: ${snapshot.tokensUsed}${snapshot.tokenBudget == null ? "" : `/${snapshot.tokenBudget}`}`]),
-      text({ fg: theme.textMuted }, [`Auto-continues: ${snapshot.autoTurns}${snapshot.maxAutoTurns == null ? "" : `/${snapshot.maxAutoTurns}`}`]),
-      ...(snapshot.lastCheckpoint ? [text({ fg: theme.textMuted }, [`Checkpoint: ${snapshot.lastCheckpoint.summary}`])] : []),
-      ...(snapshot.stopReason ? [text({ fg: theme.textMuted }, [`Stop: ${snapshot.stopReason}`])] : []),
-      ...(snapshot.lastStatus ? [text({ fg: theme.textMuted }, [snapshot.lastStatus])] : []),
-      text({ fg: theme.textMuted }, [snapshot.objective]),
+      text({ fg: colors.text }, ["Goal"]),
+      text({ fg: colors.muted }, [`Status: ${snapshot.status}`]),
+      text({ fg: colors.muted }, [`Time: ${formatDuration(liveTimeUsedSeconds(snapshot, nowSeconds()))}`]),
+      text({ fg: colors.muted }, [`Tokens: ${snapshot.tokensUsed}${snapshot.tokenBudget == null ? "" : `/${snapshot.tokenBudget}`}`]),
+      text({ fg: colors.muted }, [`Auto-continues: ${snapshot.autoTurns}${snapshot.maxAutoTurns == null ? "" : `/${snapshot.maxAutoTurns}`}`]),
+      ...(snapshot.lastCheckpoint ? [text({ fg: colors.muted }, [`Checkpoint: ${snapshot.lastCheckpoint.summary}`])] : []),
+      ...(snapshot.stopReason ? [text({ fg: colors.muted }, [`Stop: ${snapshot.stopReason}`])] : []),
+      ...(snapshot.lastStatus ? [text({ fg: colors.muted }, [snapshot.lastStatus])] : []),
+      text({ fg: colors.muted }, [snapshot.objective]),
     ])
   }])
 }
 
 function GoalKeymapLayerV2(api: TuiPluginV2.Context) {
   api.keymap.layer(() => ({
+    mode: "global",
     commands: [
       {
         id: "goal.show",
@@ -573,8 +629,8 @@ function GoalKeymapLayerV2(api: TuiPluginV2.Context) {
  * needs to dispose the two `ui.slot` registrations.
  */
 export function setupTuiV2(context: TuiPluginV2.Context): TuiPluginV2.Cleanup {
-  const offSidebar = context.ui.slot("sidebar.content", (props) => GoalSidebarV2(context, props.sessionID))
-  const offApp = context.ui.slot("app", () => GoalKeymapLayerV2(context))
+  const offSidebar = registerSlotV2(context, "sidebar.content", (props) => GoalSidebarV2(context, props.sessionID))
+  const offApp = registerSlotV2(context, "app", () => GoalKeymapLayerV2(context))
   return () => {
     offSidebar()
     offApp()

@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import plugin from "../src/server"
-import { getGoal } from "../src/state"
+import { getGoal, getGoalInternal, recordContinuationResult, reserveContinuation } from "../src/state"
 
 const TOOL_NAMES = [
   "clear_goal",
@@ -453,4 +453,419 @@ test("V2 cleanup disposes registrations and stops the event consumer", async () 
   await new Promise((resolve) => setTimeout(resolve, 30))
   const read = await goalTool(mock, "get_goal").execute({}, toolContext())
   expect(contentOf(read)).toContain('"tokensUsed": 0')
+})
+
+test("V2 session.error schedules bounded recovery without a phantom failure", async () => {
+  const mock = makeMockContext({ auto_continue: true, min_continue_interval_seconds: 0, max_auto_turns: 5 })
+  const cleanup = await plugin.setup(mock as never)
+  await createGoalViaV2Tool(mock, "recover from a transport error")
+
+  mock.stream.push({
+    type: "session.error",
+    created: Date.now(),
+    data: { sessionID: "ses_v2", error: { message: "network connection failed" } },
+  })
+  await waitFor(() => mock.promptCalls.length === 1)
+
+  const goal = await getGoal("ses_v2")
+  expect(goal?.continuationFailures).toBe(0)
+  expect(goal?.autoTurns).toBe(1)
+  expect(goal?.status).toBe("active")
+
+  mock.stream.end()
+  await cleanup()
+})
+
+test("V2 idle after a started pending attempt counts one unresolved failure and pauses at the ceiling", async () => {
+  const mock = makeMockContext({
+    auto_continue: true,
+    min_continue_interval_seconds: 0,
+    max_auto_turns: 5,
+    max_prompt_failures: 1,
+  })
+  const cleanup = await plugin.setup(mock as never)
+  await createGoalViaV2Tool(mock, "detect a no response")
+
+  mock.stream.push({ type: "session.idle", created: 1, data: { sessionID: "ses_v2" } })
+  await waitFor(() => mock.promptCalls.length === 1)
+  mock.stream.push({ type: "session.status", created: 2, data: { sessionID: "ses_v2", status: { type: "busy" } } })
+
+  // The provider picks up the prompt: the busy marks the persisted attempt started.
+  await waitFor(async () => (await getGoalInternal("ses_v2"))?.pendingAttempt?.started === true)
+  expect((await getGoalInternal("ses_v2"))?.pendingAttempt?.started).toBe(true)
+
+  // The following idle has no assistant output: exactly one unresolved failure.
+  mock.stream.push({ type: "session.idle", created: 3, data: { sessionID: "ses_v2" } })
+  await waitFor(async () => (await getGoal("ses_v2"))?.status === "paused")
+  expect((await getGoal("ses_v2"))?.continuationFailures).toBe(1)
+
+  mock.stream.end()
+  await cleanup()
+})
+
+test("V2 persists the attempt before the prompt resolves so a later busy can correlate", async () => {
+  let resolvePrompt: (() => void) | undefined
+  const mock = makeMockContext({ auto_continue: true, min_continue_interval_seconds: 0, max_prompt_failures: 3 })
+  mock.session.prompt = async (input: { sessionID: string; text: string }) => {
+    mock.promptCalls.push(input)
+    await new Promise<void>((resolve) => {
+      resolvePrompt = resolve
+    })
+  }
+  const cleanup = await plugin.setup(mock as never)
+  await createGoalViaV2Tool(mock, "correlate a racing busy")
+
+  void mock.stream.push({ type: "session.idle", created: 1, data: { sessionID: "ses_v2" } })
+  await waitFor(() => mock.promptCalls.length === 1)
+
+  // The attempt is persisted BEFORE the prompt resolves, so a provider busy
+  // (whenever it arrives) correlates to this exact attempt rather than a
+  // local-only timing assumption.
+  const during = await getGoalInternal("ses_v2")
+  expect(during?.pendingAttempt).not.toBeNull()
+  expect(during?.pendingAttempt?.delivered).toBe(false)
+
+  resolvePrompt?.()
+  await waitFor(async () => (await getGoalInternal("ses_v2"))?.pendingAttempt?.delivered === true)
+
+  // A busy arriving after delivery still marks the same persisted attempt.
+  mock.stream.push({ type: "session.status", created: 2, data: { sessionID: "ses_v2", status: { type: "busy" } } })
+  await waitFor(async () => (await getGoalInternal("ses_v2"))?.pendingAttempt?.started === true)
+  expect((await getGoalInternal("ses_v2"))?.pendingAttempt?.started).toBe(true)
+
+  mock.stream.end()
+  await cleanup()
+})
+
+test("V2 retry status cancels scheduled transport recovery", async () => {
+  const mock = makeMockContext({ auto_continue: true, min_continue_interval_seconds: 0 })
+  const cleanup = await plugin.setup(mock as never)
+  await createGoalViaV2Tool(mock, "let the native retry win")
+
+  mock.stream.push({
+    type: "session.error",
+    created: 1,
+    data: { sessionID: "ses_v2", error: { message: "network connection failed" } },
+  })
+  mock.stream.push({ type: "session.status", created: 2, data: { sessionID: "ses_v2", status: { type: "retry" } } })
+  await new Promise((resolve) => setTimeout(resolve, 100))
+
+  expect(mock.promptCalls).toHaveLength(0)
+  expect((await getGoal("ses_v2"))?.continuationFailures).toBe(0)
+
+  mock.stream.end()
+  await cleanup()
+})
+
+test("V2 successful tool progress cancels no-pending transport recovery", async () => {
+  const mock = makeMockContext({ auto_continue: true, min_continue_interval_seconds: 0 })
+  const cleanup = await plugin.setup(mock as never)
+  await createGoalViaV2Tool(mock, "cancel recovery via tool progress")
+
+  mock.stream.push({
+    type: "session.error",
+    created: 1,
+    data: { sessionID: "ses_v2", error: { message: "network connection failed" } },
+  })
+  // Drain the FIFO event stream deterministically: a later usage event writes
+  // state, so once it is visible the transport error above has already been
+  // processed and its recovery timer scheduled. Then cancel it via the awaited
+  // tool hook before the timer (RETRY_SETTLE_MS) can fire.
+  mock.stream.push({
+    type: "session.usage.updated",
+    created: 2,
+    data: { sessionID: "ses_v2", tokens: { input: 5, output: 0, reasoning: 0, cache: { read: 0, write: 0 } } },
+  })
+  await waitFor(async () => (await getGoal("ses_v2"))?.tokensUsed === 5)
+  await mock.hooks["execute.after"]!({
+    tool: "bash",
+    sessionID: "ses_v2",
+    id: "call_progress",
+    status: "completed",
+    result: { output: "tests passed" },
+  })
+  await new Promise((resolve) => setTimeout(resolve, 100))
+
+  expect(mock.promptCalls).toHaveLength(0)
+  expect((await getGoal("ses_v2"))?.continuationFailures).toBe(0)
+
+  mock.stream.end()
+  await cleanup()
+})
+
+test("V2 assistant progress cancels no-pending transport recovery", async () => {
+  const mock = makeMockContext({ auto_continue: true, min_continue_interval_seconds: 0 })
+  const cleanup = await plugin.setup(mock as never)
+  await createGoalViaV2Tool(mock, "cancel recovery via assistant progress")
+
+  mock.stream.push({
+    type: "session.error",
+    created: 1,
+    data: { sessionID: "ses_v2", error: { message: "network connection failed" } },
+  })
+  mock.stream.push({
+    type: "session.step.started",
+    created: 20,
+    data: { sessionID: "ses_v2", assistantMessageID: "msg_recovered", agent: "build" },
+  })
+  mock.stream.push({
+    type: "session.text.ended",
+    created: 21,
+    data: { sessionID: "ses_v2", assistantMessageID: "msg_recovered", text: "The provider recovered on its own." },
+  })
+  mock.stream.push({
+    type: "session.step.ended",
+    created: 22,
+    data: { sessionID: "ses_v2", assistantMessageID: "msg_recovered", tokens: { input: 10, output: 20, reasoning: 0, cache: { read: 0, write: 0 } } },
+  })
+  await waitFor(async () => (await getGoal("ses_v2"))?.lastAssistantMessageID === "msg_recovered")
+  await new Promise((resolve) => setTimeout(resolve, 100))
+
+  expect(mock.promptCalls).toHaveLength(0)
+
+  mock.stream.end()
+  await cleanup()
+})
+
+test("V2 watchdog rescues a busy active goal without consuming auto-turn budgets", async () => {
+  const mock = makeMockContext({ auto_continue: false, max_turn_time: 0.02, max_prompt_failures: 5, max_auto_turns: 1 })
+  const cleanup = await plugin.setup(mock as never)
+  await createGoalViaV2Tool(mock, "watchdog should not eat the budget")
+
+  mock.stream.push({ type: "session.status", created: Date.now(), data: { sessionID: "ses_v2", status: { type: "busy" } } })
+  await waitFor(() => mock.promptCalls.length === 1)
+
+  expect(mock.promptCalls).toHaveLength(1)
+  expect((await getGoal("ses_v2"))?.autoTurns).toBe(0)
+
+  mock.stream.end()
+  await cleanup()
+})
+
+test("V2 non-transport prompt errors do not count toward the ceiling or retry", async () => {
+  const mock = makeMockContext({ auto_continue: true, min_continue_interval_seconds: 0, max_prompt_failures: 3 })
+  mock.session.prompt = async () => {
+    throw new Error("invalid provider configuration")
+  }
+  const cleanup = await plugin.setup(mock as never)
+  await createGoalViaV2Tool(mock, "non-transport must be ignored")
+
+  mock.stream.push({ type: "session.idle", created: Date.now(), data: { sessionID: "ses_v2" } })
+  await new Promise((resolve) => setTimeout(resolve, 100))
+
+  const goal = await getGoal("ses_v2")
+  expect(goal?.continuationFailures).toBe(0)
+  expect(goal?.status).toBe("active")
+
+  mock.stream.end()
+  await cleanup()
+})
+
+test("V2 a native retry status suppresses a later session.error until busy ends the episode", async () => {
+  const mock = makeMockContext({ auto_continue: true, min_continue_interval_seconds: 0, max_prompt_failures: 3 })
+  const cleanup = await plugin.setup(mock as never)
+  await createGoalViaV2Tool(mock, "native retry must win")
+
+  // retry arrives before the transport error; the error is suppressed while
+  // the provider is already retrying.
+  mock.stream.push({ type: "session.status", created: 1, data: { sessionID: "ses_v2", status: { type: "retry" } } })
+  mock.stream.push({
+    type: "session.error",
+    created: 2,
+    data: { sessionID: "ses_v2", error: { message: "network connection failed" } },
+  })
+  await new Promise((resolve) => setTimeout(resolve, 100))
+
+  expect(mock.promptCalls).toHaveLength(0)
+  const suppressed = await getGoal("ses_v2")
+  expect(suppressed?.continuationFailures).toBe(0)
+  expect(suppressed?.status).toBe("active")
+
+  // busy ends the retry episode; a later transport error may then recover.
+  mock.stream.push({ type: "session.status", created: 3, data: { sessionID: "ses_v2", status: { type: "busy" } } })
+  mock.stream.push({
+    type: "session.error",
+    created: 4,
+    data: { sessionID: "ses_v2", error: { message: "network connection failed" } },
+  })
+  await waitFor(() => mock.promptCalls.length === 1)
+  expect(mock.promptCalls[0]?.text).toContain("Continue working toward the active session goal")
+
+  mock.stream.end()
+  await cleanup()
+})
+
+test("V2 watchdog no-response counts a failure on idle even with auto_continue false", async () => {
+  const mock = makeMockContext({ auto_continue: false, max_turn_time: 0.02, max_prompt_failures: 5, max_auto_turns: 1 })
+  const cleanup = await plugin.setup(mock as never)
+  await createGoalViaV2Tool(mock, "watchdog no response with auto-continue disabled")
+
+  mock.stream.push({ type: "session.status", created: Date.now(), data: { sessionID: "ses_v2", status: { type: "busy" } } })
+  await waitFor(async () => (await getGoalInternal("ses_v2"))?.pendingAttempt?.started === true)
+  await waitFor(() => mock.promptCalls.length === 1)
+  expect((await getGoal("ses_v2"))?.autoTurns).toBe(0)
+
+  // The busy episode ends with no response: the started pending attempt counts
+  // exactly one unresolved failure even though auto-continue is disabled, and
+  // no retry is scheduled.
+  mock.stream.push({ type: "session.idle", created: Date.now(), data: { sessionID: "ses_v2" } })
+  await waitFor(async () => (await getGoal("ses_v2"))?.continuationFailures === 1)
+
+  const goal = await getGoal("ses_v2")
+  expect(goal?.continuationFailures).toBe(1)
+  expect(goal?.autoTurns).toBe(0)
+  expect(goal?.status).toBe("active")
+  expect((await getGoalInternal("ses_v2"))?.pendingAttempt).toBeNull()
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  expect(mock.promptCalls).toHaveLength(1)
+
+  mock.stream.end()
+  await cleanup()
+})
+
+test("V2 delayed tool output from a prior turn cannot clear a newer pending attempt", async () => {
+  const mock = makeMockContext({ auto_continue: false })
+  const cleanup = await plugin.setup(mock as never)
+  await createGoalViaV2Tool(mock, "correlate tool progress to the attempt")
+
+  // The tool call starts while attempt A is pending; the before hook captures
+  // the attempt id for the session+call key.
+  await reserveContinuation("ses_v2", 10, 0)
+  await recordContinuationResult("ses_v2", "success", 5)
+  const attemptA = (await getGoalInternal("ses_v2"))?.pendingAttempt?.id
+  expect(attemptA).toMatch(/^att_/)
+  await mock.hooks["execute.before"]!({ tool: "bash", sessionID: "ses_v2", id: "call_delayed", input: {} })
+
+  // A newer attempt B is reserved while the tool is still running.
+  await reserveContinuation("ses_v2", 10, 0)
+  await recordContinuationResult("ses_v2", "success", 5)
+  const attemptB = (await getGoalInternal("ses_v2"))?.pendingAttempt?.id
+  expect(attemptB).not.toBe(attemptA)
+
+  // The delayed output from the old call must leave attempt B pending.
+  await mock.hooks["execute.after"]!({
+    tool: "bash",
+    sessionID: "ses_v2",
+    id: "call_delayed",
+    status: "completed",
+    result: { output: "tests passed" },
+  })
+  expect((await getGoalInternal("ses_v2"))?.pendingAttempt?.id).toBe(attemptB)
+
+  // A tool call that started while attempt B was pending clears it.
+  await mock.hooks["execute.before"]!({ tool: "bash", sessionID: "ses_v2", id: "call_current", input: {} })
+  await mock.hooks["execute.after"]!({
+    tool: "bash",
+    sessionID: "ses_v2",
+    id: "call_current",
+    status: "completed",
+    result: { output: "more progress" },
+  })
+  expect((await getGoalInternal("ses_v2"))?.pendingAttempt).toBeNull()
+
+  mock.stream.end()
+  await cleanup()
+})
+
+test("V2 dispose during an in-flight prompt rolls back the reserved attempt on rejection", async () => {
+  let resolvePrompt: (() => void) | undefined
+  const mock = makeMockContext({ auto_continue: true, min_continue_interval_seconds: 0, max_prompt_failures: 3 })
+  mock.session.prompt = async (input: { sessionID: string; text: string }) => {
+    mock.promptCalls.push(input)
+    await new Promise<void>((resolve) => {
+      resolvePrompt = resolve
+    })
+    throw new Error("network down")
+  }
+  const cleanup = await plugin.setup(mock as never)
+  await createGoalViaV2Tool(mock, "dispose mid-flight rejection")
+
+  void mock.stream.push({ type: "session.idle", created: 1, data: { sessionID: "ses_v2" } })
+  await waitFor(() => mock.promptCalls.length === 1)
+
+  // Dispose while the prompt is in flight, then let it fail: the catch block
+  // must roll back the reserved attempt without counting a transport failure
+  // or consuming an auto-turn.
+  await cleanup()
+  resolvePrompt?.()
+  await new Promise((resolve) => setTimeout(resolve, 100))
+
+  expect(mock.promptCalls).toHaveLength(1)
+  const goal = await getGoal("ses_v2")
+  expect(goal?.autoTurns).toBe(0)
+  expect(goal?.continuationFailures).toBe(0)
+  expect(goal?.status).toBe("active")
+  expect((await getGoalInternal("ses_v2"))?.pendingAttempt).toBeNull()
+})
+
+test("V2 commits an accepted prompt when its recovery timer is canceled in flight", async () => {
+  let resolvePrompt: (() => void) | undefined
+  const mock = makeMockContext({ auto_continue: true, min_continue_interval_seconds: 0 })
+  mock.session.prompt = async (input) => {
+    mock.promptCalls.push(input)
+    await new Promise<void>((resolve) => {
+      resolvePrompt = resolve
+    })
+  }
+  const cleanup = await plugin.setup(mock as never)
+  await createGoalViaV2Tool(mock, "commit accepted recovery")
+
+  mock.stream.push({
+    type: "session.error",
+    created: Date.now(),
+    data: { sessionID: "ses_v2", error: { message: "network connection failed" } },
+  })
+  await waitFor(() => mock.promptCalls.length === 1)
+
+  // Concurrent progress cancels the timer while prompt() is still in flight.
+  // Once prompt() resolves, its accepted delivery must remain charged/tracked.
+  await mock.hooks["execute.before"]!({ tool: "bash", sessionID: "ses_v2", id: "call_cancel" })
+  await mock.hooks["execute.after"]!({
+    tool: "bash",
+    sessionID: "ses_v2",
+    id: "call_cancel",
+    status: "completed",
+    result: { output: "progress from the active session" },
+  })
+  resolvePrompt?.()
+
+  await waitFor(async () => (await getGoalInternal("ses_v2"))?.pendingAttempt?.delivered === true)
+  expect((await getGoal("ses_v2"))?.autoTurns).toBe(1)
+  expect(mock.promptCalls).toHaveLength(1)
+
+  mock.stream.end()
+  await cleanup()
+})
+
+test("V2 completed tool failures do not clear retry state", async () => {
+  const mock = makeMockContext({ auto_continue: false })
+  const cleanup = await plugin.setup(mock as never)
+  await createGoalViaV2Tool(mock, "keep failed tools from masking recovery")
+
+  await reserveContinuation("ses_v2", 10, 0)
+  await recordContinuationResult("ses_v2", "failure", 5)
+  await reserveContinuation("ses_v2", 10, 0)
+  await recordContinuationResult("ses_v2", "success", 5)
+  const attemptID = (await getGoalInternal("ses_v2"))?.pendingAttempt?.id
+  expect(attemptID).toBeTypeOf("string")
+
+  for (const [id, output] of [
+    ["call_running", "state: running\nstill working"],
+    ["call_error", "<error>command failed</error>"],
+  ] as const) {
+    await mock.hooks["execute.before"]!({ tool: "bash", sessionID: "ses_v2", id })
+    await mock.hooks["execute.after"]!({
+      tool: "bash",
+      sessionID: "ses_v2",
+      id,
+      status: "completed",
+      result: { output },
+    })
+    const goal = await getGoalInternal("ses_v2")
+    expect(goal?.continuationFailures).toBe(1)
+    expect(goal?.pendingAttempt?.id).toBe(attemptID)
+  }
+
+  mock.stream.end()
+  await cleanup()
 })
