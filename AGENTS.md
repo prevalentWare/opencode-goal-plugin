@@ -26,7 +26,7 @@ Before treating a code change as complete, run the relevant checks. For release-
 ```bash
 bun run lint
 bun run typecheck
-bun test
+bun run test
 bun run build
 bun run pack:dry-run
 ```
@@ -46,7 +46,7 @@ gh release view v<version>
 
 ## End-To-End Plugin Test
 
-To test this plugin end to end, do not stop at unit tests. Run the local gates first: `bun run lint`, `bun run typecheck`, `bun test`, `bun run build`, and `bun run pack:dry-run`.
+To test this plugin end to end, do not stop at unit tests. Run the local gates first: `bun run lint`, `bun run typecheck`, `bun run test`, `bun run build`, and `bun run pack:dry-run`.
 
 After publishing, verify the exact npm version with `npm view @prevalentware/opencode-goal-plugin version dependencies`. Install that version in an isolated temp OpenCode project with `opencode plugin @prevalentware/opencode-goal-plugin@<version>`, run `opencode debug config` to confirm the package is loaded and the `goal` command is registered, then run a smoke test with an isolated state file, for example:
 

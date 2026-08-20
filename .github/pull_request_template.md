@@ -16,7 +16,7 @@
 
 ## Checklist
 
-- [ ] `bun test` passes (new behavior has regression coverage)
+- [ ] `bun run test` passes (new behavior has regression coverage)
 - [ ] `bun run lint` passes
 - [ ] `bun run typecheck` passes
 - [ ] `bun run build` passes and `dist/server.js` is committed if server code changed

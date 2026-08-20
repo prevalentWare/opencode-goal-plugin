@@ -48,7 +48,8 @@
     "ci:version": "bun scripts/resolve-ci-version.ts",
     "lint": "eslint .",
     "pack:dry-run": "npm pack --dry-run",
-    "test": "bun test",
+    "test": "bun test --concurrent --max-concurrency 1",
+    "test:coverage": "bun test --concurrent --max-concurrency 1 --coverage",
     "typecheck": "tsc --noEmit",
     "prepublishOnly": "bun run test && bun run build"
   },

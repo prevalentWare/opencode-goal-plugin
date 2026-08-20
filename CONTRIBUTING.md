@@ -19,8 +19,8 @@ Useful scripts:
 
 | Script | What it does |
 | --- | --- |
-| `bun test` | Run the unit test suite |
-| `bun test --coverage` | Run tests with a coverage report |
+| `bun run test` | Run the unit test suite serially |
+| `bun run test:coverage` | Run the serial test suite with a coverage report |
 | `bun run lint` | ESLint over the repo |
 | `bun run typecheck` | TypeScript `--noEmit` check |
 | `bun run build` | Bundle `src/server.ts` into `dist/` |
@@ -40,7 +40,7 @@ Useful scripts:
 1. Create a topic branch from `main`.
 2. Make your change, keeping the existing code style (no semicolons, 130-column lines, strict TypeScript).
 3. Add or update tests — behavior changes need regression coverage.
-4. Run the local gates: `bun test && bun run lint && bun run typecheck && bun run build`.
+4. Run the local gates: `bun run test && bun run lint && bun run typecheck && bun run build`.
 5. Commit the rebuilt `dist/server.js` when `src/server.ts` (or its imports) changed — the built file is tracked on purpose.
 6. Open a pull request against `main` describing the problem, the approach, and how you verified it. Link the related issue (`Closes #NN`) when one exists. The pull request description must also name the AI model and agent harness used (for example, OpenCode or Claude Code), or explicitly state that the change was made manually.
 

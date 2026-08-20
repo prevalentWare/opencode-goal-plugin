@@ -239,7 +239,7 @@ This plugin follows Codex's native goal-mode semantics where OpenCode plugin hoo
 
 ```bash
 bun install
-bun test
+bun run test
 bun run lint
 bun run typecheck
 bun run build
