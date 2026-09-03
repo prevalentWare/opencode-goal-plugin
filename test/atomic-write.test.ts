@@ -70,9 +70,16 @@ function makeRecordingOps(overrides: { ops?: Partial<AtomicWriteOps>; handle?: P
           record("sync", [])
           return overrides.handle?.sync ? overrides.handle.sync() : inner.sync()
         },
-        close: () => {
+        close: async () => {
           record("close", [])
-          return overrides.handle?.close ? overrides.handle.close() : inner.close()
+          if (!overrides.handle?.close) return inner.close()
+          try {
+            await overrides.handle.close()
+          } catch (error) {
+            await inner.close()
+            throw error
+          }
+          return inner.close()
         },
       }
     },
