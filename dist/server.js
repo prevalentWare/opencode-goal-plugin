@@ -1875,6 +1875,21 @@ function v2ObjectSchema(properties, required = []) {
     additionalProperties: false
   };
 }
+function decodeV2Event(value) {
+  let decoded = value;
+  if (typeof decoded === "string") {
+    try {
+      decoded = JSON.parse(decoded);
+    } catch {
+      return;
+    }
+  }
+  if (!isRecord(decoded) || typeof decoded.type !== "string" || !isRecord(decoded.data))
+    return;
+  if (typeof decoded.created !== "number")
+    return;
+  return decoded;
+}
 function textFromToolResult(result) {
   if (typeof result.output === "string")
     return result.output;
@@ -3031,7 +3046,9 @@ async function setupV2(context) {
         const { done, value } = await iterator.next();
         if (done)
           break;
-        await handleV2Event(value);
+        const event = decodeV2Event(value);
+        if (event)
+          await handleV2Event(event);
       }
     } catch (error) {
       if (!abortController.signal.aborted)

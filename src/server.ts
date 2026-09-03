@@ -885,6 +885,20 @@ type V2EventLike = {
   data: Record<string, unknown>
 }
 
+function decodeV2Event(value: unknown): V2EventLike | undefined {
+  let decoded = value
+  if (typeof decoded === "string") {
+    try {
+      decoded = JSON.parse(decoded)
+    } catch {
+      return undefined
+    }
+  }
+  if (!isRecord(decoded) || typeof decoded.type !== "string" || !isRecord(decoded.data)) return undefined
+  if (typeof decoded.created !== "number") return undefined
+  return decoded as V2EventLike
+}
+
 type V2StepRecord = {
   messageID: string
   agent?: string
@@ -2168,7 +2182,8 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       while (true) {
         const { done, value } = await iterator.next()
         if (done) break
-        await handleV2Event(value as V2EventLike)
+        const event = decodeV2Event(value)
+        if (event) await handleV2Event(event)
       }
     } catch (error) {
       if (!abortController.signal.aborted) v2ErrorLog("V2 event consumer stopped", error)

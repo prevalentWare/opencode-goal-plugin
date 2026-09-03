@@ -562,6 +562,22 @@ test("V2 idle event triggers auto-continue via ctx.session.prompt", async () => 
   await cleanup()
 })
 
+test("V2 JSON-encoded idle event triggers auto-continue", async () => {
+  const mock = makeMockContext({ auto_continue: true, min_continue_interval_seconds: 0, max_auto_turns: 5 })
+  const cleanup = await setupPlugin(mock as never)
+  await createGoalViaV2Tool(mock, "auto-continue from encoded idle events")
+
+  mock.stream.push("not JSON")
+  mock.stream.push(JSON.stringify({ type: "session.idle", created: Date.now(), data: { sessionID: "ses_v2" } }))
+
+  await waitFor(() => mock.promptCalls.length === 1)
+  expect(mock.promptCalls[0]?.sessionID).toBe("ses_v2")
+  expect((await getGoal("ses_v2"))?.autoTurns).toBe(1)
+
+  mock.stream.end()
+  await cleanup()
+})
+
 test("V2 idle continuation waits for a running child session", async () => {
   const mock = makeMockContext({ min_continue_interval_seconds: 1 })
   const cleanup = await setupPlugin(mock as never)
