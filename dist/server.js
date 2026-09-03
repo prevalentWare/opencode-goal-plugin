@@ -1161,6 +1161,8 @@ var DEFAULT_COMMAND_NAME = "goal";
 var DEFAULT_RESTRICTED_AGENTS = ["plan"];
 var TASK_SETTLE_DELAY_MS = 25;
 var SNAPSHOT_IDLE_HOLD_MS = 250;
+var DEFAULT_MAX_TASK_BLOCK_SECONDS = 900;
+var TASK_BLOCK_RETRY_MS = 1000;
 var MAX_TIMER_DELAY_MS = 2147483647;
 var STALE_PENDING_MS = 30000;
 var RETRY_SETTLE_MS = 25;
@@ -1481,6 +1483,12 @@ function toolOutputFailed(output) {
     return true;
   return false;
 }
+function taskBlockExpired(task, maxBlockMs, now) {
+  if (maxBlockMs == null)
+    return false;
+  const blockingSince = task.state === "running" ? task.runningSince : task.terminalAt;
+  return blockingSince != null && now - blockingSince >= maxBlockMs;
+}
 function sessionIDFromEvent(event) {
   const direct = event.properties?.sessionID;
   if (typeof direct === "string")
@@ -1606,13 +1614,17 @@ class TaskTracker {
     if (marker)
       this.observeAssistant(sessionID, marker);
   }
-  hasBlockingTasks(parentSessionID) {
+  hasBlockingTasks(parentSessionID, maxBlockMs = null) {
     this.pruneExpiredSnapshotIdleHolds();
+    const now = Date.now();
     for (const task of this.tasks.values()) {
       if (task.parentSessionID !== parentSessionID)
         continue;
-      if (task.state === "running" || task.terminalUnreconciled)
-        return true;
+      if (task.state !== "running" && !task.terminalUnreconciled)
+        continue;
+      if (taskBlockExpired(task, maxBlockMs, now))
+        continue;
+      return true;
     }
     for (const hold of this.snapshotIdleHolds.values()) {
       if (hold.parentSessionID === parentSessionID)
@@ -1673,6 +1685,7 @@ class TaskTracker {
       parentSessionID,
       state: "running",
       terminalUnreconciled: false,
+      runningSince: existing?.state === "running" ? existing.runningSince ?? Date.now() : Date.now(),
       terminalAt: null,
       lastAssistantMessageIDAtTerminal: existing?.lastAssistantMessageIDAtTerminal ?? null
     });
@@ -1693,6 +1706,7 @@ class TaskTracker {
       parentSessionID: resolvedParentSessionID,
       state,
       terminalUnreconciled: true,
+      runningSince: null,
       terminalAt: Date.now(),
       lastAssistantMessageIDAtTerminal: this.latestAssistantBySession.get(resolvedParentSessionID)?.id ?? null
     });
@@ -1902,6 +1916,7 @@ var server = async ({ client }, options) => {
   const maxAutoTurns = positiveIntegerOrNull2(options?.max_auto_turns) ?? DEFAULT_MAX_AUTO_TURNS;
   const minInterval = nonNegativeIntegerOrNull2(options?.min_continue_interval_seconds) ?? DEFAULT_CONTINUE_INTERVAL_SECONDS;
   const maxTurnTimeMs = timeoutMillisecondsFromSeconds(options?.max_turn_time);
+  const maxTaskBlockMs = timeoutMillisecondsFromSeconds(options?.max_task_block_seconds ?? DEFAULT_MAX_TASK_BLOCK_SECONDS);
   const maxPromptFailures = positiveIntegerOrNull2(options?.max_prompt_failures) ?? DEFAULT_MAX_PROMPT_FAILURES;
   const registerCommand = options?.register_command ?? true;
   const commandName = commandNameFromOptions(options);
@@ -1923,7 +1938,7 @@ var server = async ({ client }, options) => {
       return false;
     await taskTracker.refreshLiveChildren(client, sessionID);
     return {
-      blocked: taskTracker.hasBlockingTasks(sessionID),
+      blocked: taskTracker.hasBlockingTasks(sessionID, maxTaskBlockMs),
       retryAt: taskTracker.nextSnapshotIdleRetryAt(sessionID)
     };
   }
@@ -2062,9 +2077,7 @@ var server = async ({ client }, options) => {
       const taskStatus = await taskBlockStatus(sessionID);
       if (taskStatus && taskStatus.blocked) {
         taskDeferredSessions.add(sessionID);
-        if (taskStatus.retryAt != null) {
-          scheduleSettledContinuation(sessionID, taskStatus.retryAt - Date.now(), scheduled != null);
-        }
+        scheduleSettledContinuation(sessionID, taskStatus.retryAt != null ? taskStatus.retryAt - Date.now() : TASK_BLOCK_RETRY_MS, scheduled != null);
         return;
       }
       if (busySessions.has(sessionID))
@@ -2450,6 +2463,7 @@ async function setupV2(context) {
   const maxAutoTurns = positiveIntegerOrNull2(options.max_auto_turns) ?? DEFAULT_MAX_AUTO_TURNS;
   const minInterval = nonNegativeIntegerOrNull2(options.min_continue_interval_seconds) ?? DEFAULT_CONTINUE_INTERVAL_SECONDS;
   const maxTurnTimeMs = timeoutMillisecondsFromSeconds(options.max_turn_time);
+  const maxTaskBlockMs = timeoutMillisecondsFromSeconds(options.max_task_block_seconds ?? DEFAULT_MAX_TASK_BLOCK_SECONDS);
   const maxPromptFailures = positiveIntegerOrNull2(options.max_prompt_failures) ?? DEFAULT_MAX_PROMPT_FAILURES;
   const registerCommand = options.register_command ?? true;
   const commandName = commandNameFromOptions(options);
@@ -2495,7 +2509,7 @@ async function setupV2(context) {
     if (!deferWhileTasksActive)
       return false;
     return {
-      blocked: taskTracker.hasBlockingTasks(sessionID),
+      blocked: taskTracker.hasBlockingTasks(sessionID, maxTaskBlockMs),
       retryAt: taskTracker.nextSnapshotIdleRetryAt(sessionID)
     };
   }
@@ -2624,9 +2638,7 @@ async function setupV2(context) {
       const taskStatus = taskBlockStatus(sessionID);
       if (taskStatus && taskStatus.blocked) {
         taskDeferredSessions.add(sessionID);
-        if (taskStatus.retryAt != null) {
-          scheduleSettledContinuation(sessionID, taskStatus.retryAt - Date.now(), scheduled != null);
-        }
+        scheduleSettledContinuation(sessionID, taskStatus.retryAt != null ? taskStatus.retryAt - Date.now() : TASK_BLOCK_RETRY_MS, scheduled != null);
         return;
       }
       if (busySessions.has(sessionID))

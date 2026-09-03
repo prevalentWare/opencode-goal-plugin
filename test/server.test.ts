@@ -1518,6 +1518,71 @@ test("tracked running child absent from live children stops blocking after grace
   expect(JSON.stringify(calls[0])).toContain("Continue working toward the active session goal")
 })
 
+test("task deferral re-polls live children without a further idle event", async () => {
+  const calls: unknown[] = []
+  let children = [{ id: "task_1" }]
+  const hooks = await setupServer(
+    {
+      client: {
+        session: {
+          children: async () => ({ data: children }),
+          status: async () => ({ data: { task_1: { type: "busy" } } }),
+          promptAsync: async (input: unknown) => {
+            calls.push(input)
+          },
+        },
+      },
+    } as never,
+    { auto_continue: true, max_auto_turns: 1, min_continue_interval_seconds: 0 },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "keep going" }, { sessionID: "ses_repoll" } as never)
+  await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_repoll" } } as never })
+  expect(calls).toHaveLength(0)
+
+  // The child disappears and no new idle event ever arrives. Only the task-block
+  // retry can observe the absence, so continuation must resume without further input.
+  children = []
+  await waitForLong(() => calls.length === 1, 10_000)
+  expect(JSON.stringify(calls[0])).toContain("Continue working toward the active session goal")
+}, 20_000)
+
+test("live child that never reaches a terminal state stops blocking after the task block ceiling", async () => {
+  const calls: unknown[] = []
+  const hooks = await setupServer(
+    {
+      client: {
+        session: {
+          children: async () => ({ data: [{ id: "task_1" }] }),
+          status: async () => ({ data: { task_1: { type: "busy" } } }),
+          promptAsync: async (input: unknown) => {
+            calls.push(input)
+          },
+        },
+      },
+    } as never,
+    {
+      auto_continue: true,
+      max_auto_turns: 1,
+      min_continue_interval_seconds: 0,
+      max_task_block_seconds: 0.2,
+    },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "keep going" }, { sessionID: "ses_ceiling" } as never)
+  await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_ceiling" } } as never })
+  expect(calls).toHaveLength(0)
+
+  // The child stays listed and busy forever, so it is never pruned as absent and no
+  // terminal result is ever reconciled. The wall-clock ceiling is the only way out.
+  await waitForLong(() => calls.length === 1, 10_000)
+  expect(JSON.stringify(calls[0])).toContain("Continue working toward the active session goal")
+}, 20_000)
+
 test("task deferral can be disabled with config", async () => {
   const calls: unknown[] = []
   const hooks = await setupServer(

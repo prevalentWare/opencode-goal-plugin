@@ -167,8 +167,8 @@ function toolContext(sessionID = "ses_v2", agent = "build") {
   return { sessionID, agent, messageID: "msg_1", id: "call_1" }
 }
 
-async function waitFor(predicate: () => boolean | Promise<boolean>) {
-  const deadline = Date.now() + 2000
+async function waitFor(predicate: () => boolean | Promise<boolean>, deadlineMs = 2000) {
+  const deadline = Date.now() + deadlineMs
   while (Date.now() < deadline) {
     if (await predicate()) return
     await new Promise((resolve) => setTimeout(resolve, 5))
@@ -618,6 +618,25 @@ test("V2 idle continuation waits for a running child session", async () => {
   mock.stream.end()
   await cleanup()
 })
+
+test("V2 running child session stops blocking after the task block ceiling", async () => {
+  const mock = makeMockContext({ min_continue_interval_seconds: 0, max_task_block_seconds: 0.2 })
+  const cleanup = await setupPlugin(mock as never)
+  await createGoalViaV2Tool(mock, "wait for delegated work that never reports back")
+
+  // The child is never deleted and never reports a terminal state, and no further idle
+  // event arrives, so only the retry plus the wall-clock ceiling can resume the goal.
+  mock.stream.push({ type: "session.created", created: 100, data: { sessionID: "child", parentID: "ses_v2" } })
+  mock.stream.push({ type: "session.idle", created: 101, data: { sessionID: "ses_v2" } })
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  expect(mock.promptCalls).toHaveLength(0)
+
+  await waitFor(() => mock.promptCalls.length === 1, 10_000)
+  expect(mock.promptCalls[0]?.text).toContain("Continue working toward the active session goal")
+
+  mock.stream.end()
+  await cleanup()
+}, 20_000)
 
 test("V2 idle auto-continue is suppressed for plan-agent goals", async () => {
   const mock = makeMockContext({ auto_continue: true, min_continue_interval_seconds: 0, max_auto_turns: 5 })
