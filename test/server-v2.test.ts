@@ -27,13 +27,21 @@ type ToolDraft = {
   }): void
 }
 
+type MockMention = { start: number; end: number; text: string }
+type MockPrompt = {
+  text: string
+  files?: Array<{ uri: string; mention?: MockMention }>
+  agents?: Array<{ name: string; mention?: MockMention }>
+  skills?: Array<{ id: string; mention?: MockMention }>
+}
+
 type MockCommandDraft = {
   add(command: {
     name: string
     description?: string
     execute: (input: {
       sessionID: string
-      prompt: { text: string; files?: Array<{ uri: string }> }
+      prompt: MockPrompt
       delivery: "steer" | "queue"
     }) => Promise<void>
   }): void
@@ -75,11 +83,8 @@ type MockContext = {
   options: Record<string, unknown>
   promptCalls: Array<{
     sessionID: string
-    text: string
-    files?: Array<{ uri: string }>
-    agents?: Array<{ name: string }>
     delivery?: "steer" | "queue"
-  }>
+  } & MockPrompt>
   tools: Array<ToolDraft["add"] extends (tool: infer T) => void ? T : never>
   commands: Array<MockCommandDraft["add"] extends (command: infer T) => void ? T : never>
   hooks: Record<string, (input: unknown) => void>
@@ -97,11 +102,8 @@ type MockContext = {
     hook: (name: string, callback: (input: unknown) => void) => Promise<Registration>
     prompt: (input: {
       sessionID: string
-      text: string
-      files?: Array<{ uri: string }>
-      agents?: Array<{ name: string }>
       delivery?: "steer" | "queue"
-    }) => Promise<unknown>
+    } & MockPrompt) => Promise<unknown>
   }
   event: {
     subscribe: (options?: { signal?: AbortSignal }) => AsyncIterable<unknown>
@@ -328,20 +330,31 @@ test("V2 setup registers the /goal command via command transform", async () => {
 
   await command?.execute({
     sessionID: "ses_command",
-    prompt: { text: "ship the V2 fix", files: [{ uri: "file:///tmp/context.txt" }] },
+    prompt: {
+      text: "ship $& and $ARGUMENTS",
+      files: [{ uri: "file:///tmp/context.txt", mention: { start: 5, end: 7, text: "$&" } }],
+      agents: [{ name: "build", mention: { start: 5, end: 7, text: "$&" } }],
+      skills: [{ id: "review", mention: { start: 5, end: 7, text: "$&" } }],
+    },
     delivery: "queue",
   })
   expect(mock.promptCalls).toHaveLength(1)
   expect(mock.promptCalls[0]).toMatchObject({
     sessionID: "ses_command",
-    files: [{ uri: "file:///tmp/context.txt" }],
     delivery: "queue",
   })
+  expect(mock.promptCalls[0]?.files).toEqual([{ uri: "file:///tmp/context.txt" }])
+  expect(mock.promptCalls[0]?.agents).toEqual([{ name: "build" }])
+  expect(mock.promptCalls[0]?.skills).toEqual([{ id: "review" }])
   expect(mock.promptCalls[0]?.text).toContain('OpenCode goal mode command "/goal" was invoked')
-  expect(mock.promptCalls[0]?.text).toContain("ship the V2 fix")
+  expect(mock.promptCalls[0]?.text).toContain("ship $& and $ARGUMENTS")
   expect(mock.promptCalls[0]?.text).toContain("call get_goal first")
   expect(mock.promptCalls[0]?.text).toContain("never call it again")
-  expect(mock.promptCalls[0]?.text).not.toContain("$ARGUMENTS")
+  expect(mock.promptCalls[0]?.text.match(/\$ARGUMENTS/g)).toHaveLength(1)
+
+  await command?.execute({ sessionID: "ses_empty", prompt: { text: "" }, delivery: "steer" })
+  expect(mock.promptCalls[1]).toMatchObject({ sessionID: "ses_empty", delivery: "steer" })
+  expect(mock.promptCalls[1]?.text).toContain("If the arguments are empty, call get_goal")
 
   mock.stream.end()
   await cleanup()
