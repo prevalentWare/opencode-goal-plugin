@@ -2963,11 +2963,17 @@ async function setupV2(context) {
   }
   if (registerCommand) {
     registrations.push(await context.command.transform((draft) => {
-      if (draft.get(commandName))
-        return;
-      draft.update(commandName, (command) => {
-        command.description = "Set or view the long-running session goal";
-        command.template = goalCommandTemplate(commandName);
+      draft.add({
+        name: commandName,
+        description: "Set or view the long-running session goal",
+        execute: async (input) => {
+          await context.session.prompt({
+            ...input.prompt,
+            sessionID: input.sessionID,
+            text: goalCommandTemplate(commandName).replaceAll("$ARGUMENTS", () => input.prompt.text.trim()),
+            delivery: input.delivery
+          });
+        }
       });
     }));
   }

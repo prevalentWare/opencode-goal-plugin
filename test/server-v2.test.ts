@@ -28,8 +28,15 @@ type ToolDraft = {
 }
 
 type MockCommandDraft = {
-  get(name: string): { name: string; template: string } | undefined
-  update(name: string, update: (command: { description?: string; template: string }) => void): void
+  add(command: {
+    name: string
+    description?: string
+    execute: (input: {
+      sessionID: string
+      prompt: { text: string; files?: Array<{ uri: string }> }
+      delivery: "steer" | "queue"
+    }) => Promise<void>
+  }): void
 }
 
 type Registration = { dispose: () => Promise<void> }
@@ -66,9 +73,15 @@ function controlledStream() {
 
 type MockContext = {
   options: Record<string, unknown>
-  promptCalls: Array<{ sessionID: string; text: string; agents?: Array<{ name: string }> }>
+  promptCalls: Array<{
+    sessionID: string
+    text: string
+    files?: Array<{ uri: string }>
+    agents?: Array<{ name: string }>
+    delivery?: "steer" | "queue"
+  }>
   tools: Array<ToolDraft["add"] extends (tool: infer T) => void ? T : never>
-  commandDraft: MockCommandDraft
+  commands: Array<MockCommandDraft["add"] extends (command: infer T) => void ? T : never>
   hooks: Record<string, (input: unknown) => void>
   systemParts: Array<{ type: string; text: string }>
   stream: ReturnType<typeof controlledStream>
@@ -82,7 +95,13 @@ type MockContext = {
   }
   session: {
     hook: (name: string, callback: (input: unknown) => void) => Promise<Registration>
-    prompt: (input: { sessionID: string; text: string; agents?: Array<{ name: string }> }) => Promise<unknown>
+    prompt: (input: {
+      sessionID: string
+      text: string
+      files?: Array<{ uri: string }>
+      agents?: Array<{ name: string }>
+      delivery?: "steer" | "queue"
+    }) => Promise<unknown>
   }
   event: {
     subscribe: (options?: { signal?: AbortSignal }) => AsyncIterable<unknown>
@@ -91,18 +110,11 @@ type MockContext = {
 
 function makeMockContext(options: Record<string, unknown> = {}): MockContext {
   const tools: MockContext["tools"] = []
+  const commands: MockContext["commands"] = []
   const hooks: MockContext["hooks"] = {}
   const promptCalls: MockContext["promptCalls"] = []
   const disposals: string[] = []
   const stream = controlledStream()
-  const commandDraft: MockCommandDraft = {
-    get: () => undefined,
-    update: (name, update) => {
-      const command = { name, template: "" }
-      update(command)
-      commandDraft.get = () => command
-    },
-  }
   const registration = (name: string): Registration => ({
     dispose: async () => {
       disposals.push(name)
@@ -112,14 +124,14 @@ function makeMockContext(options: Record<string, unknown> = {}): MockContext {
     options,
     promptCalls,
     tools,
-    commandDraft,
+    commands,
     hooks,
     systemParts: [],
     stream,
     disposals,
     command: {
       transform: async (callback) => {
-        callback(commandDraft)
+        callback({ add: (command) => commands.push(command) })
         return registration("command.transform")
       },
     },
@@ -310,12 +322,26 @@ test("V2 setup registers the /goal command via command transform", async () => {
   const mock = makeMockContext({ auto_continue: false })
   const cleanup = await setupPlugin(mock as never)
 
-  const command = mock.commandDraft.get("goal")
+  const command = mock.commands.find((candidate) => candidate.name === "goal")
   expect(command).toBeDefined()
-  expect(command?.template).toContain('OpenCode goal mode command "/goal" was invoked')
-  expect(command?.template).toContain("$ARGUMENTS")
-  expect(command?.template).toContain("call get_goal first")
-  expect(command?.template).toContain("never call it again")
+  expect(command?.description).toBe("Set or view the long-running session goal")
+
+  await command?.execute({
+    sessionID: "ses_command",
+    prompt: { text: "ship the V2 fix", files: [{ uri: "file:///tmp/context.txt" }] },
+    delivery: "queue",
+  })
+  expect(mock.promptCalls).toHaveLength(1)
+  expect(mock.promptCalls[0]).toMatchObject({
+    sessionID: "ses_command",
+    files: [{ uri: "file:///tmp/context.txt" }],
+    delivery: "queue",
+  })
+  expect(mock.promptCalls[0]?.text).toContain('OpenCode goal mode command "/goal" was invoked')
+  expect(mock.promptCalls[0]?.text).toContain("ship the V2 fix")
+  expect(mock.promptCalls[0]?.text).toContain("call get_goal first")
+  expect(mock.promptCalls[0]?.text).toContain("never call it again")
+  expect(mock.promptCalls[0]?.text).not.toContain("$ARGUMENTS")
 
   mock.stream.end()
   await cleanup()
@@ -325,7 +351,7 @@ test("V2 setup skips command registration when register_command is false", async
   const mock = makeMockContext({ auto_continue: false, register_command: false })
   const cleanup = await setupPlugin(mock as never)
 
-  expect(mock.commandDraft.get("goal")).toBeUndefined()
+  expect(mock.commands).toHaveLength(0)
   expect(mock.disposals).not.toContain("command.transform")
 
   mock.stream.end()
