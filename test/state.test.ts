@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, setSystemTime, spyOn, test } from "bun:test"
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises"
+import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import {
@@ -501,6 +501,7 @@ test("does not overwrite corrupt persisted state", async () => {
   await expect(createGoal("ses_1", "ship the plugin", null)).rejects.toThrow()
 
   expect(await readFile(process.env.OPENCODE_GOAL_STATE_PATH!, "utf8")).toBe("{not valid json")
+  expect((await readdir(dir)).filter((name) => name.includes(".corrupt-"))).toEqual([])
 })
 
 test("treats empty and zero-filled state files as missing for async and sync reads", async () => {
@@ -511,6 +512,7 @@ test("treats empty and zero-filled state files as missing for async and sync rea
     expect(getGoalSync("ses_1")).toBeNull()
     expect(await readFile(process.env.OPENCODE_GOAL_STATE_PATH!, "utf8")).toBe(content)
   }
+  expect(await readdir(dir)).toEqual(["goals.json"])
 })
 
 test("loads valid state prefixed by a UTF-8 BOM", async () => {
@@ -533,6 +535,21 @@ test("creates and persists a goal from an empty state file", async () => {
     version: 1,
     goals: { ses_1: { objective: "recover safely" } },
   })
+  expect((await readdir(dir)).filter((name) => name.includes(".corrupt-"))).toEqual([])
+})
+
+test("quarantines a non-empty zero-filled state before replacing it", async () => {
+  const file = process.env.OPENCODE_GOAL_STATE_PATH!
+  const damaged = "\0".repeat(28_454)
+  await writeFile(file, damaged, "utf8")
+
+  const created = await createGoal("ses_1", "recover safely", null)
+
+  expect(created.objective).toBe("recover safely")
+  expect((await getGoal("ses_1"))?.objective).toBe("recover safely")
+  const quarantines = (await readdir(dir)).filter((name) => name.startsWith("goals.json.corrupt-"))
+  expect(quarantines).toHaveLength(1)
+  expect(await readFile(join(dir, quarantines[0]!), "utf8")).toBe(damaged)
 })
 
 test("warns once for each empty state file path", async () => {

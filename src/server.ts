@@ -15,6 +15,7 @@ import {
   getGoal,
   getGoalInternal,
   markGoalUnmet,
+  onStateRecovery,
   pauseGoalForPlanMode,
   PLAN_MODE_STOP_REASON,
   recordAssistantProgress,
@@ -25,6 +26,7 @@ import {
   reserveContinuation,
   rollbackContinuationAttempt,
   setGoalStatus,
+  statePath,
   updateGoalObjective,
   validateObjective,
 } from "./state"
@@ -958,6 +960,16 @@ const server: Plugin = async ({ client }, options?: Options) => {
   const planAgents = restrictedAgentSet(options)
   const isPlanAgent = (agent: unknown) => typeof agent === "string" && planAgents.has(agent.trim().toLowerCase())
   const goalServices: GoalServices = { options: options ?? {}, isPlanAgent }
+  const stopStateRecoveryReporting = onStateRecovery(statePath(), async ({ stateFile, quarantineFile }) => {
+    await client.app?.log?.({
+      body: {
+        service: "opencode-goal-plugin",
+        level: "error",
+        message: "Corrupt goal state quarantined before recovery",
+        extra: { stateFile, quarantineFile },
+      },
+    })
+  })
   // Set by dispose so in-flight operations triggered before disposal cannot
   // schedule new timers or invoke continuations afterward.
   let disposed = false
@@ -1250,6 +1262,7 @@ const server: Plugin = async ({ client }, options?: Options) => {
   return {
     async dispose() {
       disposed = true
+      stopStateRecoveryReporting()
       for (const scheduled of scheduledContinuations.values()) clearTimeout(scheduled.timer)
       scheduledContinuations.clear()
       for (const watchdog of turnWatchdogs.values()) clearTimeout(watchdog.timer)

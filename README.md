@@ -231,6 +231,8 @@ Ordinary fsync improves crash consistency but is not `F_FULLFSYNC`, so sudden po
 
 If the rename succeeds but syncing the parent directory reports a genuine I/O error, the mutation reports a write failure even though the new valid state may already be present. This avoids claiming durability that the filesystem did not confirm.
 
+If a non-empty state file contains only whitespace, a UTF-8 BOM, or NUL bytes after an interrupted write, the next mutation preserves its exact contents beside the state file as `goals.json.corrupt-<timestamp>-<uuid>` before writing recovered state. Recovery aborts rather than overwrite the original if that quarantine copy cannot be created. OpenCode 1 also records the quarantine path through its application log so the data-loss event remains discoverable.
+
 ## Credits
 
 This plugin follows Codex's native goal-mode semantics where OpenCode plugin hooks allow it. Several hardening ideas were adapted from William Ricchiuti's [`willytop8/OpenCode-goal-plugin`](https://github.com/willytop8/OpenCode-goal-plugin), especially lifecycle history, checkpoints, no-progress safeguards, budget wrap-up behavior, and strict-provider-safe system prompt merging. Thank you, William.

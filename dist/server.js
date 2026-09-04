@@ -3,6 +3,7 @@
 import { z } from "zod";
 
 // src/state.ts
+import { randomUUID as randomUUID2 } from "crypto";
 import { mkdir, readFile } from "fs/promises";
 import { homedir } from "os";
 import { dirname as dirname2, join } from "path";
@@ -220,6 +221,23 @@ function mutableState(state) {
   return JSON.parse(JSON.stringify(state));
 }
 var warnedEmptyStatePaths = new Set;
+var stateRecoveryListeners = new Set;
+function onStateRecovery(stateFile, report) {
+  const listener = { stateFile, report };
+  stateRecoveryListeners.add(listener);
+  return () => stateRecoveryListeners.delete(listener);
+}
+function notifyStateRecovery(notice) {
+  for (const listener of stateRecoveryListeners) {
+    if (listener.stateFile !== notice.stateFile)
+      continue;
+    Promise.resolve().then(() => listener.report(notice)).catch((error) => {
+      try {
+        console.error(`[opencode-goal-plugin] Failed to report quarantined state at ${notice.quarantineFile}:`, error instanceof Error ? error.message : String(error));
+      } catch {}
+    });
+  }
+}
 function isStatePadding(character) {
   return character === "\x00" || character.trim() === "";
 }
@@ -232,24 +250,49 @@ function parseStateText(raw, file) {
     end -= 1;
   const content = raw.slice(start, end);
   if (content)
-    return JSON.parse(content);
+    return { value: JSON.parse(content), recoveryContent: null };
   if (!warnedEmptyStatePaths.has(file)) {
     warnedEmptyStatePaths.add(file);
     console.warn(`[opencode-goal-plugin] Empty or zero-filled state file at ${file}; recovering with empty state.`);
   }
-  return emptyState();
+  return { value: emptyState(), recoveryContent: raw || null };
 }
 function decodeState(value) {
   return Schema.decodeUnknown(StateSchema)(value).pipe(Effect.map(mutableState), Effect.map(normalizeState), Effect.mapError((cause) => new StateDecodeError({ cause })));
 }
-function readStateEffect(file = statePath()) {
+function readStateResultEffect(file = statePath()) {
   return Effect.tryPromise({
     try: () => readFile(file, "utf8"),
     catch: (cause) => new StateReadError({ cause })
   }).pipe(Effect.flatMap((raw) => Effect.try({
     try: () => parseStateText(raw, file),
     catch: (cause) => new StateDecodeError({ cause })
-  })), Effect.flatMap(decodeState), Effect.catchAll((error) => error._tag === "StateReadError" && isMissingStateFile(error.cause) ? Effect.succeed(emptyState()) : Effect.fail(error)));
+  })), Effect.flatMap(({ value, recoveryContent }) => decodeState(value).pipe(Effect.map((state) => ({ state, recoveryContent })))), Effect.catchAll((error) => error._tag === "StateReadError" && isMissingStateFile(error.cause) ? Effect.succeed({ state: emptyState(), recoveryContent: null }) : Effect.fail(error)));
+}
+function readStateEffect(file = statePath()) {
+  return readStateResultEffect(file).pipe(Effect.map(({ state }) => state));
+}
+function quarantineStateEffect(file, content) {
+  return Effect.tryPromise({
+    try: async () => {
+      const quarantineFile = `${file}.corrupt-${Date.now()}-${randomUUID2()}`;
+      await mkdir(dirname2(file), { recursive: true, mode: 448 });
+      await atomicWriteFile(quarantineFile, content);
+      notifyStateRecovery({ stateFile: file, quarantineFile });
+      return quarantineFile;
+    },
+    catch: (cause) => new StateWriteError({ cause })
+  });
+}
+function verifyRecoverySourceEffect(file, expectedContent) {
+  return Effect.tryPromise({
+    try: async () => {
+      if (await readFile(file, "utf8") !== expectedContent) {
+        throw new Error("goal state changed while recovery was being quarantined; refusing to overwrite it");
+      }
+    },
+    catch: (cause) => new StateWriteError({ cause })
+  });
 }
 function writeStateEffect(state, file = statePath()) {
   return Effect.tryPromise({
@@ -278,11 +321,15 @@ async function mutate(fn) {
   return enqueueMutation(() => {
     const file = statePath();
     return Effect.runPromise(Effect.gen(function* () {
-      const state = yield* readStateEffect(file);
+      const { state, recoveryContent } = yield* readStateResultEffect(file);
       const result = yield* Effect.tryPromise({
         try: () => Promise.resolve(fn(state)),
         catch: (cause) => cause instanceof Error ? cause : new Error(String(cause))
       });
+      if (recoveryContent != null) {
+        yield* quarantineStateEffect(file, recoveryContent);
+        yield* verifyRecoverySourceEffect(file, recoveryContent);
+      }
       yield* writeStateEffect(state, file);
       return result;
     }));
@@ -1932,6 +1979,16 @@ var server = async ({ client }, options) => {
   const planAgents = restrictedAgentSet(options);
   const isPlanAgent = (agent) => typeof agent === "string" && planAgents.has(agent.trim().toLowerCase());
   const goalServices = { options: options ?? {}, isPlanAgent };
+  const stopStateRecoveryReporting = onStateRecovery(statePath(), async ({ stateFile, quarantineFile }) => {
+    await client.app?.log?.({
+      body: {
+        service: "opencode-goal-plugin",
+        level: "error",
+        message: "Corrupt goal state quarantined before recovery",
+        extra: { stateFile, quarantineFile }
+      }
+    });
+  });
   let disposed = false;
   async function taskBlockStatus(sessionID) {
     if (!deferWhileTasksActive)
@@ -2180,6 +2237,7 @@ var server = async ({ client }, options) => {
   return {
     async dispose() {
       disposed = true;
+      stopStateRecoveryReporting();
       for (const scheduled of scheduledContinuations.values())
         clearTimeout(scheduled.timer);
       scheduledContinuations.clear();

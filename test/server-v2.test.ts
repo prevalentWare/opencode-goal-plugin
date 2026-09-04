@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, test } from "bun:test"
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import plugin from "../src/server"
@@ -289,6 +289,7 @@ test("V2 create_goal recovers from a zero-filled state file", async () => {
 
   expect(contentOf(created)).toContain('"objective": "recover V2 state"')
   expect((await getGoal("ses_v2"))?.objective).toBe("recover V2 state")
+  expect((await readdir(dir)).filter((name) => name.startsWith("goals.json.corrupt-"))).toHaveLength(1)
   mock.stream.end()
   await cleanup()
 })

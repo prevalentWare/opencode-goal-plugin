@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, setSystemTime, test } from "bun:test"
+import { afterEach, beforeEach, expect, setSystemTime, spyOn, test } from "bun:test"
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
@@ -699,6 +699,119 @@ test("per-prompt chat hook recovers from an empty state file", async () => {
   await hooks["chat.message"]!({ sessionID: "ses_1", agent: "build" } as never, { message: {} } as never)
 
   expect(JSON.parse(await readFile(process.env.OPENCODE_GOAL_STATE_PATH!, "utf8"))).toEqual({ version: 1, goals: {} })
+})
+
+test("zero-filled state recovery reports the quarantine through app logging", async () => {
+  const file = process.env.OPENCODE_GOAL_STATE_PATH!
+  await writeFile(file, "\0".repeat(28_454), "utf8")
+  const logs: unknown[] = []
+  const hooks = await setupServer(
+    {
+      client: {
+        app: { log: async (input: unknown) => logs.push(input) },
+        session: { promptAsync: async () => {} },
+      },
+    } as never,
+    { auto_continue: false },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+
+  await requireTool(tools.create_goal, "create_goal").execute(
+    { objective: "recover with evidence" },
+    { sessionID: "ses_1", agent: "build" } as never,
+  )
+
+  await waitFor(() => logs.length === 1)
+  expect(logs[0]).toMatchObject({
+    body: {
+      service: "opencode-goal-plugin",
+      level: "error",
+      message: "Corrupt goal state quarantined before recovery",
+      extra: { stateFile: file },
+    },
+  })
+  expect(JSON.stringify(logs[0])).toContain(`${file}.corrupt-`)
+})
+
+test("state recovery reporting is scoped to the configured state path", async () => {
+  const firstLogs: unknown[] = []
+  await setupServer(
+    { client: { app: { log: async (input: unknown) => firstLogs.push(input) } } } as never,
+    { auto_continue: false },
+  )
+  const secondFile = join(dir, "other-goals.json")
+  process.env.OPENCODE_GOAL_STATE_PATH = secondFile
+  await writeFile(secondFile, "\0\0", "utf8")
+  const secondLogs: unknown[] = []
+  const second = await setupServer(
+    { client: { app: { log: async (input: unknown) => secondLogs.push(input) } } } as never,
+    { auto_continue: false },
+  )
+  const tools = second.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+
+  await requireTool(tools.create_goal, "create_goal").execute(
+    { objective: "recover the second state" },
+    { sessionID: "ses_1", agent: "build" } as never,
+  )
+
+  await waitFor(() => secondLogs.length === 1)
+  expect(firstLogs).toEqual([])
+})
+
+test("disposing a server unregisters its state recovery reporter", async () => {
+  const staleLogs: unknown[] = []
+  const stale = await setupServer(
+    { client: { app: { log: async (input: unknown) => staleLogs.push(input) } } } as never,
+    { auto_continue: false },
+  )
+  await stale.dispose?.()
+  const activeLogs: unknown[] = []
+  const active = await setupServer(
+    { client: { app: { log: async (input: unknown) => activeLogs.push(input) } } } as never,
+    { auto_continue: false },
+  )
+  await writeFile(process.env.OPENCODE_GOAL_STATE_PATH!, "\0\0", "utf8")
+  const tools = active.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+
+  await requireTool(tools.create_goal, "create_goal").execute(
+    { objective: "recover after reload" },
+    { sessionID: "ses_1", agent: "build" } as never,
+  )
+
+  await waitFor(() => activeLogs.length === 1)
+  expect(staleLogs).toEqual([])
+})
+
+test("application logging failures do not block state recovery", async () => {
+  await writeFile(process.env.OPENCODE_GOAL_STATE_PATH!, "\0\0", "utf8")
+  const errors: string[] = []
+  const error = spyOn(console, "error").mockImplementation((...args) => errors.push(args.map(String).join(" ")))
+  const hooks = await setupServer(
+    {
+      client: {
+        app: { log: async () => Promise.reject(new Error("logger unavailable")) },
+      },
+    } as never,
+    { auto_continue: false },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+
+  try {
+    await requireTool(tools.create_goal, "create_goal").execute(
+      { objective: "recover without logger" },
+      { sessionID: "ses_1", agent: "build" } as never,
+    )
+    await waitFor(() => errors.length === 1)
+  } finally {
+    error.mockRestore()
+  }
+
+  expect((await getGoal("ses_1"))?.objective).toBe("recover without logger")
+  expect(errors[0]).toContain("Failed to report quarantined state")
 })
 
 test("message transform records assistant checkpoints", async () => {
