@@ -294,6 +294,8 @@ const warnedEmptyStatePaths = new Set<string>()
 export type StateRecoveryNotice = {
   stateFile: string
   quarantineFile: string
+  outcome: "quarantined" | "quarantineFailed" | "sourceChanged"
+  error?: string
 }
 type StateRecoveryListener = {
   stateFile: string
@@ -381,26 +383,35 @@ function readStateEffect(file = statePath()) {
 }
 
 function quarantineStateEffect(file: string, content: string) {
-  return Effect.tryPromise({
-    try: async () => {
-      const quarantineFile = `${file}.corrupt-${Date.now()}-${randomUUID()}`
+  return Effect.promise(async () => {
+    const quarantineFile = `${file}.corrupt-${Date.now()}-${randomUUID()}`
+    try {
       await mkdir(dirname(file), { recursive: true, mode: 0o700 })
       await atomicWriteFile(quarantineFile, content)
-      notifyStateRecovery({ stateFile: file, quarantineFile })
-      return quarantineFile
-    },
-    catch: (cause) => new StateWriteError({ cause }),
+      return { quarantineFile, error: null }
+    } catch (error) {
+      return { quarantineFile, error: error instanceof Error ? error.message : String(error) }
+    }
   })
 }
 
-function verifyRecoverySourceEffect(file: string, expectedContent: string) {
-  return Effect.tryPromise({
-    try: async () => {
-      if ((await readFile(file, "utf8")) !== expectedContent) {
-        throw new Error("goal state changed while recovery was being quarantined; refusing to overwrite it")
+function verifyRecoverySourceEffect(file: string, expectedContent: string, quarantineFile: string) {
+  return Effect.promise(async () => {
+    try {
+      return (await readFile(file, "utf8")) === expectedContent
+    } catch (error) {
+      if (!isMissingStateFile(error)) {
+        try {
+          console.error(
+            `[opencode-goal-plugin] Could not re-read ${file} after preserving it at ${quarantineFile}; continuing recovery:`,
+            error instanceof Error ? error.message : String(error),
+          )
+        } catch {
+          // Diagnostics must never block state recovery.
+        }
       }
-    },
-    catch: (cause) => new StateWriteError({ cause }),
+      return true
+    }
   })
 }
 
@@ -461,8 +472,48 @@ async function mutate<T>(fn: (state: State) => T | Promise<T>) {
           catch: (cause) => (cause instanceof Error ? cause : new Error(String(cause))),
         })
         if (recoveryContent != null) {
-          yield* quarantineStateEffect(file, recoveryContent)
-          yield* verifyRecoverySourceEffect(file, recoveryContent)
+          const quarantine = yield* quarantineStateEffect(file, recoveryContent)
+          if (quarantine.error != null) {
+            const notice: StateRecoveryNotice = {
+              stateFile: file,
+              quarantineFile: quarantine.quarantineFile,
+              outcome: "quarantineFailed",
+              error: quarantine.error,
+            }
+            try {
+              console.error(
+                `[opencode-goal-plugin] Could not quarantine corrupt state at ${file}; continuing recovery:`,
+                quarantine.error,
+              )
+            } catch {
+              // Diagnostics must never block state recovery.
+            }
+            notifyStateRecovery(notice)
+          } else {
+            const unchanged = yield* verifyRecoverySourceEffect(file, recoveryContent, quarantine.quarantineFile)
+            if (!unchanged) {
+              const message = "goal state changed while recovery was being quarantined; refusing to overwrite it"
+              notifyStateRecovery({
+                stateFile: file,
+                quarantineFile: quarantine.quarantineFile,
+                outcome: "sourceChanged",
+                error: message,
+              })
+              return yield* Effect.fail(new StateWriteError({ cause: new Error(message) }))
+            }
+            try {
+              console.warn(
+                `[opencode-goal-plugin] Preserved corrupt state from ${file} at ${quarantine.quarantineFile}; continuing recovery.`,
+              )
+            } catch {
+              // Diagnostics must never block state recovery.
+            }
+            notifyStateRecovery({
+              stateFile: file,
+              quarantineFile: quarantine.quarantineFile,
+              outcome: "quarantined",
+            })
+          }
         }
         yield* writeStateEffect(state, file)
         return result

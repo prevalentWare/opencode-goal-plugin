@@ -960,13 +960,18 @@ const server: Plugin = async ({ client }, options?: Options) => {
   const planAgents = restrictedAgentSet(options)
   const isPlanAgent = (agent: unknown) => typeof agent === "string" && planAgents.has(agent.trim().toLowerCase())
   const goalServices: GoalServices = { options: options ?? {}, isPlanAgent }
-  const stopStateRecoveryReporting = onStateRecovery(statePath(), async ({ stateFile, quarantineFile }) => {
+  const stopStateRecoveryReporting = onStateRecovery(statePath(), async ({ stateFile, quarantineFile, outcome, error }) => {
     await client.app?.log?.({
       body: {
         service: "opencode-goal-plugin",
         level: "error",
-        message: "Corrupt goal state quarantined before recovery",
-        extra: { stateFile, quarantineFile },
+        message:
+          outcome === "quarantined"
+            ? "Corrupt goal state quarantined before recovery"
+            : outcome === "sourceChanged"
+              ? "Goal state changed during recovery; refusing to overwrite it"
+              : "Corrupt goal state could not be quarantined; continuing recovery",
+        extra: { stateFile, quarantineFile, outcome, ...(error ? { error } : {}) },
       },
     })
   })

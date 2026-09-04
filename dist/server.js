@@ -273,25 +273,29 @@ function readStateEffect(file = statePath()) {
   return readStateResultEffect(file).pipe(Effect.map(({ state }) => state));
 }
 function quarantineStateEffect(file, content) {
-  return Effect.tryPromise({
-    try: async () => {
-      const quarantineFile = `${file}.corrupt-${Date.now()}-${randomUUID2()}`;
+  return Effect.promise(async () => {
+    const quarantineFile = `${file}.corrupt-${Date.now()}-${randomUUID2()}`;
+    try {
       await mkdir(dirname2(file), { recursive: true, mode: 448 });
       await atomicWriteFile(quarantineFile, content);
-      notifyStateRecovery({ stateFile: file, quarantineFile });
-      return quarantineFile;
-    },
-    catch: (cause) => new StateWriteError({ cause })
+      return { quarantineFile, error: null };
+    } catch (error) {
+      return { quarantineFile, error: error instanceof Error ? error.message : String(error) };
+    }
   });
 }
-function verifyRecoverySourceEffect(file, expectedContent) {
-  return Effect.tryPromise({
-    try: async () => {
-      if (await readFile(file, "utf8") !== expectedContent) {
-        throw new Error("goal state changed while recovery was being quarantined; refusing to overwrite it");
+function verifyRecoverySourceEffect(file, expectedContent, quarantineFile) {
+  return Effect.promise(async () => {
+    try {
+      return await readFile(file, "utf8") === expectedContent;
+    } catch (error) {
+      if (!isMissingStateFile(error)) {
+        try {
+          console.error(`[opencode-goal-plugin] Could not re-read ${file} after preserving it at ${quarantineFile}; continuing recovery:`, error instanceof Error ? error.message : String(error));
+        } catch {}
       }
-    },
-    catch: (cause) => new StateWriteError({ cause })
+      return true;
+    }
   });
 }
 function writeStateEffect(state, file = statePath()) {
@@ -327,8 +331,39 @@ async function mutate(fn) {
         catch: (cause) => cause instanceof Error ? cause : new Error(String(cause))
       });
       if (recoveryContent != null) {
-        yield* quarantineStateEffect(file, recoveryContent);
-        yield* verifyRecoverySourceEffect(file, recoveryContent);
+        const quarantine = yield* quarantineStateEffect(file, recoveryContent);
+        if (quarantine.error != null) {
+          const notice = {
+            stateFile: file,
+            quarantineFile: quarantine.quarantineFile,
+            outcome: "quarantineFailed",
+            error: quarantine.error
+          };
+          try {
+            console.error(`[opencode-goal-plugin] Could not quarantine corrupt state at ${file}; continuing recovery:`, quarantine.error);
+          } catch {}
+          notifyStateRecovery(notice);
+        } else {
+          const unchanged = yield* verifyRecoverySourceEffect(file, recoveryContent, quarantine.quarantineFile);
+          if (!unchanged) {
+            const message = "goal state changed while recovery was being quarantined; refusing to overwrite it";
+            notifyStateRecovery({
+              stateFile: file,
+              quarantineFile: quarantine.quarantineFile,
+              outcome: "sourceChanged",
+              error: message
+            });
+            return yield* Effect.fail(new StateWriteError({ cause: new Error(message) }));
+          }
+          try {
+            console.warn(`[opencode-goal-plugin] Preserved corrupt state from ${file} at ${quarantine.quarantineFile}; continuing recovery.`);
+          } catch {}
+          notifyStateRecovery({
+            stateFile: file,
+            quarantineFile: quarantine.quarantineFile,
+            outcome: "quarantined"
+          });
+        }
       }
       yield* writeStateEffect(state, file);
       return result;
@@ -1979,13 +2014,13 @@ var server = async ({ client }, options) => {
   const planAgents = restrictedAgentSet(options);
   const isPlanAgent = (agent) => typeof agent === "string" && planAgents.has(agent.trim().toLowerCase());
   const goalServices = { options: options ?? {}, isPlanAgent };
-  const stopStateRecoveryReporting = onStateRecovery(statePath(), async ({ stateFile, quarantineFile }) => {
+  const stopStateRecoveryReporting = onStateRecovery(statePath(), async ({ stateFile, quarantineFile, outcome, error }) => {
     await client.app?.log?.({
       body: {
         service: "opencode-goal-plugin",
         level: "error",
-        message: "Corrupt goal state quarantined before recovery",
-        extra: { stateFile, quarantineFile }
+        message: outcome === "quarantined" ? "Corrupt goal state quarantined before recovery" : outcome === "sourceChanged" ? "Goal state changed during recovery; refusing to overwrite it" : "Corrupt goal state could not be quarantined; continuing recovery",
+        extra: { stateFile, quarantineFile, outcome, ...error ? { error } : {} }
       }
     });
   });

@@ -552,6 +552,20 @@ test("quarantines a non-empty zero-filled state before replacing it", async () =
   expect(await readFile(join(dir, quarantines[0]!), "utf8")).toBe(damaged)
 })
 
+test("quarantines non-empty whitespace and BOM-only state before replacing it", async () => {
+  for (const [index, damaged] of [" \n\t", "\uFEFF"].entries()) {
+    const file = join(dir, `goals-${index}.json`)
+    process.env.OPENCODE_GOAL_STATE_PATH = file
+    await writeFile(file, damaged, "utf8")
+
+    await createGoal(`ses_${index}`, "recover padded state", null)
+
+    const quarantines = (await readdir(dir)).filter((name) => name.startsWith(`goals-${index}.json.corrupt-`))
+    expect(quarantines).toHaveLength(1)
+    expect(await readFile(join(dir, quarantines[0]!), "utf8")).toBe(damaged)
+  }
+})
+
 test("warns once for each empty state file path", async () => {
   const first = process.env.OPENCODE_GOAL_STATE_PATH!
   const second = join(dir, "other-goals.json")

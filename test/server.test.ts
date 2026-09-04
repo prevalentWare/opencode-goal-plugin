@@ -814,6 +814,40 @@ test("application logging failures do not block state recovery", async () => {
   expect(errors[0]).toContain("Failed to report quarantined state")
 })
 
+test("quarantine write failures are reported without blocking recovery", async () => {
+  const file = join(dir, "g".repeat(170))
+  process.env.OPENCODE_GOAL_STATE_PATH = file
+  await writeFile(file, "\0\0", "utf8")
+  const logs: unknown[] = []
+  const errors: string[] = []
+  const error = spyOn(console, "error").mockImplementation((...args) => errors.push(args.map(String).join(" ")))
+  const hooks = await setupServer(
+    { client: { app: { log: async (input: unknown) => logs.push(input) } } } as never,
+    { auto_continue: false },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+
+  try {
+    await requireTool(tools.create_goal, "create_goal").execute(
+      { objective: "recover after quarantine failure" },
+      { sessionID: "ses_1", agent: "build" } as never,
+    )
+    await waitFor(() => logs.length === 1)
+  } finally {
+    error.mockRestore()
+  }
+
+  expect((await getGoal("ses_1"))?.objective).toBe("recover after quarantine failure")
+  expect(logs[0]).toMatchObject({
+    body: {
+      message: "Corrupt goal state could not be quarantined; continuing recovery",
+      extra: { stateFile: file, outcome: "quarantineFailed" },
+    },
+  })
+  expect(errors.some((message) => message.includes("Could not quarantine corrupt state"))).toBe(true)
+})
+
 test("message transform records assistant checkpoints", async () => {
   const hooks = await setupServer(
     {
