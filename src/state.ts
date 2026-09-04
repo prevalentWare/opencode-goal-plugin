@@ -878,6 +878,9 @@ export async function setGoalStatus(sessionID: string, status: MutableGoalStatus
   return mutate((state) => {
     const goal = state.goals[sessionID]
     if (!goal) throw new Error("cannot update goal because this session has no goal")
+    if (isClosed(goal.status)) throw new Error("cannot update goal status because this goal is closed")
+    if (goal.status === status) return snapshot(goal)
+    if (status === "paused" && goal.status !== "active") return snapshot(goal)
     accountWallClock(goal)
     goal.status = status
     goal.updatedAt = nowSeconds()

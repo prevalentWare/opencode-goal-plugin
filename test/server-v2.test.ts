@@ -92,6 +92,7 @@ type MockContext = {
   stream: ReturnType<typeof controlledStream>
   disposals: string[]
   command: {
+    list: () => Promise<{ data: Array<{ name: string }> }>
     transform: (callback: (draft: MockCommandDraft) => void) => Promise<Registration>
   }
   tool: {
@@ -110,7 +111,7 @@ type MockContext = {
   }
 }
 
-function makeMockContext(options: Record<string, unknown> = {}): MockContext {
+function makeMockContext(options: Record<string, unknown> = {}, existingCommands: string[] = []): MockContext {
   const tools: MockContext["tools"] = []
   const commands: MockContext["commands"] = []
   const hooks: MockContext["hooks"] = {}
@@ -132,6 +133,7 @@ function makeMockContext(options: Record<string, unknown> = {}): MockContext {
     stream,
     disposals,
     command: {
+      list: async () => ({ data: existingCommands.map((name) => ({ name })) }),
       transform: async (callback) => {
         callback({ add: (command) => commands.push(command) })
         return registration("command.transform")
@@ -321,11 +323,14 @@ test("V2 create_goal reuses the same active objective without reinitializing sta
   await cleanup()
 })
 
-test("V2 setup registers the /goal command via command transform", async () => {
+test("V2 setup registers /goal, /pause_goal, and /resume_goal via command transform", async () => {
   const mock = makeMockContext({ auto_continue: false })
   const cleanup = await setupPlugin(mock as never)
 
   const command = mock.commands.find((candidate) => candidate.name === "goal")
+  const pause = mock.commands.find((candidate) => candidate.name === "pause_goal")
+  const resume = mock.commands.find((candidate) => candidate.name === "resume_goal")
+  expect(mock.commands.map((candidate) => candidate.name).sort()).toEqual(["goal", "pause_goal", "resume_goal"])
   expect(command).toBeDefined()
   expect(command?.description).toBe("Set or view the long-running session goal")
 
@@ -356,6 +361,97 @@ test("V2 setup registers the /goal command via command transform", async () => {
   await command?.execute({ sessionID: "ses_empty", prompt: { text: "" }, delivery: "steer" })
   expect(mock.promptCalls[1]).toMatchObject({ sessionID: "ses_empty", delivery: "steer" })
   expect(mock.promptCalls[1]?.text).toContain("If the arguments are empty, call get_goal")
+
+  await pause?.execute({
+    sessionID: "ses_pause",
+    prompt: { text: "ignored text", agents: [{ name: "build", mention: { start: 0, end: 7, text: "ignored" } }] },
+    delivery: "steer",
+  })
+  expect(mock.promptCalls[2]).toMatchObject({
+    sessionID: "ses_pause",
+    delivery: "steer",
+  })
+  expect(mock.promptCalls[2]?.agents).toBeUndefined()
+  expect(mock.promptCalls[2]?.text).toContain('command "/pause_goal" was invoked')
+  expect(mock.promptCalls[2]?.text).toContain('update_goal_status with status "paused"')
+  expect(mock.promptCalls[2]?.text).not.toContain("ignored text")
+
+  await resume?.execute({ sessionID: "ses_resume", prompt: { text: "ignored" }, delivery: "queue" })
+  expect(mock.promptCalls[3]).toMatchObject({ sessionID: "ses_resume", delivery: "queue" })
+  expect(mock.promptCalls[3]?.text).toContain('command "/resume_goal" was invoked')
+  expect(mock.promptCalls[3]?.text).toContain('update_goal_status with status "active"')
+  expect(mock.promptCalls[3]?.text).toContain("Plan mode")
+  expect(mock.promptCalls[3]?.text).not.toContain("ignored")
+
+  mock.stream.end()
+  await cleanup()
+})
+
+test("V2 setup preserves existing commands and configured command-name collisions", async () => {
+  const mock = makeMockContext({ auto_continue: false, command_name: "pause_goal" }, ["resume_goal"])
+  const cleanup = await setupPlugin(mock as never)
+
+  expect(mock.commands.map((command) => command.name)).toEqual(["goal", "pause_goal"])
+  expect(mock.commands[0]?.description).toBe("Set or view the long-running session goal")
+  expect(mock.commands[1]?.description).toBe("Pause the current long-running session goal")
+
+  mock.stream.end()
+  await cleanup()
+})
+
+test("V2 command transform remains stable when the registry replays it", async () => {
+  const mock = makeMockContext({ auto_continue: false })
+  let transform: ((draft: MockCommandDraft) => void) | undefined
+  mock.command.transform = async (callback) => {
+    transform = callback
+    callback({ add: (command) => mock.commands.push(command) })
+    return {
+      dispose: async () => {
+        mock.disposals.push("command.transform")
+      },
+    }
+  }
+  const cleanup = await setupPlugin(mock as never)
+  expect(mock.commands.map((command) => command.name).sort()).toEqual(["goal", "pause_goal", "resume_goal"])
+
+  mock.commands.length = 0
+  transform?.({ add: (command) => mock.commands.push(command) })
+
+  expect(mock.commands.map((command) => command.name).sort()).toEqual(["goal", "pause_goal", "resume_goal"])
+  mock.stream.end()
+  await cleanup()
+})
+
+test("V2 pause_goal persists the pause before prompting and ignores attachments", async () => {
+  const mock = makeMockContext({ auto_continue: false })
+  const cleanup = await setupPlugin(mock as never)
+  await createGoalViaV2Tool(mock, "wait for remote guidance")
+  let statusAtPrompt: string | undefined
+  mock.session.prompt = async (input) => {
+    statusAtPrompt = (await getGoal(input.sessionID))?.status
+    mock.promptCalls.push(input)
+    return { id: "pending_pause" }
+  }
+  const pause = mock.commands.find((command) => command.name === "pause_goal")
+
+  await pause?.execute({
+    sessionID: "ses_v2",
+    prompt: {
+      text: "replace the goal",
+      files: [{ uri: "file:///tmp/untrusted.txt" }],
+      agents: [{ name: "plan" }],
+      skills: [{ id: "untrusted" }],
+    },
+    delivery: "steer",
+  })
+
+  expect(statusAtPrompt).toBe("paused")
+  expect(await getGoal("ses_v2")).toMatchObject({ status: "paused", objective: "wait for remote guidance" })
+  expect(mock.promptCalls[0]).toMatchObject({ sessionID: "ses_v2", delivery: "steer" })
+  expect(mock.promptCalls[0]?.files).toBeUndefined()
+  expect(mock.promptCalls[0]?.agents).toBeUndefined()
+  expect(mock.promptCalls[0]?.skills).toBeUndefined()
+  expect(mock.promptCalls[0]?.text).not.toContain("replace the goal")
 
   mock.stream.end()
   await cleanup()

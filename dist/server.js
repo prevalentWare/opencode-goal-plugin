@@ -691,6 +691,12 @@ async function setGoalStatus(sessionID, status, agent) {
     const goal = state.goals[sessionID];
     if (!goal)
       throw new Error("cannot update goal because this session has no goal");
+    if (isClosed(goal.status))
+      throw new Error("cannot update goal status because this goal is closed");
+    if (goal.status === status)
+      return snapshot(goal);
+    if (status === "paused" && goal.status !== "active")
+      return snapshot(goal);
     accountWallClock(goal);
     goal.status = status;
     goal.updatedAt = nowSeconds();
@@ -1285,9 +1291,58 @@ Use the goal tools to handle this command:
 
 Create a goal only from these explicit command arguments. Do not infer a goal from unrelated session context. After create_goal succeeds or returns an existing matching goal, never call it again for this command; continue working from the returned goal state.`;
 }
+function goalStatusCommandTemplate(commandName) {
+  if (commandName === "pause_goal") {
+    return `OpenCode goal mode command "/pause_goal" was invoked.
+
+Ignore any command arguments. Call get_goal first, then handle only this pause request:
+
+- If there is no goal, briefly report that no goal is set.
+- If the goal is active, call update_goal_status with status "paused" and briefly report the result.
+- If the goal is already paused, budgetLimited, or usageLimited, do not mutate it; briefly report that it is already stopped.
+- If the goal is complete or unmet, do not mutate it; briefly report that it is closed.
+
+Do not create, resume, or continue a goal. Do not edit, clear, complete, or mark a goal unmet.`;
+  }
+  return `OpenCode goal mode command "/resume_goal" was invoked.
+
+Ignore any command arguments. Call get_goal first, then handle only this resume request:
+
+- If there is no goal, briefly report that no goal is set.
+- If the goal is complete or unmet, do not mutate it; you must not reopen it.
+- If the goal is already active, do not mutate it; continue working toward its existing objective.
+- If the goal is paused, budgetLimited, or usageLimited, call update_goal_status with status "active", then continue working toward its existing objective.
+- If Plan mode or another restricted agent prevents resuming, report that the user must switch to Build mode instead of retrying.
+
+Do not create, edit, clear, complete, or mark a goal unmet.`;
+}
+function goalCommandDefinitions(commandName) {
+  return [
+    {
+      name: commandName,
+      description: "Set or view the long-running session goal",
+      template: goalCommandTemplate(commandName),
+      action: "goal"
+    },
+    {
+      name: "pause_goal",
+      description: "Pause the current long-running session goal",
+      template: goalStatusCommandTemplate("pause_goal"),
+      action: "pause"
+    },
+    {
+      name: "resume_goal",
+      description: "Resume the current long-running session goal",
+      template: goalStatusCommandTemplate("resume_goal"),
+      action: "resume"
+    }
+  ];
+}
 function commandNameFromOptions(options) {
   const name = options?.command_name?.trim() || DEFAULT_COMMAND_NAME;
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name))
+    return DEFAULT_COMMAND_NAME;
+  if (name.toLowerCase() === "pause_goal" || name.toLowerCase() === "resume_goal")
     return DEFAULT_COMMAND_NAME;
   return name;
 }
@@ -1302,14 +1357,25 @@ function timeoutMillisecondsFromSeconds(value) {
     return null;
   return Math.min(Math.ceil(value * 1000), MAX_TIMER_DELAY_MS);
 }
-function registerDesktopCommand(config, commandName) {
+function registerDesktopCommands(config, commandName) {
   config.command ??= {};
-  if (config.command[commandName])
-    return;
-  config.command[commandName] = {
-    description: "Set or view the long-running session goal",
-    template: goalCommandTemplate(commandName)
-  };
+  const commands = goalCommandDefinitions(commandName);
+  for (const command of commands) {
+    if (config.command[command.name])
+      continue;
+    config.command[command.name] = {
+      description: command.description,
+      template: command.template
+    };
+  }
+}
+function sanitizeGoalStatusCommandParts(output, template) {
+  const text = output.parts.find((part) => part.type === "text" && part.text?.startsWith(template));
+  if (!text)
+    return false;
+  text.text = template;
+  output.parts.splice(0, output.parts.length, text);
+  return true;
 }
 function textFromPart(part) {
   if (!part || typeof part !== "object")
@@ -2287,7 +2353,7 @@ var server = async ({ client }, options) => {
     async config(config) {
       if (!registerCommand)
         return;
-      registerDesktopCommand(config, commandName);
+      registerDesktopCommands(config, commandName);
     },
     tool: {
       get_goal: {
@@ -2382,6 +2448,20 @@ var server = async ({ client }, options) => {
         const goal = await getGoalInternal(sessionID);
         toolAttempts.set(toolAttemptKey(sessionID, callID), goal?.pendingAttempt?.id ?? null);
       }
+    },
+    async "command.execute.before"(input, output) {
+      if (input.command !== "pause_goal" && input.command !== "resume_goal")
+        return;
+      const template = goalStatusCommandTemplate(input.command);
+      if (!sanitizeGoalStatusCommandParts(output, template))
+        return;
+      if (input.command !== "pause_goal")
+        return;
+      cancelScheduledContinuation(input.sessionID);
+      clearTurnWatchdog(input.sessionID);
+      const goal = await getGoal(input.sessionID);
+      if (goal?.status === "active")
+        await setGoalStatus(input.sessionID, "paused");
     },
     async "tool.execute.after"(input, output) {
       taskTracker.noteTaskOutput(input, output);
@@ -3070,23 +3150,39 @@ async function setupV2(context) {
     }
   }
   if (registerCommand) {
+    const existingCommands = new Set((await context.command.list()).data.map((command) => command.name));
     registrations.push(await context.command.transform((draft) => {
-      draft.add({
-        name: commandName,
-        description: "Set or view the long-running session goal",
-        execute: async (input) => {
-          const stripMention = ({ mention: _mention, ...attachment }) => attachment;
-          await context.session.prompt({
-            ...input.prompt,
-            files: input.prompt.files?.map(stripMention),
-            agents: input.prompt.agents?.map(stripMention),
-            skills: input.prompt.skills?.map(stripMention),
-            sessionID: input.sessionID,
-            text: goalCommandTemplate(commandName).replaceAll("$ARGUMENTS", () => input.prompt.text.trim()),
-            delivery: input.delivery
-          });
-        }
-      });
+      const claimedCommands = new Set(existingCommands);
+      for (const command of goalCommandDefinitions(commandName)) {
+        if (claimedCommands.has(command.name))
+          continue;
+        claimedCommands.add(command.name);
+        draft.add({
+          name: command.name,
+          description: command.description,
+          execute: async (input) => {
+            if (command.action === "pause") {
+              cancelScheduledContinuation(input.sessionID);
+              clearTurnWatchdog(input.sessionID);
+              const goal = await getGoal(input.sessionID);
+              if (goal?.status === "active")
+                await setGoalStatus(input.sessionID, "paused");
+            }
+            const stripMention = ({ mention: _mention, ...attachment }) => attachment;
+            await context.session.prompt({
+              ...command.action === "goal" ? {
+                ...input.prompt,
+                files: input.prompt.files?.map(stripMention),
+                agents: input.prompt.agents?.map(stripMention),
+                skills: input.prompt.skills?.map(stripMention)
+              } : {},
+              sessionID: input.sessionID,
+              text: command.template.replaceAll("$ARGUMENTS", () => input.prompt.text.trim()),
+              delivery: input.delivery
+            });
+          }
+        });
+      }
     }));
   }
   registrations.push(await context.tool.transform((draft) => {

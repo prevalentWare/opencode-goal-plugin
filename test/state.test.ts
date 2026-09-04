@@ -55,6 +55,36 @@ test("creates, reads, pauses, resumes, completes, and clears a goal", async () =
   expect(await getGoal("ses_1")).toBeNull()
 })
 
+test("status transitions are idempotent and cannot reopen closed goals", async () => {
+  await createGoal("ses_1", "ship safely", null)
+  const active = await getGoal("ses_1")
+  await setGoalStatus("ses_1", "active")
+  expect((await getGoal("ses_1"))?.history).toEqual(active?.history)
+
+  await setGoalStatus("ses_1", "paused")
+  const paused = await getGoal("ses_1")
+  await setGoalStatus("ses_1", "paused")
+  expect((await getGoal("ses_1"))?.history).toEqual(paused?.history)
+
+  await completeGoal("ses_1", "verified")
+  await expect(setGoalStatus("ses_1", "active")).rejects.toThrow("goal is closed")
+  expect((await getGoal("ses_1"))?.status).toBe("complete")
+})
+
+test("pausing an already limited goal preserves its safety status", async () => {
+  await createGoal("ses_limited", "stay bounded", 1)
+  await accountUsage("ses_limited", 2)
+  const limited = await getGoal("ses_limited")
+
+  await setGoalStatus("ses_limited", "paused")
+
+  expect(await getGoal("ses_limited")).toMatchObject({
+    status: "budgetLimited",
+    lastStatus: limited?.lastStatus,
+    history: limited?.history,
+  })
+})
+
 test("a mutation writes back to the state path it read", async () => {
   const firstPath = process.env.OPENCODE_GOAL_STATE_PATH!
   const secondPath = join(dir, "other-goals.json")

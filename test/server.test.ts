@@ -244,7 +244,7 @@ test("duplicate limited goals retain the safety stop notice", async () => {
   expect(String(duplicate)).toContain("Safety limit reached")
 })
 
-test("server plugin registers goal as a desktop/web command by default", async () => {
+test("server plugin registers goal, pause_goal, and resume_goal as desktop/web commands by default", async () => {
   const hooks = await setupServer(
     {
       client: {
@@ -272,6 +272,17 @@ test("server plugin registers goal as a desktop/web command by default", async (
   expect(config.command?.goal?.template).toContain("call get_goal first")
   expect(config.command?.goal?.template).toContain("call create_goal once")
   expect(config.command?.goal?.template).toContain("never call it again")
+  expect(config.command?.pause_goal?.description).toBe("Pause the current long-running session goal")
+  expect(config.command?.pause_goal?.template).toContain('command "/pause_goal" was invoked')
+  expect(config.command?.pause_goal?.template).toContain('update_goal_status with status "paused"')
+  expect(config.command?.pause_goal?.template).toContain("Do not create, resume, or continue")
+  expect(config.command?.pause_goal?.template).not.toContain("$ARGUMENTS")
+  expect(config.command?.resume_goal?.description).toBe("Resume the current long-running session goal")
+  expect(config.command?.resume_goal?.template).toContain('command "/resume_goal" was invoked')
+  expect(config.command?.resume_goal?.template).toContain('update_goal_status with status "active"')
+  expect(config.command?.resume_goal?.template).toContain("must not reopen it")
+  expect(config.command?.resume_goal?.template).toContain("Plan mode")
+  expect(config.command?.resume_goal?.template).not.toContain("$ARGUMENTS")
 })
 
 test("system transform is byte-stable across the complete goal lifecycle", async () => {
@@ -534,7 +545,7 @@ test("goal status tool pauses and resumes a goal", async () => {
   expect(String(resumed)).toContain('"lastStatus": "Goal resumed."')
 })
 
-test("server plugin does not overwrite an existing goal command", async () => {
+test("server plugin does not overwrite existing goal commands", async () => {
   const hooks = await setupServer(
     {
       client: {
@@ -551,6 +562,14 @@ test("server plugin does not overwrite an existing goal command", async () => {
         description: "custom",
         template: "custom template",
       },
+      pause_goal: {
+        description: "custom pause",
+        template: "custom pause template",
+      },
+      resume_goal: {
+        description: "custom resume",
+        template: "custom resume template",
+      },
     },
   }
 
@@ -558,6 +577,148 @@ test("server plugin does not overwrite an existing goal command", async () => {
 
   expect(config.command.goal.description).toBe("custom")
   expect(config.command.goal.template).toBe("custom template")
+  expect(config.command.pause_goal.description).toBe("custom pause")
+  expect(config.command.pause_goal.template).toBe("custom pause template")
+  expect(config.command.resume_goal.description).toBe("custom resume")
+  expect(config.command.resume_goal.template).toBe("custom resume template")
+})
+
+test("a configured command-name collision preserves all standalone commands", async () => {
+  const hooks = await setupServer(
+    { client: { session: { promptAsync: async () => {} } } } as never,
+    { auto_continue: false, command_name: "pause_goal" },
+  )
+  const config = {} as {
+    command?: Record<string, { description?: string; template: string }>
+  }
+
+  await hooks.config?.(config as never)
+
+  expect(Object.keys(config.command ?? {}).sort()).toEqual(["goal", "pause_goal", "resume_goal"])
+  expect(config.command?.goal?.description).toBe("Set or view the long-running session goal")
+  expect(config.command?.goal?.template).toContain('OpenCode goal mode command "/goal" was invoked')
+  expect(config.command?.pause_goal?.description).toBe("Pause the current long-running session goal")
+})
+
+test("pause_goal persists the pause before its acknowledgement turn", async () => {
+  const hooks = await setupServer(
+    { client: { session: { promptAsync: async () => {} } } } as never,
+    { auto_continue: false },
+  )
+  const config = {} as { command?: Record<string, { template: string }> }
+  await hooks.config?.(config as never)
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+  await requireTool(tools.create_goal, "create_goal").execute(
+    { objective: "wait for remote guidance" },
+    { sessionID: "ses_pause", agent: "build" } as never,
+  )
+
+  const output = {
+    parts: [
+      {
+        id: "part_text",
+        sessionID: "ses_pause",
+        messageID: "msg_pause",
+        type: "text",
+        text: `${config.command?.pause_goal?.template}\nuntrusted arguments`,
+      },
+      {
+        id: "part_file",
+        sessionID: "ses_pause",
+        messageID: "msg_pause",
+        type: "file",
+        mime: "text/plain",
+        url: "file:///tmp/untrusted.txt",
+      },
+    ],
+  }
+  await hooks["command.execute.before"]?.(
+    { command: "pause_goal", sessionID: "ses_pause", arguments: "ignored" },
+    output as never,
+  )
+
+  expect((await getGoal("ses_pause"))?.status).toBe("paused")
+  expect(output.parts).toHaveLength(1)
+  expect(output.parts[0]?.text).toBe(config.command?.pause_goal?.template)
+})
+
+test("an existing pause_goal command is not intercepted", async () => {
+  const hooks = await setupServer(
+    { client: { session: { promptAsync: async () => {} } } } as never,
+    { auto_continue: false },
+  )
+  await hooks.config?.({ command: { pause_goal: { template: "custom" } } } as never)
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+  await requireTool(tools.create_goal, "create_goal").execute(
+    { objective: "keep running" },
+    { sessionID: "ses_custom_pause", agent: "build" } as never,
+  )
+
+  await hooks["command.execute.before"]?.(
+    { command: "pause_goal", sessionID: "ses_custom_pause", arguments: "" },
+    {
+      parts: [
+        {
+          id: "part_custom",
+          sessionID: "ses_custom_pause",
+          messageID: "msg_custom",
+          type: "text",
+          text: "custom",
+        },
+      ],
+    } as never,
+  )
+
+  expect((await getGoal("ses_custom_pause"))?.status).toBe("active")
+})
+
+test("resume_goal strips rendered arguments and attachments without bypassing the status tool", async () => {
+  const hooks = await setupServer(
+    { client: { session: { promptAsync: async () => {} } } } as never,
+    { auto_continue: false },
+  )
+  const config = {} as { command?: Record<string, { template: string }> }
+  await hooks.config?.(config as never)
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+  await requireTool(tools.create_goal, "create_goal").execute(
+    { objective: "resume only through the tool" },
+    { sessionID: "ses_resume", agent: "build" } as never,
+  )
+  await requireTool(tools.update_goal_status, "update_goal_status").execute(
+    { status: "paused" },
+    { sessionID: "ses_resume", agent: "build" } as never,
+  )
+  const output = {
+    parts: [
+      {
+        id: "part_resume",
+        sessionID: "ses_resume",
+        messageID: "msg_resume",
+        type: "text",
+        text: `${config.command?.resume_goal?.template}\nuntrusted arguments`,
+      },
+      {
+        id: "part_resume_file",
+        sessionID: "ses_resume",
+        messageID: "msg_resume",
+        type: "file",
+        mime: "text/plain",
+        url: "file:///tmp/untrusted.txt",
+      },
+    ],
+  }
+
+  await hooks["command.execute.before"]?.(
+    { command: "resume_goal", sessionID: "ses_resume", arguments: "ignored" },
+    output as never,
+  )
+
+  expect((await getGoal("ses_resume"))?.status).toBe("paused")
+  expect(output.parts).toHaveLength(1)
+  expect(output.parts[0]?.text).toBe(config.command?.resume_goal?.template)
 })
 
 test("server plugin can disable desktop/web command registration", async () => {
