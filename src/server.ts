@@ -165,11 +165,12 @@ function goalStatusCommandTemplate(commandName: "pause_goal" | "resume_goal") {
   if (commandName === "pause_goal") {
     return `OpenCode goal mode command "/pause_goal" was invoked.
 
-Ignore any command arguments. Call get_goal first, then handle only this pause request:
+The command handler pauses an active goal before this acknowledgement turn when possible. Ignore any command arguments, call get_goal first, then handle only this pause request:
 
 - If there is no goal, briefly report that no goal is set.
-- If the goal is active, call update_goal_status with status "paused" and briefly report the result.
-- If the goal is already paused, budgetLimited, or usageLimited, do not mutate it; briefly report that it is already stopped.
+- If the goal is paused, do not mutate it again; briefly confirm "Goal paused."
+- If the goal is still active, call update_goal_status with status "paused" and briefly report the result.
+- If the goal is budgetLimited or usageLimited, do not mutate it; briefly report that it remains stopped by its safety limit.
 - If the goal is complete or unmet, do not mutate it; briefly report that it is closed.
 
 Do not create, resume, or continue a goal. Do not edit, clear, complete, or mark a goal unmet.`
@@ -1465,10 +1466,10 @@ const server: Plugin = async ({ client }, options?: Options) => {
       const template = goalStatusCommandTemplate(input.command)
       if (!sanitizeGoalStatusCommandParts(output, template)) return
       if (input.command !== "pause_goal") return
-      cancelScheduledContinuation(input.sessionID)
-      clearTurnWatchdog(input.sessionID)
       const goal = await getGoal(input.sessionID)
       if (goal?.status === "active") await setGoalStatus(input.sessionID, "paused")
+      cancelScheduledContinuation(input.sessionID)
+      clearTurnWatchdog(input.sessionID)
     },
     async "tool.execute.after"(input, output) {
       taskTracker.noteTaskOutput(
@@ -2210,10 +2211,10 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
             description: command.description,
             execute: async (input) => {
               if (command.action === "pause") {
-                cancelScheduledContinuation(input.sessionID)
-                clearTurnWatchdog(input.sessionID)
                 const goal = await getGoal(input.sessionID)
                 if (goal?.status === "active") await setGoalStatus(input.sessionID, "paused")
+                cancelScheduledContinuation(input.sessionID)
+                clearTurnWatchdog(input.sessionID)
               }
               const stripMention = <T extends { mention?: unknown }>({ mention: _mention, ...attachment }: T) => attachment
               await context.session.prompt({
