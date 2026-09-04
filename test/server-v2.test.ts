@@ -399,6 +399,57 @@ test("V2 setup preserves existing commands and configured command-name collision
   await cleanup()
 })
 
+test("V2 prompt hook pauses compatibility commands before admission", async () => {
+  const mock = makeMockContext({ auto_continue: false }, ["goal", "pause_goal", "resume_goal"])
+  const cleanup = await setupPlugin(mock as never)
+  await createGoalViaV2Tool(mock, "pause before acknowledgement")
+  const v1 = await plugin.server({ client: { session: { promptAsync: async () => {} } } } as never, {
+    auto_continue: false,
+  })
+  const config = {} as { command?: Record<string, { template: string }> }
+  await v1.config?.(config as never)
+  const pauseTemplate = config.command?.pause_goal?.template
+  const resumeTemplate = config.command?.resume_goal?.template
+  if (!pauseTemplate) throw new Error("expected pause_goal compatibility command")
+  if (!resumeTemplate) throw new Error("expected resume_goal compatibility command")
+  await v1.dispose?.()
+  const input = {
+    sessionID: "ses_v2",
+    messageID: "msg_pause",
+    prompt: {
+      text: `${pauseTemplate}\nuntrusted arguments`,
+      files: [{ uri: "file:///tmp/untrusted.txt" }],
+      agents: [{ name: "plan" }],
+      skills: [{ id: "untrusted" }],
+    },
+    delivery: "steer",
+  }
+
+  await mock.hooks.prompt?.(input)
+
+  expect(await getGoal("ses_v2")).toMatchObject({ status: "paused", objective: "pause before acknowledgement" })
+  expect(input.prompt.text).toBe(pauseTemplate)
+  expect(input.prompt.files).toBeUndefined()
+  expect(input.prompt.agents).toBeUndefined()
+  expect(input.prompt.skills).toBeUndefined()
+
+  const resumeInput = {
+    sessionID: "ses_v2",
+    messageID: "msg_resume",
+    prompt: {
+      text: `${resumeTemplate}\nuntrusted arguments`,
+      files: [{ uri: "file:///tmp/untrusted.txt" }],
+    },
+    delivery: "steer",
+  }
+  await mock.hooks.prompt?.(resumeInput)
+  expect((await getGoal("ses_v2"))?.status).toBe("paused")
+  expect(resumeInput.prompt.text).toBe(resumeTemplate)
+  expect(resumeInput.prompt.files).toBeUndefined()
+  mock.stream.end()
+  await cleanup()
+})
+
 test("V2 command transform remains stable when the registry replays it", async () => {
   const mock = makeMockContext({ auto_continue: false })
   let transform: ((draft: MockCommandDraft) => void) | undefined
@@ -463,6 +514,7 @@ test("V2 setup skips command registration when register_command is false", async
 
   expect(mock.commands).toHaveLength(0)
   expect(mock.disposals).not.toContain("command.transform")
+  expect(mock.hooks.prompt).toBeUndefined()
 
   mock.stream.end()
   await cleanup()
@@ -757,7 +809,14 @@ test("V2 cleanup disposes registrations and stops the event consumer", async () 
   await cleanup()
 
   expect(mock.disposals).toEqual(
-    expect.arrayContaining(["command.transform", "tool.transform", "tool.hook:execute.before", "tool.hook:execute.after", "session.hook:context"]),
+    expect.arrayContaining([
+      "command.transform",
+      "session.hook:prompt",
+      "tool.transform",
+      "tool.hook:execute.before",
+      "tool.hook:execute.after",
+      "session.hook:context",
+    ]),
   )
   // Events pushed after cleanup must not throw or mutate state.
   mock.stream.push({

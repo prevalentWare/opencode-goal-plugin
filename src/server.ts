@@ -2235,6 +2235,30 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
         }
       }),
     )
+
+    // V1-compatible config commands bypass V2 command executors, so enforce
+    // their lifecycle action again at the shared prompt-admission boundary.
+    registrations.push(
+      await context.session.hook("prompt", async (input) => {
+        const pauseTemplate = goalStatusCommandTemplate("pause_goal")
+        const resumeTemplate = goalStatusCommandTemplate("resume_goal")
+        const template = input.prompt.text.startsWith(pauseTemplate)
+          ? pauseTemplate
+          : input.prompt.text.startsWith(resumeTemplate)
+            ? resumeTemplate
+            : null
+        if (!template) return
+        input.prompt.text = template
+        delete input.prompt.files
+        delete input.prompt.agents
+        delete input.prompt.skills
+        if (template !== pauseTemplate) return
+        const goal = await getGoal(input.sessionID)
+        if (goal?.status === "active") await setGoalStatus(input.sessionID, "paused")
+        cancelScheduledContinuation(input.sessionID)
+        clearTurnWatchdog(input.sessionID)
+      }),
+    )
   }
 
   registrations.push(
