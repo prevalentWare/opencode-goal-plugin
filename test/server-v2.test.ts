@@ -184,6 +184,13 @@ function goalTool(mock: MockContext, name: string) {
   return tool
 }
 
+function v2TextSchema(mock: MockContext, toolName: string, field: string) {
+  const input = goalTool(mock, toolName).input as {
+    properties?: Record<string, { maxLength?: number; pattern?: string }>
+  }
+  return input.properties?.[field]
+}
+
 function contentOf(result: unknown) {
   const value = result as { content?: string }
   return typeof value.content === "string" ? value.content : String(result)
@@ -356,6 +363,8 @@ test("V2 setup registers /goal, /pause_goal, and /resume_goal via command transf
   expect(mock.promptCalls[0]?.text).toContain("ship $& and $ARGUMENTS")
   expect(mock.promptCalls[0]?.text).toContain("call get_goal first")
   expect(mock.promptCalls[0]?.text).toContain("never call it again")
+  expect(mock.promptCalls[0]?.text).toContain("faithful representation")
+  expect(mock.promptCalls[0]?.text).toContain("do NOT compress, truncate")
   expect(mock.promptCalls[0]?.text.match(/\$ARGUMENTS/g)).toHaveLength(1)
 
   await command?.execute({ sessionID: "ses_empty", prompt: { text: "" }, delivery: "steer" })
@@ -506,6 +515,61 @@ test("V2 pause_goal persists the pause before prompting and ignores attachments"
 
   mock.stream.end()
   await cleanup()
+})
+
+test("max_objective_chars is advertised and enforced per V2 instance", async () => {
+  const wide = makeMockContext({ auto_continue: false, max_objective_chars: 100 })
+  const narrow = makeMockContext({ auto_continue: false, max_objective_chars: 10 })
+  const defaulted = makeMockContext({ auto_continue: false })
+  const wideCleanup = await setupPlugin(wide as never)
+  const narrowCleanup = await setupPlugin(narrow as never)
+  const defaultCleanup = await setupPlugin(defaulted as never)
+
+  expect(v2TextSchema(wide, "create_goal", "objective")).toMatchObject({ maxLength: 100, pattern: "\\S" })
+  expect(v2TextSchema(narrow, "create_goal", "objective")).toMatchObject({ maxLength: 10, pattern: "\\S" })
+  expect(v2TextSchema(defaulted, "create_goal", "objective")).toMatchObject({ maxLength: 100_000, pattern: "\\S" })
+  expect(v2TextSchema(wide, "set_goal", "objective")).toMatchObject({ maxLength: 100, pattern: "\\S" })
+  expect(v2TextSchema(wide, "update_goal_objective", "objective")).toMatchObject({ maxLength: 100, pattern: "\\S" })
+  expect(v2TextSchema(wide, "update_goal", "evidence")).toMatchObject({ maxLength: 100, pattern: "\\S" })
+  expect(v2TextSchema(wide, "update_goal", "blocker")).toMatchObject({ maxLength: 100, pattern: "\\S" })
+
+  const created = await goalTool(wide, "create_goal").execute(
+    { objective: "x".repeat(11) },
+    toolContext("ses_wide"),
+  )
+  expect(contentOf(created)).toContain('"status": "active"')
+  await expect(
+    goalTool(narrow, "create_goal").execute({ objective: "x".repeat(11) }, toolContext("ses_narrow")),
+  ).rejects.toThrow("at most 10 characters")
+  await expect(
+    goalTool(narrow, "create_goal").execute({ objective: " xxxxxxxxxx " }, toolContext("ses_spaced")),
+  ).rejects.toThrow("at most 10 characters")
+
+  const emoji = await goalTool(wide, "create_goal").execute({ objective: "😀" }, toolContext("ses_emoji"))
+  expect(contentOf(emoji)).toContain('"objective": "😀"')
+  const trimmed = await goalTool(wide, "create_goal").execute({ objective: "  y  " }, toolContext("ses_trim"))
+  expect(contentOf(trimmed)).toContain('"objective": "y"')
+  await expect(
+    goalTool(defaulted, "create_goal").execute({ objective: "x".repeat(100_001) }, toolContext("ses_default")),
+  ).rejects.toThrow("at most 100000 characters")
+
+  await goalTool(wide, "create_goal").execute({ objective: "close me" }, toolContext("ses_close"))
+  await expect(
+    goalTool(wide, "update_goal").execute(
+      { status: "complete", evidence: "x".repeat(101) },
+      toolContext("ses_close"),
+    ),
+  ).rejects.toThrow("at most 100 characters")
+  await expect(
+    goalTool(wide, "update_goal").execute({ status: "unmet", blocker: "x".repeat(101) }, toolContext("ses_close")),
+  ).rejects.toThrow("at most 100 characters")
+
+  wide.stream.end()
+  narrow.stream.end()
+  defaulted.stream.end()
+  await wideCleanup()
+  await narrowCleanup()
+  await defaultCleanup()
 })
 
 test("V2 setup skips command registration when register_command is false", async () => {

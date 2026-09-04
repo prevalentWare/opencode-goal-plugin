@@ -2,6 +2,7 @@ import { afterEach, beforeEach, expect, setSystemTime, spyOn, test } from "bun:t
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
+import { z } from "zod"
 import plugin from "../src/server"
 import {
   accountUsage,
@@ -14,6 +15,27 @@ import {
 function requireTool<T>(tool: T | undefined, name: string): T {
   if (!tool) throw new Error(`expected ${name} to be registered`)
   return tool
+}
+
+type ToolArgs = {
+  args: Record<string, z.ZodType | undefined>
+  execute: (args: unknown, context: unknown) => Promise<unknown>
+}
+
+function toolArgs(tool: { args?: unknown } | undefined, name: string): ToolArgs {
+  const resolved = requireTool(tool, name) as ToolArgs
+  if (!resolved.args) throw new Error(`expected ${name} to expose args`)
+  return resolved
+}
+
+function argSchema(args: ToolArgs["args"], key: string) {
+  const schema = args[key]
+  if (!schema) throw new Error(`expected args.${key}`)
+  return schema
+}
+
+function advertisedText(schema: z.ZodType) {
+  return z.toJSONSchema(schema) as { maxLength?: number; pattern?: string }
 }
 
 async function waitFor(predicate: () => boolean) {
@@ -186,9 +208,68 @@ test("create_goal reuses the same active objective without mutating state", asyn
   await expect(
     requireTool(tools.create_goal, "create_goal").execute({ objective: "   " }, context),
   ).rejects.toThrow("must not be empty")
+})
+
+test("max_objective_chars is advertised and enforced per V1 instance", async () => {
+  const client = { client: { session: { promptAsync: async () => {} } } } as never
+  const wide = await setupServer(client, { auto_continue: false, max_objective_chars: 100 })
+  const narrow = await setupServer(client, { auto_continue: false, max_objective_chars: 10 })
+  const defaulted = await setupServer(client, { auto_continue: false })
+  const wideCreate = toolArgs(wide.tool?.create_goal, "create_goal")
+  const narrowCreate = toolArgs(narrow.tool?.create_goal, "create_goal")
+  const defaultCreate = toolArgs(defaulted.tool?.create_goal, "create_goal")
+  const wideUpdate = toolArgs(wide.tool?.update_goal, "update_goal")
+  const wideSet = toolArgs(wide.tool?.set_goal, "set_goal")
+  const wideEdit = toolArgs(wide.tool?.update_goal_objective, "update_goal_objective")
+
+  const wideObjective = argSchema(wideCreate.args, "objective")
+  const narrowObjective = argSchema(narrowCreate.args, "objective")
+  expect(advertisedText(wideObjective)).toMatchObject({ maxLength: 100, pattern: "\\S" })
+  expect(advertisedText(narrowObjective)).toMatchObject({ maxLength: 10, pattern: "\\S" })
+  expect(advertisedText(argSchema(defaultCreate.args, "objective"))).toMatchObject({
+    maxLength: 100_000,
+    pattern: "\\S",
+  })
+  expect(advertisedText(argSchema(wideSet.args, "objective"))).toMatchObject({ maxLength: 100, pattern: "\\S" })
+  expect(advertisedText(argSchema(wideEdit.args, "objective"))).toMatchObject({ maxLength: 100, pattern: "\\S" })
+  expect(advertisedText(argSchema(wideUpdate.args, "evidence"))).toMatchObject({ maxLength: 100, pattern: "\\S" })
+  expect(advertisedText(argSchema(wideUpdate.args, "blocker"))).toMatchObject({ maxLength: 100, pattern: "\\S" })
+
+  expect(wideObjective.safeParse("😀").success).toBe(true)
+  expect(wideObjective.safeParse(" a ").success).toBe(true)
+  expect(wideObjective.safeParse("   ").success).toBe(false)
+  expect(wideObjective.safeParse("x".repeat(101)).success).toBe(false)
+  expect(narrowObjective.safeParse("x".repeat(11)).success).toBe(false)
+  expect(narrowObjective.safeParse(" xxxxxxxxxx ").success).toBe(false)
+
+  const wideContext = { sessionID: "ses_wide" } as never
+  const narrowContext = { sessionID: "ses_narrow" } as never
+  await expect(wideCreate.execute({ objective: "x".repeat(11) }, wideContext)).resolves.toContain('"status": "active"')
+  await expect(narrowCreate.execute({ objective: "x".repeat(11) }, narrowContext)).rejects.toThrow(
+    "at most 10 characters",
+  )
+  await expect(wideCreate.execute({ objective: "😀".repeat(100) }, { sessionID: "ses_emoji" } as never)).resolves.toContain(
+    '"status": "active"',
+  )
+  await expect(wideCreate.execute({ objective: "  y  " }, { sessionID: "ses_trim" } as never)).resolves.toContain(
+    '"objective": "y"',
+  )
   await expect(
-    requireTool(tools.create_goal, "create_goal").execute({ objective: "x".repeat(4_001) }, context),
-  ).rejects.toThrow("at most 4000 characters")
+    defaultCreate.execute({ objective: "x".repeat(100_001) }, { sessionID: "ses_default" } as never),
+  ).rejects.toThrow("at most 100000 characters")
+
+  await wideCreate.execute({ objective: "close me" }, { sessionID: "ses_close" } as never)
+  await expect(
+    wideUpdate.execute({ status: "complete", evidence: "x".repeat(101) }, { sessionID: "ses_close" } as never),
+  ).rejects.toThrow("at most 100 characters")
+  await expect(
+    wideUpdate.execute({ status: "unmet", blocker: "x".repeat(101) }, { sessionID: "ses_close" } as never),
+  ).rejects.toThrow("at most 100 characters")
+  const closed = await wideUpdate.execute(
+    { status: "complete", evidence: "x".repeat(100) },
+    { sessionID: "ses_close" } as never,
+  )
+  expect(String(closed)).toContain('"completion_report"')
 })
 
 test("create_goal starts a fresh goal when the matching prior goal is closed", async () => {
@@ -272,6 +353,8 @@ test("server plugin registers goal, pause_goal, and resume_goal as desktop/web c
   expect(config.command?.goal?.template).toContain("call get_goal first")
   expect(config.command?.goal?.template).toContain("call create_goal once")
   expect(config.command?.goal?.template).toContain("never call it again")
+  expect(config.command?.goal?.template).toContain("faithful representation")
+  expect(config.command?.goal?.template).toContain("do NOT compress, truncate")
   expect(config.command?.pause_goal?.description).toBe("Pause the current long-running session goal")
   expect(config.command?.pause_goal?.template).toContain('command "/pause_goal" was invoked')
   expect(config.command?.pause_goal?.template).toContain('update_goal_status with status "paused"')

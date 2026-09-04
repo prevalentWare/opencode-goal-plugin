@@ -128,7 +128,8 @@ In OpenCode 1, server options use the package-and-options tuple in `opencode.jso
         "no_progress_token_threshold": 50,
         "max_no_progress_turns": 2,
         "restricted_agents": ["plan"],
-        "allow_goal_execution_from_plan": false
+        "allow_goal_execution_from_plan": false,
+        "max_objective_chars": 100000
       }
     ]
   ]
@@ -169,6 +170,10 @@ Defaults:
 - `command_name`: `"goal"`; renames the main goal command only. The reserved names `pause_goal` and `resume_goal` fall back to `goal` so the standalone controls remain available.
 - `restricted_agents`: `["plan"]`; agents (matched case-insensitively) treated as planning-only for goal execution.
 - `allow_goal_execution_from_plan`: `false`; when `true`, disables Plan-mode goal restrictions entirely.
+- `max_objective_chars`: `100000`; maximum Unicode code-point length of the submitted goal objective, completion evidence,
+  and blocker text. The previous 4000-character cap was a defect, not a compatibility constraint. The same limit is
+  advertised on V1 and V2 tool schemas and enforced at runtime, independently per plugin instance. Accepted values are
+  trimmed before persistence. Large objectives are echoed into continuation and compaction prompts.
 
 ## Goal Workflow
 

@@ -40,6 +40,7 @@ export type CreateGoalOptions = {
   maxNoProgressTurns?: number | null
   agent?: string | null
   initialStatus?: MutableGoalStatus
+  maxObjectiveChars?: number | null
 }
 
 export type AssistantProgressInput = {
@@ -522,18 +523,25 @@ async function mutate<T>(fn: (state: State) => T | Promise<T>) {
   })
 }
 
-export function validateObjective(objective: string) {
-  const value = objective.trim()
-  if (!value) throw new Error("goal objective must not be empty")
-  if ([...value].length > 4000) throw new Error("goal objective must be at most 4000 characters")
-  return value
+export const DEFAULT_MAX_OBJECTIVE_CHARS = 100_000
+
+export function resolveMaxObjectiveChars(value: number | null | undefined) {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : DEFAULT_MAX_OBJECTIVE_CHARS
 }
 
-export function validateEvidence(evidence: string | null | undefined, label: string) {
-  const value = evidence?.trim()
-  if (!value) throw new Error(`${label} must not be empty`)
-  if ([...value].length > 4000) throw new Error(`${label} must be at most 4000 characters`)
-  return value
+function boundedText(value: string, limit: number, label: string) {
+  if ([...value].length > limit) throw new Error(`${label} must be at most ${limit} characters`)
+  const trimmed = value.trim()
+  if (!trimmed) throw new Error(`${label} must not be empty`)
+  return trimmed
+}
+
+export function validateObjective(objective: string, limit = DEFAULT_MAX_OBJECTIVE_CHARS) {
+  return boundedText(objective, limit, "goal objective")
+}
+
+export function validateEvidence(evidence: string | null | undefined, label: string, limit = DEFAULT_MAX_OBJECTIVE_CHARS) {
+  return boundedText(evidence ?? "", limit, label)
 }
 
 function normalizeState(state: State): State {
@@ -621,6 +629,7 @@ function normalizeCreateOptions(input?: number | null | CreateGoalOptions): Requ
       maxNoProgressTurns: DEFAULT_MAX_NO_PROGRESS_TURNS,
       agent: null,
       initialStatus: "active",
+      maxObjectiveChars: DEFAULT_MAX_OBJECTIVE_CHARS,
     }
   }
   return {
@@ -631,6 +640,7 @@ function normalizeCreateOptions(input?: number | null | CreateGoalOptions): Requ
     maxNoProgressTurns: positiveIntegerOrNull(input?.maxNoProgressTurns) ?? DEFAULT_MAX_NO_PROGRESS_TURNS,
     agent: typeof input?.agent === "string" && input.agent.trim() ? input.agent.trim() : null,
     initialStatus: input?.initialStatus === "paused" ? "paused" : "active",
+    maxObjectiveChars: resolveMaxObjectiveChars(input?.maxObjectiveChars),
   }
 }
 
@@ -753,8 +763,8 @@ export function getGoalSync(sessionID: string) {
 }
 
 export async function createGoal(sessionID: string, objective: string, options?: number | null | CreateGoalOptions) {
-  const value = validateObjective(objective)
   const normalizedOptions = normalizeCreateOptions(options)
+  const value = validateObjective(objective, resolveMaxObjectiveChars(normalizedOptions.maxObjectiveChars))
   return mutate((state) => {
     const existing = state.goals[sessionID]
     if (existing && !isClosed(existing.status)) {
@@ -809,9 +819,9 @@ export async function updateGoalObjective(
   sessionID: string,
   objective: string,
   status: MutableGoalStatus = "active",
-  options?: { agent?: string | null; planModePause?: boolean },
+  options?: { agent?: string | null; planModePause?: boolean; maxObjectiveChars?: number },
 ) {
-  const value = validateObjective(objective)
+  const value = validateObjective(objective, resolveMaxObjectiveChars(options?.maxObjectiveChars))
   const agent = typeof options?.agent === "string" && options.agent.trim() ? options.agent.trim() : null
   const planModePause = options?.planModePause === true
   return mutate((state) => {
@@ -909,7 +919,9 @@ export async function closeGoal(
         status: "unmet"
         blocker: string
       },
+  maxObjectiveChars = DEFAULT_MAX_OBJECTIVE_CHARS,
 ) {
+  const limit = resolveMaxObjectiveChars(maxObjectiveChars)
   return mutate((state) => {
     const goal = state.goals[sessionID]
     if (!goal) throw new Error("cannot update goal because this session has no goal")
@@ -921,12 +933,12 @@ export async function closeGoal(
     goal.lastAccountedAt = null
     goal.stopReason = input.status === "complete" ? null : "blocked"
     if (input.status === "complete") {
-      goal.completionEvidence = validateEvidence(input.evidence, "completion evidence")
+      goal.completionEvidence = validateEvidence(input.evidence, "completion evidence", limit)
       goal.blocker = null
       goal.lastStatus = "Goal completed."
       pushHistory(goal, "completed", goal.completionEvidence)
     } else {
-      goal.blocker = validateEvidence(input.blocker, "blocker")
+      goal.blocker = validateEvidence(input.blocker, "blocker", limit)
       goal.completionEvidence = null
       goal.lastStatus = "Goal marked unmet."
       pushHistory(goal, "unmet", goal.blocker)
@@ -935,12 +947,12 @@ export async function closeGoal(
   })
 }
 
-export async function completeGoal(sessionID: string, evidence: string) {
-  return closeGoal(sessionID, { status: "complete", evidence })
+export async function completeGoal(sessionID: string, evidence: string, maxObjectiveChars = DEFAULT_MAX_OBJECTIVE_CHARS) {
+  return closeGoal(sessionID, { status: "complete", evidence }, maxObjectiveChars)
 }
 
-export async function markGoalUnmet(sessionID: string, blocker: string) {
-  return closeGoal(sessionID, { status: "unmet", blocker })
+export async function markGoalUnmet(sessionID: string, blocker: string, maxObjectiveChars = DEFAULT_MAX_OBJECTIVE_CHARS) {
+  return closeGoal(sessionID, { status: "unmet", blocker }, maxObjectiveChars)
 }
 
 export async function clearGoal(sessionID: string) {
