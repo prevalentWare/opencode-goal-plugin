@@ -995,6 +995,7 @@ type V2EventLike = {
   type: string
   created: number
   data: Record<string, unknown>
+  location?: { directory?: string; workspaceID?: string }
 }
 
 function decodeV2Event(value: unknown): V2EventLike | undefined {
@@ -1728,6 +1729,10 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
   const planAgents = restrictedAgentSet(options)
   const isPlanAgent = (agent: unknown) => typeof agent === "string" && planAgents.has(agent.trim().toLowerCase())
   const activeContinuationsV2 = new Set<string>()
+  // Interruptions and terminal failures are not successful idle boundaries.
+  // Keep legacy idle notifications and queued recovery from restarting them;
+  // only a new execution started by the host may lift this local suppression.
+  const stoppedExecutions = new Set<string>()
   const latestStepBySession = new Map<string, V2StepRecord>()
   const stepTextBuffers = new Map<string, string>()
   const stepTokenSums = new Map<string, number>()
@@ -1871,6 +1876,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
 
   async function runAutoContinue(sessionID: string, fromTaskDeferral = false, scheduled?: ScheduledContinuation) {
     if (disposed) return
+    if (stoppedExecutions.has(sessionID)) return
     if (busySessions.has(sessionID)) return
     if (activeContinuationsV2.has(sessionID)) return
     activeContinuationsV2.add(sessionID)
@@ -1952,7 +1958,20 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       if (nativeRetrySessions.has(sessionID)) return
 
       const goal = await reserveContinuation(sessionID, maxAutoTurns, minInterval)
-      if (!goal) return
+      if (!goal) {
+        // A fast execution can settle before the minimum interval expires.
+        // There may be no further idle event, so retain a timed wake-up rather
+        // than dropping the only continuation signal.
+        const waiting = await getGoalInternal(sessionID)
+        if (waiting?.status === "active" && waiting.pendingAttempt == null && waiting.lastContinuationAt != null && minInterval > 0) {
+          scheduleSettledContinuation(
+            sessionID,
+            continuationDelayFromSnapshot(minInterval, waiting.lastContinuationAt),
+            scheduled != null,
+          )
+        }
+        return
+      }
       attemptReservedAt = goal.pendingAttempt?.reservedAt ?? Date.now()
       if (nativeRetrySessions.has(sessionID)) {
         await rollbackContinuationAttempt(sessionID)
@@ -2012,6 +2031,27 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
   async function handleV2Event(event: V2EventLike) {
     const data = event.data
     const sessionID = typeof data.sessionID === "string" ? data.sessionID : undefined
+    // subscribe() is server-wide. Every loaded location has a plugin instance;
+    // only the owner may account usage or send a goal prompt for this event.
+    // Still observe foreign child lifecycles for cross-location Task deferral.
+    if (
+      context.location && event.location &&
+      (event.location.directory !== context.location.directory || event.location.workspaceID !== context.location.workspaceID)
+    ) {
+      if (event.type === "session.created" && sessionID && typeof data.parentID === "string") {
+        taskTracker.observeSessionCreated({ properties: { info: { id: sessionID, parentID: data.parentID } } })
+      } else if (sessionID) {
+        if (event.type === "session.execution.started") taskTracker.observeSessionStatus(sessionID, "busy")
+        if (["session.execution.succeeded", "session.execution.failed", "session.execution.interrupted", "session.idle"].includes(event.type)) {
+          taskTracker.observeSessionStatus(sessionID, "idle")
+        }
+        if (event.type === "session.status" && isRecord(data.status) && typeof data.status.type === "string") {
+          taskTracker.observeSessionStatus(sessionID, data.status.type)
+        }
+        if (event.type === "session.deleted") taskTracker.observeSessionDeleted(sessionID)
+      }
+      return
+    }
     switch (event.type) {
       case "session.created": {
         const parentID = data.parentID
@@ -2020,10 +2060,15 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
         }
         return
       }
+      case "session.execution.started":
+      case "session.retry.scheduled":
       case "session.status": {
-        const status = data.status
+        const status = event.type === "session.execution.started"
+          ? { type: "busy" }
+          : event.type === "session.retry.scheduled" ? { type: "retry" } : data.status
         if (sessionID && isRecord(status) && typeof status.type === "string") {
           if (status.type === "busy") {
+            stoppedExecutions.delete(sessionID)
             busySessions.add(sessionID)
             nativeRetrySessions.delete(sessionID)
             armTurnWatchdog(sessionID)
@@ -2051,6 +2096,10 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
         }
         return
       }
+      // Current V2 runners publish execution settlement, not the legacy idle
+      // notifications. A successful execution is the continuation boundary;
+      // individual step completions may still be followed by tool/model work.
+      case "session.execution.succeeded":
       case "session.idle": {
         if (sessionID) {
           busySessions.delete(sessionID)
@@ -2067,8 +2116,24 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
         }
         return
       }
+      case "session.execution.interrupted": {
+        if (!sessionID) return
+        stoppedExecutions.add(sessionID)
+        busySessions.delete(sessionID)
+        nativeRetrySessions.delete(sessionID)
+        clearTurnWatchdog(sessionID)
+        watchdogRescuedSessions.delete(sessionID)
+        cancelScheduledContinuation(sessionID)
+        taskDeferredSessions.delete(sessionID)
+        taskTracker.observeSessionStatus(sessionID, "idle")
+        return
+      }
+      case "session.execution.failed":
       case "session.error": {
         if (!sessionID) return
+        // execution.failed is emitted only after the host's retry episode has
+        // ended. Unlike a legacy session.error inside a retry, it can recover.
+        if (event.type === "session.execution.failed") nativeRetrySessions.delete(sessionID)
         const inNativeRetry = nativeRetrySessions.has(sessionID)
         busySessions.delete(sessionID)
         clearTurnWatchdog(sessionID)
@@ -2079,6 +2144,12 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
         nativeRetrySessions.delete(sessionID)
         watchdogRescuedSessions.delete(sessionID)
         const errorMessage = transportErrorMessageFromEvent(data)
+        if (event.type === "session.execution.failed" && !isTransportError(errorMessage)) {
+          stoppedExecutions.add(sessionID)
+          cancelScheduledContinuation(sessionID)
+          taskDeferredSessions.delete(sessionID)
+        }
+        if (event.type === "session.execution.failed") taskTracker.observeSessionStatus(sessionID, "idle")
         if (errorMessage && isTransportError(errorMessage)) {
           const goal = await getGoalInternal(sessionID)
           if (goal?.status === "active") {
@@ -2113,6 +2184,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       }
       case "session.deleted": {
         if (!sessionID) return
+        stoppedExecutions.delete(sessionID)
         busySessions.delete(sessionID)
         clearTurnWatchdog(sessionID)
         watchdogRescuedSessions.delete(sessionID)
@@ -2396,6 +2468,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
     for (const watchdog of turnWatchdogs.values()) clearTimeout(watchdog.timer)
     turnWatchdogs.clear()
     activeContinuationsV2.clear()
+    stoppedExecutions.clear()
     nativeRetrySessions.clear()
     locallyDeliveredPendingSessions.clear()
     watchdogRescuedSessions.clear()
