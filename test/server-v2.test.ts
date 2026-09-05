@@ -638,6 +638,47 @@ test("V2 running child session stops blocking after the task block ceiling", asy
   await cleanup()
 }, 20_000)
 
+// A V2 task-block poll touches nothing on the mock context (taskBlockStatus is entirely
+// in-memory), so "no prompt was sent" cannot distinguish a stopped loop from a running
+// one - a cleared goal is refused later in runAutoContinue either way. Count the re-arm
+// timers themselves instead: that is the resource the fix is about.
+test("V2 task deferral stops re-arming when the goal is cleared while a child still blocks", async () => {
+  const mock = makeMockContext({ min_continue_interval_seconds: 0 })
+  const realSetTimeout = globalThis.setTimeout
+  let taskBlockRearms = 0
+  const countingSetTimeout = (handler: (...handlerArgs: never[]) => void, timeout?: number, ...rest: unknown[]) => {
+    if (timeout === 1_000) taskBlockRearms += 1
+    return realSetTimeout(handler as never, timeout as never, ...(rest as never[]))
+  }
+  globalThis.setTimeout = countingSetTimeout as unknown as typeof globalThis.setTimeout
+  try {
+    const cleanup = await setupPlugin(mock as never)
+    await createGoalViaV2Tool(mock, "wait for delegated work")
+
+    mock.stream.push({ type: "session.created", created: 100, data: { sessionID: "child", parentID: "ses_v2" } })
+    mock.stream.push({ type: "session.idle", created: 101, data: { sessionID: "ses_v2" } })
+
+    // The deferral is armed and re-arming once per second while the child blocks.
+    await waitFor(() => taskBlockRearms >= 2, 10_000)
+    expect(mock.promptCalls).toHaveLength(0)
+
+    await goalTool(mock, "clear_goal").execute({}, toolContext())
+    expect(await getGoalInternal("ses_v2")).toBeNull()
+
+    // Let any in-flight re-arm land, then confirm the loop has genuinely stopped.
+    await new Promise((resolve) => realSetTimeout(resolve, 1_500))
+    const rearmsAfterClear = taskBlockRearms
+    await new Promise((resolve) => realSetTimeout(resolve, 3_000))
+    expect(taskBlockRearms).toBe(rearmsAfterClear)
+    expect(mock.promptCalls).toHaveLength(0)
+
+    mock.stream.end()
+    await cleanup()
+  } finally {
+    globalThis.setTimeout = realSetTimeout
+  }
+}, 30_000)
+
 test("V2 idle auto-continue is suppressed for plan-agent goals", async () => {
   const mock = makeMockContext({ auto_continue: true, min_continue_interval_seconds: 0, max_auto_turns: 5 })
   const cleanup = await setupPlugin(mock as never)

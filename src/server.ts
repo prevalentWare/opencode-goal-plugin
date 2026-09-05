@@ -669,14 +669,29 @@ class TaskTracker {
     ) {
       return
     }
+    // refreshLiveChildren re-marks a listed idle child on every poll. Once the record is
+    // terminal-unreconciled the guard above no longer returns, so a naive rewrite would
+    // restart `terminalAt` each time and `taskBlockExpired` would never see the record
+    // age out - the ceiling would never fire for the very case it exists to bound. Carry
+    // the original timestamp, and with it the assistant marker captured when the child
+    // first went terminal, so both the ceiling and reconciliation measure from that
+    // moment. A genuine state change (or an explicit resetReconciled) starts a new clock.
+    const continuesExistingTerminal =
+      existing != null &&
+      TASK_TERMINAL_STATES.has(existing.state) &&
+      existing.state === state &&
+      existing.terminalUnreconciled &&
+      !options.resetReconciled
     this.tasks.set(taskID, {
       taskID,
       parentSessionID: resolvedParentSessionID,
       state,
       terminalUnreconciled: true,
       runningSince: null,
-      terminalAt: Date.now(),
-      lastAssistantMessageIDAtTerminal: this.latestAssistantBySession.get(resolvedParentSessionID)?.id ?? null,
+      terminalAt: continuesExistingTerminal ? existing.terminalAt ?? Date.now() : Date.now(),
+      lastAssistantMessageIDAtTerminal: continuesExistingTerminal
+        ? existing.lastAssistantMessageIDAtTerminal
+        : this.latestAssistantBySession.get(resolvedParentSessionID)?.id ?? null,
     })
   }
 
@@ -828,6 +843,16 @@ async function createGoalFromTool(input: CreateGoalArgs, context: ToolExecContex
 
 function isClosedGoal(goal: GoalSnapshot) {
   return goal.status === "complete" || goal.status === "unmet"
+}
+
+// A task-block deferral re-arms a poll that records nothing on the goal, so it must not
+// outlive the goal it exists to continue. `budgetLimited` / `usageLimited` still receive a
+// wrap-up continuation (see reserveContinuation), so only a missing, closed, or paused goal
+// stops the poll.
+function taskDeferralGoalContinuable(goal: GoalSnapshot | null | undefined) {
+  if (!goal) return false
+  if (isClosedGoal(goal)) return false
+  return goal.status !== "paused"
 }
 
 function existingGoalResult(goal: GoalSnapshot, requestedObjective: string, planningOnly: boolean) {
@@ -1116,6 +1141,16 @@ const server: Plugin = async ({ client }, options?: Options) => {
       taskTracker.observeAssistantMessage(sessionID, latestAssistant)
       const taskStatus = await taskBlockStatus(sessionID)
       if (taskStatus && taskStatus.blocked) {
+        // Validate the goal before re-arming. The re-arm below runs at TASK_BLOCK_RETRY_MS
+        // and writes nothing to the goal, so a goal completed, cleared, or paused while a
+        // child still blocks would otherwise keep a 1 Hz poll alive until the ceiling - and
+        // forever when max_task_block_seconds is 0.
+        const deferralGoal = await getGoalInternal(sessionID)
+        if (!taskDeferralGoalContinuable(deferralGoal)) {
+          taskDeferredSessions.delete(sessionID)
+          cancelScheduledContinuation(sessionID)
+          return
+        }
         taskDeferredSessions.add(sessionID)
         // Always re-arm. A task block is the only deferral that records nothing on the
         // goal, so without a scheduled retry a child that never reports a terminal state
@@ -1751,6 +1786,16 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       }
       const taskStatus = taskBlockStatus(sessionID)
       if (taskStatus && taskStatus.blocked) {
+        // Validate the goal before re-arming. The re-arm below runs at TASK_BLOCK_RETRY_MS
+        // and writes nothing to the goal, so a goal completed, cleared, or paused while a
+        // child still blocks would otherwise keep a 1 Hz poll alive until the ceiling - and
+        // forever when max_task_block_seconds is 0.
+        const deferralGoal = await getGoalInternal(sessionID)
+        if (!taskDeferralGoalContinuable(deferralGoal)) {
+          taskDeferredSessions.delete(sessionID)
+          cancelScheduledContinuation(sessionID)
+          return
+        }
         taskDeferredSessions.add(sessionID)
         // Always re-arm. A task block is the only deferral that records nothing on the
         // goal, so without a scheduled retry a child that never reports a terminal state

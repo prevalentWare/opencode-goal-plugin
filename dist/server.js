@@ -1701,14 +1701,15 @@ class TaskTracker {
     if (existing && TASK_TERMINAL_STATES.has(existing.state) && !existing.terminalUnreconciled && !options.resetReconciled) {
       return;
     }
+    const continuesExistingTerminal = existing != null && TASK_TERMINAL_STATES.has(existing.state) && existing.state === state && existing.terminalUnreconciled && !options.resetReconciled;
     this.tasks.set(taskID, {
       taskID,
       parentSessionID: resolvedParentSessionID,
       state,
       terminalUnreconciled: true,
       runningSince: null,
-      terminalAt: Date.now(),
-      lastAssistantMessageIDAtTerminal: this.latestAssistantBySession.get(resolvedParentSessionID)?.id ?? null
+      terminalAt: continuesExistingTerminal ? existing.terminalAt ?? Date.now() : Date.now(),
+      lastAssistantMessageIDAtTerminal: continuesExistingTerminal ? existing.lastAssistantMessageIDAtTerminal : this.latestAssistantBySession.get(resolvedParentSessionID)?.id ?? null
     });
   }
   markSnapshotIdle(parentSessionID, taskID) {
@@ -1844,6 +1845,13 @@ async function createGoalFromTool(input, context, services) {
 }
 function isClosedGoal(goal) {
   return goal.status === "complete" || goal.status === "unmet";
+}
+function taskDeferralGoalContinuable(goal) {
+  if (!goal)
+    return false;
+  if (isClosedGoal(goal))
+    return false;
+  return goal.status !== "paused";
 }
 function existingGoalResult(goal, requestedObjective, planningOnly) {
   const reused = goal.objective === requestedObjective;
@@ -2076,6 +2084,12 @@ var server = async ({ client }, options) => {
       taskTracker.observeAssistantMessage(sessionID, latestAssistant);
       const taskStatus = await taskBlockStatus(sessionID);
       if (taskStatus && taskStatus.blocked) {
+        const deferralGoal = await getGoalInternal(sessionID);
+        if (!taskDeferralGoalContinuable(deferralGoal)) {
+          taskDeferredSessions.delete(sessionID);
+          cancelScheduledContinuation(sessionID);
+          return;
+        }
         taskDeferredSessions.add(sessionID);
         scheduleSettledContinuation(sessionID, taskStatus.retryAt != null ? taskStatus.retryAt - Date.now() : TASK_BLOCK_RETRY_MS, scheduled != null);
         return;
@@ -2637,6 +2651,12 @@ async function setupV2(context) {
       }
       const taskStatus = taskBlockStatus(sessionID);
       if (taskStatus && taskStatus.blocked) {
+        const deferralGoal = await getGoalInternal(sessionID);
+        if (!taskDeferralGoalContinuable(deferralGoal)) {
+          taskDeferredSessions.delete(sessionID);
+          cancelScheduledContinuation(sessionID);
+          return;
+        }
         taskDeferredSessions.add(sessionID);
         scheduleSettledContinuation(sessionID, taskStatus.retryAt != null ? taskStatus.retryAt - Date.now() : TASK_BLOCK_RETRY_MS, scheduled != null);
         return;

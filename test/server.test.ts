@@ -1583,6 +1583,125 @@ test("live child that never reaches a terminal state stops blocking after the ta
   expect(JSON.stringify(calls[0])).toContain("Continue working toward the active session goal")
 }, 20_000)
 
+test("listed idle child whose result is never reconciled stops blocking after the task block ceiling", async () => {
+  const calls: unknown[] = []
+  let childStatus: "busy" | "idle" = "busy"
+  const hooks = await setupServer(
+    {
+      client: {
+        session: {
+          children: async () => ({ data: [{ id: "task_1" }] }),
+          status: async () => ({ data: { task_1: { type: childStatus } } }),
+          promptAsync: async (input: unknown) => {
+            calls.push(input)
+          },
+        },
+      },
+    } as never,
+    {
+      auto_continue: true,
+      max_auto_turns: 1,
+      min_continue_interval_seconds: 0,
+      max_task_block_seconds: 0.2,
+    },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+
+  await requireTool(tools.create_goal, "create_goal").execute(
+    { objective: "keep going" },
+    { sessionID: "ses_unreconciled" } as never,
+  )
+  await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_unreconciled" } } as never })
+  expect(calls).toHaveLength(0)
+
+  // The child now reports idle, so it is tracked as terminal-unreconciled: it stays
+  // listed in children(), and no orchestrator turn ever reconciles its result. Every
+  // poll re-marks the same terminal state, so the ceiling can only fire if the original
+  // terminal timestamp is preserved across those repeat marks.
+  childStatus = "idle"
+
+  await waitForLong(() => calls.length === 1, 10_000)
+  expect(JSON.stringify(calls[0])).toContain("Continue working toward the active session goal")
+}, 20_000)
+
+test("task deferral stops polling when the goal is cleared while a child still blocks", async () => {
+  const calls: unknown[] = []
+  let childPolls = 0
+  const hooks = await setupServer(
+    {
+      client: {
+        session: {
+          children: async () => {
+            childPolls += 1
+            return { data: [{ id: "task_1" }] }
+          },
+          status: async () => ({ data: { task_1: { type: "busy" } } }),
+          promptAsync: async (input: unknown) => {
+            calls.push(input)
+          },
+        },
+      },
+    } as never,
+    { auto_continue: true, max_auto_turns: 1, min_continue_interval_seconds: 0 },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+  const context = { sessionID: "ses_cleared" } as never
+
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "keep going" }, context)
+  await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_cleared" } } as never })
+  expect(calls).toHaveLength(0)
+
+  // The deferral is armed and re-polling. Clearing the goal must stop it: the retry
+  // writes nothing to the goal, so nothing else would ever end the loop.
+  await waitForLong(() => childPolls >= 2, 10_000)
+  await requireTool(tools.clear_goal, "clear_goal").execute({}, context)
+
+  await new Promise((resolve) => setTimeout(resolve, 1_500))
+  const pollsAfterClear = childPolls
+  await new Promise((resolve) => setTimeout(resolve, 2_500))
+  expect(childPolls).toBe(pollsAfterClear)
+  expect(calls).toHaveLength(0)
+}, 30_000)
+
+test("task deferral stops polling when the goal is paused while a child still blocks", async () => {
+  const calls: unknown[] = []
+  let childPolls = 0
+  const hooks = await setupServer(
+    {
+      client: {
+        session: {
+          children: async () => {
+            childPolls += 1
+            return { data: [{ id: "task_1" }] }
+          },
+          status: async () => ({ data: { task_1: { type: "busy" } } }),
+          promptAsync: async (input: unknown) => {
+            calls.push(input)
+          },
+        },
+      },
+    } as never,
+    { auto_continue: true, max_auto_turns: 1, min_continue_interval_seconds: 0 },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+  const context = { sessionID: "ses_paused_block" } as never
+
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "keep going" }, context)
+  await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_paused_block" } } as never })
+  await waitForLong(() => childPolls >= 2, 10_000)
+
+  await requireTool(tools.update_goal_status, "update_goal_status").execute({ status: "paused" }, context)
+
+  await new Promise((resolve) => setTimeout(resolve, 1_500))
+  const pollsAfterPause = childPolls
+  await new Promise((resolve) => setTimeout(resolve, 2_500))
+  expect(childPolls).toBe(pollsAfterPause)
+  expect(calls).toHaveLength(0)
+}, 30_000)
+
 test("task deferral can be disabled with config", async () => {
   const calls: unknown[] = []
   const hooks = await setupServer(
