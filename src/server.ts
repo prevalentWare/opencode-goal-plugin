@@ -40,6 +40,7 @@ type Options = {
   max_auto_turns?: number
   min_continue_interval_seconds?: number
   max_turn_time?: number
+  max_task_block_seconds?: number
   max_prompt_failures?: number
   register_command?: boolean
   command_name?: string
@@ -78,6 +79,8 @@ const DEFAULT_COMMAND_NAME = "goal"
 const DEFAULT_RESTRICTED_AGENTS = ["plan"]
 const TASK_SETTLE_DELAY_MS = 25
 const SNAPSHOT_IDLE_HOLD_MS = 250
+const DEFAULT_MAX_TASK_BLOCK_SECONDS = 900
+const TASK_BLOCK_RETRY_MS = 1_000
 const MAX_TIMER_DELAY_MS = 2_147_483_647
 const STALE_PENDING_MS = 30_000
 const RETRY_SETTLE_MS = 25
@@ -115,6 +118,7 @@ type TaskRecord = {
   parentSessionID: string
   state: TaskState
   terminalUnreconciled: boolean
+  runningSince: number | null
   terminalAt: number | null
   lastAssistantMessageIDAtTerminal: string | null
 }
@@ -531,6 +535,15 @@ function toolOutputFailed(output: unknown) {
   return false
 }
 
+// A task record must not defer goal continuation forever. `runningSince` bounds a
+// child that stays listed but never reports a terminal state; `terminalAt` bounds a
+// terminal child whose result is never reconciled by an orchestrator turn.
+function taskBlockExpired(task: TaskRecord, maxBlockMs: number | null, now: number) {
+  if (maxBlockMs == null) return false
+  const blockingSince = task.state === "running" ? task.runningSince : task.terminalAt
+  return blockingSince != null && now - blockingSince >= maxBlockMs
+}
+
 function sessionIDFromEvent(event: { type?: string; properties?: Record<string, unknown> }) {
   const direct = event.properties?.sessionID
   if (typeof direct === "string") return direct
@@ -653,11 +666,14 @@ class TaskTracker {
     if (marker) this.observeAssistant(sessionID, marker)
   }
 
-  hasBlockingTasks(parentSessionID: string) {
+  hasBlockingTasks(parentSessionID: string, maxBlockMs: number | null = null) {
     this.pruneExpiredSnapshotIdleHolds()
+    const now = Date.now()
     for (const task of this.tasks.values()) {
       if (task.parentSessionID !== parentSessionID) continue
-      if (task.state === "running" || task.terminalUnreconciled) return true
+      if (task.state !== "running" && !task.terminalUnreconciled) continue
+      if (taskBlockExpired(task, maxBlockMs, now)) continue
+      return true
     }
     for (const hold of this.snapshotIdleHolds.values()) {
       if (hold.parentSessionID === parentSessionID) return true
@@ -717,6 +733,7 @@ class TaskTracker {
       parentSessionID,
       state: "running",
       terminalUnreconciled: false,
+      runningSince: existing?.state === "running" ? existing.runningSince ?? Date.now() : Date.now(),
       terminalAt: null,
       lastAssistantMessageIDAtTerminal: existing?.lastAssistantMessageIDAtTerminal ?? null,
     })
@@ -741,13 +758,29 @@ class TaskTracker {
     ) {
       return
     }
+    // refreshLiveChildren re-marks a listed idle child on every poll. Once the record is
+    // terminal-unreconciled the guard above no longer returns, so a naive rewrite would
+    // restart `terminalAt` each time and `taskBlockExpired` would never see the record
+    // age out - the ceiling would never fire for the very case it exists to bound. Carry
+    // the original timestamp, and with it the assistant marker captured when the child
+    // first went terminal, so both the ceiling and reconciliation measure from that
+    // moment. A genuine state change (or an explicit resetReconciled) starts a new clock.
+    const continuesExistingTerminal =
+      existing != null &&
+      TASK_TERMINAL_STATES.has(existing.state) &&
+      existing.state === state &&
+      existing.terminalUnreconciled &&
+      !options.resetReconciled
     this.tasks.set(taskID, {
       taskID,
       parentSessionID: resolvedParentSessionID,
       state,
       terminalUnreconciled: true,
-      terminalAt: Date.now(),
-      lastAssistantMessageIDAtTerminal: this.latestAssistantBySession.get(resolvedParentSessionID)?.id ?? null,
+      runningSince: null,
+      terminalAt: continuesExistingTerminal ? existing.terminalAt ?? Date.now() : Date.now(),
+      lastAssistantMessageIDAtTerminal: continuesExistingTerminal
+        ? existing.lastAssistantMessageIDAtTerminal
+        : this.latestAssistantBySession.get(resolvedParentSessionID)?.id ?? null,
     })
   }
 
@@ -923,6 +956,16 @@ function isClosedGoal(goal: GoalSnapshot) {
   return goal.status === "complete" || goal.status === "unmet"
 }
 
+// A task-block deferral re-arms a poll that records nothing on the goal, so it must not
+// outlive the goal it exists to continue. `budgetLimited` / `usageLimited` still receive a
+// wrap-up continuation (see reserveContinuation), so only a missing, closed, or paused goal
+// stops the poll.
+function taskDeferralGoalContinuable(goal: GoalSnapshot | null | undefined) {
+  if (!goal) return false
+  if (isClosedGoal(goal)) return false
+  return goal.status !== "paused"
+}
+
 function existingGoalResult(goal: GoalSnapshot, requestedObjective: string, planningOnly: boolean) {
   const reused = goal.objective === requestedObjective
   return JSON.stringify(
@@ -1048,6 +1091,9 @@ const server: Plugin = async ({ client }, options?: Options) => {
   const maxAutoTurns = positiveIntegerOrNull(options?.max_auto_turns) ?? DEFAULT_MAX_AUTO_TURNS
   const minInterval = nonNegativeIntegerOrNull(options?.min_continue_interval_seconds) ?? DEFAULT_CONTINUE_INTERVAL_SECONDS
   const maxTurnTimeMs = timeoutMillisecondsFromSeconds(options?.max_turn_time)
+  const maxTaskBlockMs = timeoutMillisecondsFromSeconds(
+    options?.max_task_block_seconds ?? DEFAULT_MAX_TASK_BLOCK_SECONDS,
+  )
   const maxPromptFailures = positiveIntegerOrNull(options?.max_prompt_failures) ?? DEFAULT_MAX_PROMPT_FAILURES
   const registerCommand = options?.register_command ?? true
   const commandName = commandNameFromOptions(options)
@@ -1094,7 +1140,7 @@ const server: Plugin = async ({ client }, options?: Options) => {
     if (!deferWhileTasksActive) return false
     await taskTracker.refreshLiveChildren(client, sessionID)
     return {
-      blocked: taskTracker.hasBlockingTasks(sessionID),
+      blocked: taskTracker.hasBlockingTasks(sessionID, maxTaskBlockMs),
       retryAt: taskTracker.nextSnapshotIdleRetryAt(sessionID),
     }
   }
@@ -1237,10 +1283,26 @@ const server: Plugin = async ({ client }, options?: Options) => {
       taskTracker.observeAssistantMessage(sessionID, latestAssistant)
       const taskStatus = await taskBlockStatus(sessionID)
       if (taskStatus && taskStatus.blocked) {
-        taskDeferredSessions.add(sessionID)
-        if (taskStatus.retryAt != null) {
-          scheduleSettledContinuation(sessionID, taskStatus.retryAt - Date.now(), scheduled != null)
+        // Validate the goal before re-arming. The re-arm below runs at TASK_BLOCK_RETRY_MS
+        // and writes nothing to the goal, so a goal completed, cleared, or paused while a
+        // child still blocks would otherwise keep a 1 Hz poll alive until the ceiling - and
+        // forever when max_task_block_seconds is 0.
+        const deferralGoal = await getGoalInternal(sessionID)
+        if (!taskDeferralGoalContinuable(deferralGoal)) {
+          taskDeferredSessions.delete(sessionID)
+          cancelScheduledContinuation(sessionID)
+          return
         }
+        taskDeferredSessions.add(sessionID)
+        // Always re-arm. A task block is the only deferral that records nothing on the
+        // goal, so without a scheduled retry a child that never reports a terminal state
+        // silently ends auto-continuation: nothing refreshes live children again and the
+        // goal keeps reading active with no stop reason.
+        scheduleSettledContinuation(
+          sessionID,
+          taskStatus.retryAt != null ? taskStatus.retryAt - Date.now() : TASK_BLOCK_RETRY_MS,
+          scheduled != null,
+        )
         return
       }
       if (busySessions.has(sessionID)) return
@@ -1710,6 +1772,9 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
   const maxAutoTurns = positiveIntegerOrNull(options.max_auto_turns) ?? DEFAULT_MAX_AUTO_TURNS
   const minInterval = nonNegativeIntegerOrNull(options.min_continue_interval_seconds) ?? DEFAULT_CONTINUE_INTERVAL_SECONDS
   const maxTurnTimeMs = timeoutMillisecondsFromSeconds(options.max_turn_time)
+  const maxTaskBlockMs = timeoutMillisecondsFromSeconds(
+    options.max_task_block_seconds ?? DEFAULT_MAX_TASK_BLOCK_SECONDS,
+  )
   const maxPromptFailures = positiveIntegerOrNull(options.max_prompt_failures) ?? DEFAULT_MAX_PROMPT_FAILURES
   const registerCommand = options.register_command ?? true
   const commandName = commandNameFromOptions(options)
@@ -1761,7 +1826,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
   function taskBlockStatus(sessionID: string) {
     if (!deferWhileTasksActive) return false
     return {
-      blocked: taskTracker.hasBlockingTasks(sessionID),
+      blocked: taskTracker.hasBlockingTasks(sessionID, maxTaskBlockMs),
       retryAt: taskTracker.nextSnapshotIdleRetryAt(sessionID),
     }
   }
@@ -1882,10 +1947,26 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       }
       const taskStatus = taskBlockStatus(sessionID)
       if (taskStatus && taskStatus.blocked) {
-        taskDeferredSessions.add(sessionID)
-        if (taskStatus.retryAt != null) {
-          scheduleSettledContinuation(sessionID, taskStatus.retryAt - Date.now(), scheduled != null)
+        // Validate the goal before re-arming. The re-arm below runs at TASK_BLOCK_RETRY_MS
+        // and writes nothing to the goal, so a goal completed, cleared, or paused while a
+        // child still blocks would otherwise keep a 1 Hz poll alive until the ceiling - and
+        // forever when max_task_block_seconds is 0.
+        const deferralGoal = await getGoalInternal(sessionID)
+        if (!taskDeferralGoalContinuable(deferralGoal)) {
+          taskDeferredSessions.delete(sessionID)
+          cancelScheduledContinuation(sessionID)
+          return
         }
+        taskDeferredSessions.add(sessionID)
+        // Always re-arm. A task block is the only deferral that records nothing on the
+        // goal, so without a scheduled retry a child that never reports a terminal state
+        // silently ends auto-continuation: nothing refreshes live children again and the
+        // goal keeps reading active with no stop reason.
+        scheduleSettledContinuation(
+          sessionID,
+          taskStatus.retryAt != null ? taskStatus.retryAt - Date.now() : TASK_BLOCK_RETRY_MS,
+          scheduled != null,
+        )
         return
       }
       if (busySessions.has(sessionID)) return
