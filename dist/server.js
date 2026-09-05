@@ -2687,6 +2687,7 @@ async function setupV2(context) {
   const planAgents = restrictedAgentSet(options);
   const isPlanAgent = (agent) => typeof agent === "string" && planAgents.has(agent.trim().toLowerCase());
   const activeContinuationsV2 = new Set;
+  const stoppedExecutions = new Set;
   const latestStepBySession = new Map;
   const stepTextBuffers = new Map;
   const stepTokenSums = new Map;
@@ -2833,6 +2834,8 @@ async function setupV2(context) {
   async function runAutoContinue(sessionID, fromTaskDeferral = false, scheduled) {
     if (disposed)
       return;
+    if (stoppedExecutions.has(sessionID))
+      return;
     if (busySessions.has(sessionID))
       return;
     if (activeContinuationsV2.has(sessionID))
@@ -2913,8 +2916,13 @@ async function setupV2(context) {
       if (nativeRetrySessions.has(sessionID))
         return;
       const goal = await reserveContinuation(sessionID, maxAutoTurns, minInterval);
-      if (!goal)
+      if (!goal) {
+        const waiting = await getGoalInternal(sessionID);
+        if (waiting?.status === "active" && waiting.pendingAttempt == null && waiting.lastContinuationAt != null && minInterval > 0) {
+          scheduleSettledContinuation(sessionID, continuationDelayFromSnapshot(minInterval, waiting.lastContinuationAt), scheduled != null);
+        }
         return;
+      }
       attemptReservedAt = goal.pendingAttempt?.reservedAt ?? Date.now();
       if (nativeRetrySessions.has(sessionID)) {
         await rollbackContinuationAttempt(sessionID);
@@ -2955,6 +2963,23 @@ async function setupV2(context) {
   async function handleV2Event(event) {
     const data = event.data;
     const sessionID = typeof data.sessionID === "string" ? data.sessionID : undefined;
+    if (context.location && event.location && (event.location.directory !== context.location.directory || event.location.workspaceID !== context.location.workspaceID)) {
+      if (event.type === "session.created" && sessionID && typeof data.parentID === "string") {
+        taskTracker.observeSessionCreated({ properties: { info: { id: sessionID, parentID: data.parentID } } });
+      } else if (sessionID) {
+        if (event.type === "session.execution.started")
+          taskTracker.observeSessionStatus(sessionID, "busy");
+        if (["session.execution.succeeded", "session.execution.failed", "session.execution.interrupted", "session.idle"].includes(event.type)) {
+          taskTracker.observeSessionStatus(sessionID, "idle");
+        }
+        if (event.type === "session.status" && isRecord(data.status) && typeof data.status.type === "string") {
+          taskTracker.observeSessionStatus(sessionID, data.status.type);
+        }
+        if (event.type === "session.deleted")
+          taskTracker.observeSessionDeleted(sessionID);
+      }
+      return;
+    }
     switch (event.type) {
       case "session.created": {
         const parentID = data.parentID;
@@ -2963,10 +2988,13 @@ async function setupV2(context) {
         }
         return;
       }
+      case "session.execution.started":
+      case "session.retry.scheduled":
       case "session.status": {
-        const status = data.status;
+        const status = event.type === "session.execution.started" ? { type: "busy" } : event.type === "session.retry.scheduled" ? { type: "retry" } : data.status;
         if (sessionID && isRecord(status) && typeof status.type === "string") {
           if (status.type === "busy") {
+            stoppedExecutions.delete(sessionID);
             busySessions.add(sessionID);
             nativeRetrySessions.delete(sessionID);
             armTurnWatchdog(sessionID);
@@ -2992,6 +3020,7 @@ async function setupV2(context) {
         }
         return;
       }
+      case "session.execution.succeeded":
       case "session.idle": {
         if (sessionID) {
           busySessions.delete(sessionID);
@@ -3007,9 +3036,25 @@ async function setupV2(context) {
         }
         return;
       }
+      case "session.execution.interrupted": {
+        if (!sessionID)
+          return;
+        stoppedExecutions.add(sessionID);
+        busySessions.delete(sessionID);
+        nativeRetrySessions.delete(sessionID);
+        clearTurnWatchdog(sessionID);
+        watchdogRescuedSessions.delete(sessionID);
+        cancelScheduledContinuation(sessionID);
+        taskDeferredSessions.delete(sessionID);
+        taskTracker.observeSessionStatus(sessionID, "idle");
+        return;
+      }
+      case "session.execution.failed":
       case "session.error": {
         if (!sessionID)
           return;
+        if (event.type === "session.execution.failed")
+          nativeRetrySessions.delete(sessionID);
         const inNativeRetry = nativeRetrySessions.has(sessionID);
         busySessions.delete(sessionID);
         clearTurnWatchdog(sessionID);
@@ -3018,6 +3063,13 @@ async function setupV2(context) {
         nativeRetrySessions.delete(sessionID);
         watchdogRescuedSessions.delete(sessionID);
         const errorMessage = transportErrorMessageFromEvent(data);
+        if (event.type === "session.execution.failed" && !isTransportError(errorMessage)) {
+          stoppedExecutions.add(sessionID);
+          cancelScheduledContinuation(sessionID);
+          taskDeferredSessions.delete(sessionID);
+        }
+        if (event.type === "session.execution.failed")
+          taskTracker.observeSessionStatus(sessionID, "idle");
         if (errorMessage && isTransportError(errorMessage)) {
           const goal = await getGoalInternal(sessionID);
           if (goal?.status === "active") {
@@ -3041,6 +3093,7 @@ async function setupV2(context) {
       case "session.deleted": {
         if (!sessionID)
           return;
+        stoppedExecutions.delete(sessionID);
         busySessions.delete(sessionID);
         clearTurnWatchdog(sessionID);
         watchdogRescuedSessions.delete(sessionID);
@@ -3317,6 +3370,7 @@ async function setupV2(context) {
       clearTimeout(watchdog.timer);
     turnWatchdogs.clear();
     activeContinuationsV2.clear();
+    stoppedExecutions.clear();
     nativeRetrySessions.clear();
     locallyDeliveredPendingSessions.clear();
     watchdogRescuedSessions.clear();

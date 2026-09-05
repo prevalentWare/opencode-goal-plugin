@@ -49,6 +49,7 @@
     "lint": "eslint .",
     "pack:dry-run": "npm pack --dry-run",
     "test": "bun test",
+    "smoke:v2": "bun scripts/smoke-v2-lifecycle.ts",
     "test:coverage": "bun test --coverage",
     "typecheck": "tsc --noEmit",
     "prepublishOnly": "bun run test && bun run build"

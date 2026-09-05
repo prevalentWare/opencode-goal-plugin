@@ -160,6 +160,7 @@ Defaults:
 - `defer_while_tasks_active`: `true`; when enabled, goal auto-continuation waits for active OpenCode Task child sessions and their orchestrator reconciliation before sending the next goal prompt.
 - `max_auto_turns`: `25`
 - `min_continue_interval_seconds`: `3`
+- Fast V2 executions that finish inside this interval schedule a delayed continuation; they do not require another user message to wake up.
 - `max_turn_time`: unset by default; set a positive number of seconds to retry one active-goal continuation prompt when a model turn remains busy for that long. Each new busy event resets the watchdog. Idle, built-in retry, session deletion, active Task children, and restricted agents suppress the retry. Watchdog retries are independent of `min_continue_interval_seconds` and never consume auto-turn or no-progress budgets, but recognized transport failures still count toward the `max_prompt_failures` ceiling.
 - `max_prompt_failures`: `3`; consecutive transport or no-response continuation failures pause the goal at this ceiling. Prompt delivery alone does not reset the count; substantive assistant or tool progress, a new goal, or an explicit resume does.
 - `default_token_budget`: unset by default; when set, new goals inherit this token budget.
@@ -253,6 +254,17 @@ bun run build
 npm pack --dry-run
 ```
 
+With `opencode2` installed, run `bun run build && bun run smoke:v2` to exercise the
+native V2 lifecycle, not just mocked events. The smoke test uses a private server,
+isolated home/config/database/goal state, and a deterministic local model with no
+real provider credentials. It invokes `/goal`, requires **two** automatic
+continuations with the default minimum interval, then verifies completion. A
+second loaded location checks that server-wide events do not duplicate delivery.
+The test prints its temporary artifact directory and shuts down its private
+server. Use `OPENCODE_V2_BIN` to select another V2 binary, or run
+`bun run smoke:v2 @prevalentware/opencode-goal-plugin@<version>` to install and
+verify an exact published package in the isolated environment.
+
 ## Publishing
 
 This package is set up for npm Trusted Publishing from GitHub Actions. On every push to `main`, CI runs typecheck, lint, and unit tests in parallel. If they all pass, the publish job computes the next patch version from the latest version on npm, builds the package, and runs `npm publish`.
@@ -279,6 +291,6 @@ OpenCode plugin modules are target-specific. This package exports separate modul
 }
 ```
 
-Codex goal mode has deeper runtime integration for thread lifecycle control. This plugin implements the same workflow using OpenCode plugin hooks. Token usage is read from OpenCode step-finish usage when available and falls back to message token metadata or text estimation when exact usage is unavailable. Continuation is driven by OpenCode idle events, including `session.idle` and `session.status` idle notifications. The optional `max_turn_time` watchdog can retry one goal continuation prompt when a model turn remains busy, without consuming the goal's auto-turn, no-progress, or prompt-failure budgets. By default, continuation is deferred while OpenCode Task child sessions are active or their terminal result still needs an orchestrator turn. During compaction, the plugin disables OpenCode's generic synthetic auto-continue while an active goal exists so the goal-specific continuation prompt remains authoritative.
+Codex goal mode has deeper runtime integration for thread lifecycle control. This plugin implements the same workflow using OpenCode plugin hooks. Token usage is read from OpenCode step-finish usage when available and falls back to message token metadata or text estimation when exact usage is unavailable. Continuation is driven by V2 `session.execution.succeeded` events and legacy `session.idle` / `session.status` idle notifications, never by intermediate model-step completion. V2 execution starts arm busy tracking; native `session.retry.scheduled` events cancel plugin recovery while OpenCode retries. Terminal execution transport failures use bounded recovery, while interruptions (user, shutdown, or superseded) cancel local timers without starting another turn or charging a prompt failure. Interrupted or non-transport-failed executions remain suppressed until the host starts a new execution; this does not change the persisted goal status. Use `/pause_goal` for a durable pause. Each V2 plugin instance handles goal events only for its own location while still observing cross-location child task lifecycles. The optional `max_turn_time` watchdog can retry one goal continuation prompt when a model turn remains busy, without consuming the goal's auto-turn or no-progress budgets; recognized transport failures do count toward the prompt-failure ceiling. By default, continuation is deferred while OpenCode Task child sessions are active or their terminal result still needs an orchestrator turn. During compaction, the plugin disables OpenCode's generic synthetic auto-continue while an active goal exists so the goal-specific continuation prompt remains authoritative.
 
 The goal sidebar shows the current status, elapsed time, token usage, auto-continue count, latest checkpoint, latest status message, stop reason, and objective when a goal is active, paused, or safety-limited. Closed goals remain visible briefly through the latest tool state as achieved or unmet.
