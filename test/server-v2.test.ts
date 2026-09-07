@@ -180,6 +180,27 @@ async function waitFor(predicate: () => boolean | Promise<boolean>, deadlineMs =
   expect(await predicate()).toBe(true)
 }
 
+// A task-block re-arm is a TASK_BLOCK_RETRY_MS timer and nothing else: the V2 poll touches
+// no mock surface, so counting the timers is the only way to tell a stopped loop from a
+// running one. Swapping the global back in a finally keeps a failed assertion from leaking
+// the patched setTimeout into the rest of the file.
+async function countTaskBlockRearms(
+  body: (rearms: () => number, realSetTimeout: typeof globalThis.setTimeout) => Promise<void>,
+) {
+  const realSetTimeout = globalThis.setTimeout
+  let rearms = 0
+  const countingSetTimeout = (handler: (...handlerArgs: never[]) => void, timeout?: number, ...rest: unknown[]) => {
+    if (timeout === 1_000) rearms += 1
+    return realSetTimeout(handler as never, timeout as never, ...(rest as never[]))
+  }
+  globalThis.setTimeout = countingSetTimeout as unknown as typeof globalThis.setTimeout
+  try {
+    await body(() => rearms, realSetTimeout)
+  } finally {
+    globalThis.setTimeout = realSetTimeout
+  }
+}
+
 function goalTool(mock: MockContext, name: string) {
   const tool = mock.tools.find((candidate) => candidate.name === name)
   if (!tool) throw new Error(`expected V2 tool ${name} to be registered`)
@@ -935,20 +956,12 @@ test("V2 running child session stops blocking after the task block ceiling", asy
   await cleanup()
 }, 20_000)
 
-// A V2 task-block poll touches nothing on the mock context (taskBlockStatus is entirely
-// in-memory), so "no prompt was sent" cannot distinguish a stopped loop from a running
-// one - a cleared goal is refused later in runAutoContinue either way. Count the re-arm
-// timers themselves instead: that is the resource the fix is about.
+// "No prompt was sent" cannot distinguish a stopped loop from a running one here - a
+// cleared goal is refused later in runAutoContinue either way - so these lifecycle tests
+// count the re-arm timers, which are the resource the fix is about.
 test("V2 task deferral stops re-arming when the goal is cleared while a child still blocks", async () => {
   const mock = makeMockContext({ min_continue_interval_seconds: 0 })
-  const realSetTimeout = globalThis.setTimeout
-  let taskBlockRearms = 0
-  const countingSetTimeout = (handler: (...handlerArgs: never[]) => void, timeout?: number, ...rest: unknown[]) => {
-    if (timeout === 1_000) taskBlockRearms += 1
-    return realSetTimeout(handler as never, timeout as never, ...(rest as never[]))
-  }
-  globalThis.setTimeout = countingSetTimeout as unknown as typeof globalThis.setTimeout
-  try {
+  await countTaskBlockRearms(async (rearms, realSetTimeout) => {
     const cleanup = await setupPlugin(mock as never)
     await createGoalViaV2Tool(mock, "wait for delegated work")
 
@@ -956,7 +969,7 @@ test("V2 task deferral stops re-arming when the goal is cleared while a child st
     mock.stream.push({ type: "session.idle", created: 101, data: { sessionID: "ses_v2" } })
 
     // The deferral is armed and re-arming once per second while the child blocks.
-    await waitFor(() => taskBlockRearms >= 2, 10_000)
+    await waitFor(() => rearms() >= 2, 10_000)
     expect(mock.promptCalls).toHaveLength(0)
 
     await goalTool(mock, "clear_goal").execute({}, toolContext())
@@ -964,17 +977,135 @@ test("V2 task deferral stops re-arming when the goal is cleared while a child st
 
     // Let any in-flight re-arm land, then confirm the loop has genuinely stopped.
     await new Promise((resolve) => realSetTimeout(resolve, 1_500))
-    const rearmsAfterClear = taskBlockRearms
+    const rearmsAfterClear = rearms()
     await new Promise((resolve) => realSetTimeout(resolve, 3_000))
-    expect(taskBlockRearms).toBe(rearmsAfterClear)
+    expect(rearms()).toBe(rearmsAfterClear)
     expect(mock.promptCalls).toHaveLength(0)
 
     mock.stream.end()
     await cleanup()
-  } finally {
-    globalThis.setTimeout = realSetTimeout
-  }
+  })
 }, 30_000)
+
+test("V2 task deferral stops re-arming when the goal is paused while a child still blocks", async () => {
+  const mock = makeMockContext({ min_continue_interval_seconds: 0 })
+  await countTaskBlockRearms(async (rearms, realSetTimeout) => {
+    const cleanup = await setupPlugin(mock as never)
+    await createGoalViaV2Tool(mock, "wait for delegated work")
+
+    mock.stream.push({ type: "session.created", created: 100, data: { sessionID: "child", parentID: "ses_v2" } })
+    mock.stream.push({ type: "session.idle", created: 101, data: { sessionID: "ses_v2" } })
+    await waitFor(() => rearms() >= 2, 10_000)
+    expect(mock.promptCalls).toHaveLength(0)
+
+    await goalTool(mock, "update_goal_status").execute({ status: "paused" }, toolContext())
+    expect((await getGoalInternal("ses_v2"))?.status).toBe("paused")
+
+    await new Promise((resolve) => realSetTimeout(resolve, 1_500))
+    const rearmsAfterPause = rearms()
+    await new Promise((resolve) => realSetTimeout(resolve, 3_000))
+    expect(rearms()).toBe(rearmsAfterPause)
+    expect(mock.promptCalls).toHaveLength(0)
+
+    mock.stream.end()
+    await cleanup()
+  })
+}, 30_000)
+
+test("V2 task deferral stops re-arming when the goal is completed while a child still blocks", async () => {
+  const mock = makeMockContext({ min_continue_interval_seconds: 0 })
+  await countTaskBlockRearms(async (rearms, realSetTimeout) => {
+    const cleanup = await setupPlugin(mock as never)
+    await createGoalViaV2Tool(mock, "wait for delegated work")
+
+    mock.stream.push({ type: "session.created", created: 100, data: { sessionID: "child", parentID: "ses_v2" } })
+    mock.stream.push({ type: "session.idle", created: 101, data: { sessionID: "ses_v2" } })
+    await waitFor(() => rearms() >= 2, 10_000)
+    expect(mock.promptCalls).toHaveLength(0)
+
+    // Unlike a pause, a closed goal can never be resumed, so the poll has nothing to
+    // wake up for even in principle.
+    await goalTool(mock, "update_goal").execute(
+      { status: "complete", evidence: "delegated work is no longer needed" },
+      toolContext(),
+    )
+    expect((await getGoalInternal("ses_v2"))?.status).toBe("complete")
+
+    await new Promise((resolve) => realSetTimeout(resolve, 1_500))
+    const rearmsAfterComplete = rearms()
+    await new Promise((resolve) => realSetTimeout(resolve, 3_000))
+    expect(rearms()).toBe(rearmsAfterComplete)
+    expect(mock.promptCalls).toHaveLength(0)
+
+    mock.stream.end()
+    await cleanup()
+  })
+}, 30_000)
+
+// Mirrors the V1 wrap-up regression. Leg A is the control: a predicate that refused every
+// non-active status would pass leg B while silently dropping the one wrap-up continuation
+// a blocked limited goal is still owed.
+test("V2 task deferral keeps re-arming a limited goal until its wrap-up is spent, then stops", async () => {
+  const mock = makeMockContext({ min_continue_interval_seconds: 0 })
+  await countTaskBlockRearms(async (rearms, realSetTimeout) => {
+    const cleanup = await setupPlugin(mock as never)
+    await goalTool(mock, "create_goal").execute(
+      { objective: "wait for delegated work", token_budget: 10 },
+      toolContext(),
+    )
+
+    mock.stream.push({
+      type: "session.step.ended",
+      created: Date.now(),
+      data: {
+        sessionID: "ses_v2",
+        assistantMessageID: "msg_v2_wrapup",
+        finish: "stop",
+        tokens: { input: 20, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      },
+    })
+    await waitFor(async () => (await getGoalInternal("ses_v2"))?.status === "budgetLimited")
+    expect((await getGoalInternal("ses_v2"))?.budgetWrapupSent).toBe(false)
+
+    // Leg A - the wrap-up is still unspent, so a blocking child must not stop the poll.
+    mock.stream.push({ type: "session.created", created: 100, data: { sessionID: "child", parentID: "ses_v2" } })
+    mock.stream.push({ type: "session.idle", created: 101, data: { sessionID: "ses_v2" } })
+    await waitFor(() => rearms() >= 2, 10_000)
+    expect(mock.promptCalls).toHaveLength(0)
+
+    // Releasing the child lets the running poll reach reserveContinuation, which spends
+    // the single wrap-up a limited goal is owed.
+    mock.stream.push({ type: "session.deleted", created: 102, data: { sessionID: "child" } })
+    await waitFor(() => mock.promptCalls.length === 1, 10_000)
+    expect((await getGoalInternal("ses_v2"))?.budgetWrapupSent).toBe(true)
+
+    // The delivered wrap-up is still finishing its post-delivery bookkeeping, and
+    // runAutoContinue refuses re-entry while a continuation is in flight. Without this
+    // settle the assertions below would pass for that reason instead of the intended one.
+    await new Promise((resolve) => realSetTimeout(resolve, 1_000))
+
+    // Leg B - same status, same blocking child, but nothing left to continue to.
+    const rearmsBeforeSecondBlock = rearms()
+    mock.stream.push({ type: "session.created", created: 103, data: { sessionID: "child2", parentID: "ses_v2" } })
+    mock.stream.push({ type: "session.idle", created: 104, data: { sessionID: "ses_v2" } })
+    await new Promise((resolve) => realSetTimeout(resolve, 1_500))
+    const rearmsAfterWrapup = rearms()
+    await new Promise((resolve) => realSetTimeout(resolve, 3_000))
+    expect(rearms()).toBe(rearmsAfterWrapup)
+    expect(rearmsAfterWrapup).toBe(rearmsBeforeSecondBlock)
+    expect(mock.promptCalls).toHaveLength(1)
+
+    // Positive control: nothing about the session or the blocked child changed, so resuming
+    // the goal - which clears budgetWrapupSent - must bring the same deferral straight back.
+    // Only the predicate was ever holding it, and the loop is provably still reachable.
+    await goalTool(mock, "update_goal_status").execute({ status: "active" }, toolContext())
+    mock.stream.push({ type: "session.idle", created: 105, data: { sessionID: "ses_v2" } })
+    await waitFor(() => rearms() > rearmsAfterWrapup, 10_000)
+
+    mock.stream.end()
+    await cleanup()
+  })
+}, 60_000)
 
 test("V2 idle auto-continue is suppressed for plan-agent goals", async () => {
   const mock = makeMockContext({ auto_continue: true, min_continue_interval_seconds: 0, max_auto_turns: 5 })

@@ -2028,9 +2028,9 @@ function isClosedGoal(goal) {
 function taskDeferralGoalContinuable(goal) {
   if (!goal)
     return false;
-  if (isClosedGoal(goal))
-    return false;
-  return goal.status !== "paused";
+  if (goal.status === "budgetLimited" || goal.status === "usageLimited")
+    return !goal.budgetWrapupSent;
+  return goal.status === "active";
 }
 function existingGoalResult(goal, requestedObjective, planningOnly) {
   const reused = goal.objective === requestedObjective;

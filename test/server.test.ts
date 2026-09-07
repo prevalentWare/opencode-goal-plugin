@@ -2093,6 +2093,150 @@ test("task deferral stops polling when the goal is paused while a child still bl
   expect(calls).toHaveLength(0)
 }, 30_000)
 
+test("task deferral stops polling when the goal is completed while a child still blocks", async () => {
+  const calls: unknown[] = []
+  let childPolls = 0
+  const hooks = await setupServer(
+    {
+      client: {
+        session: {
+          children: async () => {
+            childPolls += 1
+            return { data: [{ id: "task_1" }] }
+          },
+          status: async () => ({ data: { task_1: { type: "busy" } } }),
+          promptAsync: async (input: unknown) => {
+            calls.push(input)
+          },
+        },
+      },
+    } as never,
+    { auto_continue: true, max_auto_turns: 5, min_continue_interval_seconds: 0 },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+  const context = { sessionID: "ses_completed_block" } as never
+
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "keep going" }, context)
+  await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_completed_block" } } as never })
+  await waitForLong(() => childPolls >= 2, 10_000)
+
+  // A closed goal is terminal: nothing will ever reopen it, so the poll has nothing left
+  // to wake up for. `paused` can at least be resumed; `complete` cannot.
+  await requireTool(tools.update_goal, "update_goal").execute(
+    { status: "complete", evidence: "delegated work is no longer needed" },
+    context,
+  )
+
+  await new Promise((resolve) => setTimeout(resolve, 1_500))
+  const pollsAfterComplete = childPolls
+  await new Promise((resolve) => setTimeout(resolve, 2_500))
+  expect(childPolls).toBe(pollsAfterComplete)
+  expect(calls).toHaveLength(0)
+}, 30_000)
+
+// The two legs below are one regression: a limited goal is owed exactly one wrap-up
+// continuation, so the deferral must survive `budgetLimited` (leg A) and must stop once
+// `reserveWrapup` has spent it (leg B). Leg A is the control - without it a predicate that
+// simply refused every non-active status would pass leg B while silently dropping the
+// wrap-up a blocked limited goal is still entitled to.
+test("task deferral keeps polling a limited goal until its wrap-up is spent, then stops", async () => {
+  const calls: unknown[] = []
+  let childPolls = 0
+  let childBlocks = false
+  const hooks = await setupServer(
+    {
+      client: {
+        session: {
+          children: async () => {
+            childPolls += 1
+            return { data: childBlocks ? [{ id: "task_1" }] : [] }
+          },
+          status: async () => ({ data: { task_1: { type: "busy" } } }),
+          promptAsync: async (input: unknown) => {
+            calls.push(input)
+          },
+        },
+      },
+    } as never,
+    { auto_continue: true, max_auto_turns: 5, min_continue_interval_seconds: 0 },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+  const context = { sessionID: "ses_wrapup_block" } as never
+
+  await requireTool(tools.create_goal, "create_goal").execute(
+    { objective: "keep going", token_budget: 10 },
+    context,
+  )
+  // The first step-finish observation only establishes the usage baseline; the second is
+  // what actually accrues against the budget.
+  await hooks["experimental.chat.messages.transform"]!(
+    {},
+    {
+      messages: [
+        {
+          info: { id: "msg_wrapup_budget", role: "assistant", sessionID: "ses_wrapup_block" },
+          parts: [{ type: "step-finish", tokens: { input: 6, output: 5 } }],
+        },
+      ],
+    } as never,
+  )
+  await hooks["experimental.chat.messages.transform"]!(
+    {},
+    {
+      messages: [
+        {
+          info: { id: "msg_wrapup_budget_2", role: "assistant", sessionID: "ses_wrapup_block" },
+          parts: [{ type: "step-finish", tokens: { input: 17, output: 5 } }],
+        },
+      ],
+    } as never,
+  )
+  const limited = await requireTool(tools.get_goal, "get_goal").execute({}, context)
+  expect(String(limited)).toContain('"status": "budgetLimited"')
+  expect(String(limited)).toContain('"budgetWrapupSent": false')
+
+  // Leg A - the wrap-up is still unspent, so a blocking child must NOT stop the poll.
+  childBlocks = true
+  const pollsBeforeBlock = childPolls
+  await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_wrapup_block" } } as never })
+  await waitForLong(() => childPolls >= pollsBeforeBlock + 3, 10_000)
+  expect(calls).toHaveLength(0)
+
+  // Releasing the child lets the running poll reach reserveContinuation, which spends the
+  // one wrap-up. That is the only prompt a limited goal ever gets.
+  childBlocks = false
+  await waitForLong(() => calls.length === 1, 10_000)
+  const spent = await requireTool(tools.get_goal, "get_goal").execute({}, context)
+  expect(String(spent)).toContain('"budgetWrapupSent": true')
+
+  // The delivered wrap-up is still finishing its post-delivery bookkeeping, and
+  // runAutoContinue refuses re-entry while a continuation is in flight. Without this
+  // settle the assertions below would pass for that reason instead of the intended one.
+  await new Promise((resolve) => setTimeout(resolve, 1_000))
+
+  // Leg B - same status, same blocking child, but nothing left to continue to.
+  childBlocks = true
+  const pollsBeforeSecondBlock = childPolls
+  await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_wrapup_block" } } as never })
+  // The idle's own taskBlockStatus poll must land: it proves runAutoContinue was reachable,
+  // so a frozen count afterwards means the loop stopped rather than never started.
+  await waitForLong(() => childPolls > pollsBeforeSecondBlock, 10_000)
+  await new Promise((resolve) => setTimeout(resolve, 1_500))
+  const pollsAfterWrapup = childPolls
+  await new Promise((resolve) => setTimeout(resolve, 2_500))
+  expect(childPolls).toBe(pollsAfterWrapup)
+  expect(calls).toHaveLength(1)
+
+  // Positive control: nothing about the session or the blocked child changed, so resuming
+  // the goal - which clears budgetWrapupSent - must bring the same deferral straight back.
+  // Only the predicate was ever holding it.
+  await requireTool(tools.update_goal_status, "update_goal_status").execute({ status: "active" }, context)
+  await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_wrapup_block" } } as never })
+  await waitForLong(() => childPolls >= pollsAfterWrapup + 3, 10_000)
+}, 60_000)
+
 test("task deferral can be disabled with config", async () => {
   const calls: unknown[] = []
   const hooks = await setupServer(

@@ -957,13 +957,15 @@ function isClosedGoal(goal: GoalSnapshot) {
 }
 
 // A task-block deferral re-arms a poll that records nothing on the goal, so it must not
-// outlive the goal it exists to continue. `budgetLimited` / `usageLimited` still receive a
-// wrap-up continuation (see reserveContinuation), so only a missing, closed, or paused goal
-// stops the poll.
+// outlive the goal it exists to continue. This mirrors reserveContinuation's reservation
+// rules rather than restating them: a limited goal is owed exactly one wrap-up
+// continuation, and reserveWrapup returns null once budgetWrapupSent is set, so after the
+// wrap-up has been sent there is nothing left for the poll to wake up for. Every other
+// non-active status (paused, complete, unmet) fails canContinue outright.
 function taskDeferralGoalContinuable(goal: GoalSnapshot | null | undefined) {
   if (!goal) return false
-  if (isClosedGoal(goal)) return false
-  return goal.status !== "paused"
+  if (goal.status === "budgetLimited" || goal.status === "usageLimited") return !goal.budgetWrapupSent
+  return goal.status === "active"
 }
 
 function existingGoalResult(goal: GoalSnapshot, requestedObjective: string, planningOnly: boolean) {
