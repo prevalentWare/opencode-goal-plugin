@@ -2330,7 +2330,7 @@ var server = async ({ client }, options) => {
           return;
         }
         taskDeferredSessions.add(sessionID);
-        scheduleSettledContinuation(sessionID, taskStatus.retryAt != null ? taskStatus.retryAt - Date.now() : TASK_BLOCK_RETRY_MS, scheduled != null);
+        scheduleSettledContinuation(sessionID, taskStatus.retryAt != null ? taskStatus.retryAt - Date.now() : TASK_BLOCK_RETRY_MS, scheduled != null || taskStatus.retryAt != null);
         return;
       }
       if (busySessions.has(sessionID))

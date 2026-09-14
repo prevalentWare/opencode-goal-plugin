@@ -1348,11 +1348,13 @@ const server: Plugin = async ({ client }, options?: Options) => {
         // Always re-arm. A task block is the only deferral that records nothing on the
         // goal, so without a scheduled retry a child that never reports a terminal state
         // silently ends auto-continuation: nothing refreshes live children again and the
-        // goal keeps reading active with no stop reason.
+        // goal keeps reading active with no stop reason. When a fresh child snapshot adds
+        // a shorter idle-grace deadline, replace the older fallback timer so the stale
+        // running record is revisited promptly even if a poll was already queued.
         scheduleSettledContinuation(
           sessionID,
           taskStatus.retryAt != null ? taskStatus.retryAt - Date.now() : TASK_BLOCK_RETRY_MS,
-          scheduled != null,
+          scheduled != null || taskStatus.retryAt != null,
         )
         return
       }
