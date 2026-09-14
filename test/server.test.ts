@@ -38,8 +38,8 @@ function advertisedText(schema: z.ZodType) {
   return z.toJSONSchema(schema) as { maxLength?: number; pattern?: string }
 }
 
-async function waitFor(predicate: () => boolean) {
-  const deadline = Date.now() + 2000
+async function waitFor(predicate: () => boolean, deadlineMs = 2000) {
+  const deadline = Date.now() + deadlineMs
   while (Date.now() < deadline) {
     if (predicate()) return
     await new Promise((resolve) => setTimeout(resolve, 5))
@@ -56,8 +56,8 @@ async function waitForLong(predicate: () => boolean | Promise<boolean>, deadline
   expect(await predicate()).toBe(true)
 }
 
-async function waitForContinuation(calls: unknown[]) {
-  await waitFor(() => calls.length === 1)
+async function waitForContinuation(calls: unknown[], deadlineMs = 2000) {
+  await waitFor(() => calls.length === 1, deadlineMs)
   await new Promise((resolve) => setTimeout(resolve, 10))
 }
 
@@ -1905,7 +1905,9 @@ test("tracked running child absent from live children stops blocking after grace
   await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_1" } } as never })
 
   expect(calls).toHaveLength(0)
-  await waitForContinuation(calls)
+  // The first deferral poll can already be scheduled at the 1 s fallback when
+  // the child disappears. Leave enough headroom for a loaded CI runner.
+  await waitForContinuation(calls, 4000)
   expect(JSON.stringify(calls[0])).toContain("Continue working toward the active session goal")
 })
 
