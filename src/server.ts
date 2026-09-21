@@ -1300,7 +1300,7 @@ const server: Plugin = async ({ client }, options?: Options) => {
       activeContinuations.add(sessionID)
       claimedContinuation = true
       watchdogRescuedSessions.add(sessionID)
-      await sendContinuation(client, sessionID, continuationPrompt(current), current.lastPromptAgent ?? latestTurnAgent ?? null)
+      await sendContinuation(client, sessionID, continuationPrompt(current, locale), current.lastPromptAgent ?? latestTurnAgent ?? null)
       // Watchdog rescues are untracked retries: a delivered prompt arms the
       // pending-continuation window but never consumes an auto-turn budget and
       // never arms the no-progress evaluation. The rescue delivers while the
@@ -1989,7 +1989,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       activeContinuationsV2.add(sessionID)
       claimedContinuation = true
       watchdogRescuedSessions.add(sessionID)
-      await sendContinuation(sessionID, continuationPrompt(current), current.lastPromptAgent ?? latestStep?.agent ?? null)
+      await sendContinuation(sessionID, continuationPrompt(current, locale), current.lastPromptAgent ?? latestStep?.agent ?? null)
       // Watchdog rescues are untracked retries: a delivered prompt arms the
       // pending-continuation window but never consumes an auto-turn or
       // no-progress budget (armNoProgress: false). The rescue delivers while

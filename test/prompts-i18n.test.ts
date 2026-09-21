@@ -30,6 +30,10 @@ test("zh-CN wrap-up and system prompts are localized", () => {
     "zh-CN",
   )
   expect(limited).toContain("已达到安全限制")
+  expect(limited).toContain("状态：预算已达上限")
+  expect(limited).toContain("停止原因：已达到 Token 预算")
+  expect(limited).not.toContain("状态：budgetLimited")
+  expect(limited).not.toContain("停止原因：token budget reached")
   expect(limited).toContain("不要为此目标开始新的实质性工作")
   expect(limited).toContain("update_goal")
 

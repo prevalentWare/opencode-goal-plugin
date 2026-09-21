@@ -328,3 +328,56 @@ export function resolveLocale(
 export function messagesFor(locale: GoalLocale): GoalMessages {
   return locale === "zh-CN" ? ZH_CN_MESSAGES : EN_MESSAGES
 }
+
+const STATUS_PRESENTATIONS: Record<GoalLocale, Record<string, string>> = {
+  en: {
+    active: "active",
+    paused: "paused",
+    budgetLimited: "budget limited",
+    usageLimited: "usage limited",
+    complete: "complete",
+    unmet: "unmet",
+  },
+  "zh-CN": {
+    active: "进行中",
+    paused: "已暂停",
+    budgetLimited: "预算已达上限",
+    usageLimited: "使用量已达上限",
+    complete: "已完成",
+    unmet: "未达成",
+  },
+}
+
+/** Formats protocol status values only at user-facing presentation boundaries. */
+export function presentGoalStatus(status: string, locale: GoalLocale): string {
+  return STATUS_PRESENTATIONS[locale][status] ?? status
+}
+
+/**
+ * Formats stop reasons produced by this plugin. Unknown values are user-authored
+ * or externally supplied text and must be returned verbatim.
+ */
+export function presentGoalStopReason(reason: string, locale: GoalLocale): string {
+  if (locale !== "zh-CN") return reason
+
+  const direct: Record<string, string> = {
+    paused: "已暂停",
+    blocked: "已阻塞",
+    "plan mode": "Plan 模式",
+    "no progress": "无进展",
+    "auto-continue failures": "自动继续失败",
+    "goal limit reached": "已达到目标限制",
+    "token budget reached": "已达到 Token 预算",
+    "max auto-continues reached": "已达到自动继续次数上限",
+    "max duration reached": "已达到持续时间上限",
+  }
+  if (direct[reason]) return direct[reason]
+
+  const tokenBudget = /^token budget reached \((\d+)\/(\d+)\)$/.exec(reason)
+  if (tokenBudget) return `已达到 Token 预算（${tokenBudget[1]}/${tokenBudget[2]}）`
+  const autoContinues = /^max auto-continues reached \((\d+)\)$/.exec(reason)
+  if (autoContinues) return `已达到自动继续次数上限（${autoContinues[1]}）`
+  const duration = /^max duration reached \((\d+)s\)$/.exec(reason)
+  if (duration) return `已达到持续时间上限（${duration[1]} 秒）`
+  return reason
+}

@@ -1,4 +1,4 @@
-import type { GoalLocale } from "./i18n"
+import { presentGoalStatus, presentGoalStopReason, type GoalLocale } from "./i18n"
 import type { GoalSnapshot } from "./state"
 import { formatGoal } from "./state"
 
@@ -136,8 +136,8 @@ ${escapeXmlText(goal.objective)}
 预算：
 ${budgetLines(goal, locale)}
 
-状态：${goal.status}
-停止原因：${goal.stopReason ?? "已达到目标限制"}
+状态：${presentGoalStatus(goal.status, locale)}
+停止原因：${presentGoalStopReason(goal.stopReason ?? "goal limit reached", locale)}
 
 不要为此目标开始新的实质性工作。尽快结束本轮：使用简体中文总结有效进展，指出剩余工作或阻塞项，并给用户一个清晰的下一步。除非目标确实已经完成，否则不要调用 update_goal。`
   }

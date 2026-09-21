@@ -1,6 +1,7 @@
 import { expect, setSystemTime, spyOn, test } from "bun:test"
 import { testRender } from "@opentui/solid"
-import plugin, { formatDuration, goalStateFromSession, liveTimeUsedSeconds } from "../src/tui.ts"
+import plugin, { formatDuration, formatGoal, goalStateFromSession, liveTimeUsedSeconds } from "../src/tui.ts"
+import { messagesFor } from "../src/i18n"
 
 function goal(overrides: Partial<Parameters<typeof liveTimeUsedSeconds>[0]> = {}): Parameters<typeof liveTimeUsedSeconds>[0] {
   return {
@@ -204,6 +205,19 @@ test("formats goal durations for display", () => {
   expect(formatDuration(65)).toBe("1:05")
   expect(formatDuration(74305)).toBe("20:38:25")
   expect(formatDuration(-1)).toBe("0:00")
+})
+
+test("formats plugin-owned statuses and stop reasons for zh-CN presentation only", () => {
+  const formatted = formatGoal(
+    goal({ status: "paused", stopReason: "token budget reached (1200/1000)", objective: "Keep this user text unchanged" }),
+    messagesFor("zh-CN"),
+    "zh-CN",
+  )
+
+  expect(formatted).toContain("状态: 已暂停")
+  expect(formatted).toContain("停止原因: 已达到 Token 预算（1200/1000）")
+  expect(formatted).toContain("目标: Keep this user text unchanged")
+  expect(formatted).not.toContain("状态: paused")
 })
 
 test("keeps the last goal visible when a newer turn has no goal tool output", () => {

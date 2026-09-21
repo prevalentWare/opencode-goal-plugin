@@ -1302,6 +1302,22 @@ test("turn watchdog retries a busy active goal without consuming continuation bu
   expect(String(final)).toContain('"autoTurns": 0')
 })
 
+test("turn watchdog uses the configured zh-CN locale for its rescue prompt", async () => {
+  const calls: { body?: { parts?: { text?: string }[] } }[] = []
+  const hooks = await setupServer(
+    { client: { session: { promptAsync: async (input: unknown) => calls.push(input as { body?: { parts?: { text?: string }[] } }) } } } as never,
+    { auto_continue: false, locale: "zh-CN", max_turn_time: 0.02 },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "继续国际化" }, { sessionID: "ses_watchdog_zh", agent: "build" } as never)
+  await hooks.event!({ event: { type: "session.status", properties: { sessionID: "ses_watchdog_zh", status: { type: "busy" } } } as never })
+  await waitForContinuation(calls)
+
+  expect(calls[0]?.body?.parts?.[0]?.text).toContain("继续推进当前会话的活动目标")
+})
+
 test("turn watchdog resets when another busy turn starts", async () => {
   const calls: unknown[] = []
   const hooks = await setupServer(

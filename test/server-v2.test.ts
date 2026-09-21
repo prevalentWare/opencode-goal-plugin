@@ -1760,6 +1760,19 @@ test("V2 watchdog rescues a busy active goal without consuming auto-turn budgets
   await cleanup()
 })
 
+test("V2 watchdog uses the configured zh-CN locale for its rescue prompt", async () => {
+  const mock = makeMockContext({ auto_continue: false, locale: "zh-CN", max_turn_time: 0.02 })
+  const cleanup = await setupPlugin(mock as never)
+  await createGoalViaV2Tool(mock, "继续国际化")
+
+  mock.stream.push({ type: "session.status", created: Date.now(), data: { sessionID: "ses_v2", status: { type: "busy" } } })
+  await waitFor(() => mock.promptCalls.length === 1)
+
+  expect(JSON.stringify(mock.promptCalls[0])).toContain("继续推进当前会话的活动目标")
+  mock.stream.end()
+  await cleanup()
+})
+
 test("V2 non-transport prompt errors do not count toward the ceiling or retry", async () => {
   const mock = makeMockContext({ auto_continue: true, min_continue_interval_seconds: 0, max_prompt_failures: 3 })
   mock.session.prompt = async () => {

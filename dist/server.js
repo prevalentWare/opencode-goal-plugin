@@ -1360,6 +1360,54 @@ function resolveLocale(explicit, environment = processEnvironment(), osLocale = 
 function messagesFor(locale) {
   return locale === "zh-CN" ? ZH_CN_MESSAGES : EN_MESSAGES;
 }
+var STATUS_PRESENTATIONS = {
+  en: {
+    active: "active",
+    paused: "paused",
+    budgetLimited: "budget limited",
+    usageLimited: "usage limited",
+    complete: "complete",
+    unmet: "unmet"
+  },
+  "zh-CN": {
+    active: "\u8FDB\u884C\u4E2D",
+    paused: "\u5DF2\u6682\u505C",
+    budgetLimited: "\u9884\u7B97\u5DF2\u8FBE\u4E0A\u9650",
+    usageLimited: "\u4F7F\u7528\u91CF\u5DF2\u8FBE\u4E0A\u9650",
+    complete: "\u5DF2\u5B8C\u6210",
+    unmet: "\u672A\u8FBE\u6210"
+  }
+};
+function presentGoalStatus(status, locale) {
+  return STATUS_PRESENTATIONS[locale][status] ?? status;
+}
+function presentGoalStopReason(reason, locale) {
+  if (locale !== "zh-CN")
+    return reason;
+  const direct = {
+    paused: "\u5DF2\u6682\u505C",
+    blocked: "\u5DF2\u963B\u585E",
+    "plan mode": "Plan \u6A21\u5F0F",
+    "no progress": "\u65E0\u8FDB\u5C55",
+    "auto-continue failures": "\u81EA\u52A8\u7EE7\u7EED\u5931\u8D25",
+    "goal limit reached": "\u5DF2\u8FBE\u5230\u76EE\u6807\u9650\u5236",
+    "token budget reached": "\u5DF2\u8FBE\u5230 Token \u9884\u7B97",
+    "max auto-continues reached": "\u5DF2\u8FBE\u5230\u81EA\u52A8\u7EE7\u7EED\u6B21\u6570\u4E0A\u9650",
+    "max duration reached": "\u5DF2\u8FBE\u5230\u6301\u7EED\u65F6\u95F4\u4E0A\u9650"
+  };
+  if (direct[reason])
+    return direct[reason];
+  const tokenBudget = /^token budget reached \((\d+)\/(\d+)\)$/.exec(reason);
+  if (tokenBudget)
+    return `\u5DF2\u8FBE\u5230 Token \u9884\u7B97\uFF08${tokenBudget[1]}/${tokenBudget[2]}\uFF09`;
+  const autoContinues = /^max auto-continues reached \((\d+)\)$/.exec(reason);
+  if (autoContinues)
+    return `\u5DF2\u8FBE\u5230\u81EA\u52A8\u7EE7\u7EED\u6B21\u6570\u4E0A\u9650\uFF08${autoContinues[1]}\uFF09`;
+  const duration = /^max duration reached \((\d+)s\)$/.exec(reason);
+  if (duration)
+    return `\u5DF2\u8FBE\u5230\u6301\u7EED\u65F6\u95F4\u4E0A\u9650\uFF08${duration[1]} \u79D2\uFF09`;
+  return reason;
+}
 
 // src/prompts.ts
 function escapeXmlText(input) {
@@ -1490,8 +1538,8 @@ ${escapeXmlText(goal.objective)}
 \u9884\u7B97\uFF1A
 ${budgetLines(goal, locale)}
 
-\u72B6\u6001\uFF1A${goal.status}
-\u505C\u6B62\u539F\u56E0\uFF1A${goal.stopReason ?? "\u5DF2\u8FBE\u5230\u76EE\u6807\u9650\u5236"}
+\u72B6\u6001\uFF1A${presentGoalStatus(goal.status, locale)}
+\u505C\u6B62\u539F\u56E0\uFF1A${presentGoalStopReason(goal.stopReason ?? "goal limit reached", locale)}
 
 \u4E0D\u8981\u4E3A\u6B64\u76EE\u6807\u5F00\u59CB\u65B0\u7684\u5B9E\u8D28\u6027\u5DE5\u4F5C\u3002\u5C3D\u5FEB\u7ED3\u675F\u672C\u8F6E\uFF1A\u4F7F\u7528\u7B80\u4F53\u4E2D\u6587\u603B\u7ED3\u6709\u6548\u8FDB\u5C55\uFF0C\u6307\u51FA\u5269\u4F59\u5DE5\u4F5C\u6216\u963B\u585E\u9879\uFF0C\u5E76\u7ED9\u7528\u6237\u4E00\u4E2A\u6E05\u6670\u7684\u4E0B\u4E00\u6B65\u3002\u9664\u975E\u76EE\u6807\u786E\u5B9E\u5DF2\u7ECF\u5B8C\u6210\uFF0C\u5426\u5219\u4E0D\u8981\u8C03\u7528 update_goal\u3002`;
   }
@@ -2601,7 +2649,7 @@ var server = async ({ client }, options) => {
       activeContinuations.add(sessionID);
       claimedContinuation = true;
       watchdogRescuedSessions.add(sessionID);
-      await sendContinuation(client, sessionID, continuationPrompt(current), current.lastPromptAgent ?? latestTurnAgent ?? null);
+      await sendContinuation(client, sessionID, continuationPrompt(current, locale), current.lastPromptAgent ?? latestTurnAgent ?? null);
       await recordContinuationResult(sessionID, "success", maxPromptFailures, { armNoProgress: false, started: true });
       locallyDeliveredPendingSessions.add(sessionID);
       clearTurnWatchdog(sessionID);
@@ -3197,7 +3245,7 @@ async function setupV2(context) {
       activeContinuationsV2.add(sessionID);
       claimedContinuation = true;
       watchdogRescuedSessions.add(sessionID);
-      await sendContinuation(sessionID, continuationPrompt(current), current.lastPromptAgent ?? latestStep?.agent ?? null);
+      await sendContinuation(sessionID, continuationPrompt(current, locale), current.lastPromptAgent ?? latestStep?.agent ?? null);
       await recordContinuationResult(sessionID, "success", maxPromptFailures, { armNoProgress: false, started: true });
       locallyDeliveredPendingSessions.add(sessionID);
       clearTurnWatchdog(sessionID);
