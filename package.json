@@ -39,6 +39,7 @@
   "files": [
     "dist",
     "src/tui.ts",
+    "src/i18n.ts",
     "LICENSE",
     "README.md"
   ],

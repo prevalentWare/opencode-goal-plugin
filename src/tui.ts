@@ -3,6 +3,8 @@ import type { Plugin as TuiPluginV2 } from "@opencode/plugin/tui"
 import type { SessionMessageInfo } from "@opencode/client"
 import { createElement, insert, setProp } from "@opentui/solid"
 import { createEffect, createMemo, createSignal, onCleanup } from "solid-js"
+import type { GoalMessages } from "./i18n"
+import { messagesFor, presentGoalLastStatus, presentGoalStatus, presentGoalStopReason, resolveLocale } from "./i18n"
 
 type GoalCheckpoint = {
   summary: string
@@ -194,8 +196,13 @@ function currentSessionID(api: TuiPluginApi) {
   return typeof sessionID === "string" ? sessionID : undefined
 }
 
-function toast(api: TuiPluginApi, message: string, variant: "info" | "success" | "warning" | "error" = "info") {
-  api.ui.toast({ title: "Goal", message, variant, duration: 2500 })
+function toast(
+  api: TuiPluginApi,
+  messages: GoalMessages,
+  message: string,
+  variant: "info" | "success" | "warning" | "error" = "info",
+) {
+  api.ui.toast({ title: messages.tui.title, message, variant, duration: 2500 })
 }
 
 async function sendGoalPrompt(api: TuiPluginApi, sessionID: string, text: string) {
@@ -205,27 +212,35 @@ async function sendGoalPrompt(api: TuiPluginApi, sessionID: string, text: string
   })
 }
 
-function refreshGoalPrompt() {
-  return "Call get_goal for this session and report the current goal state briefly."
+function refreshGoalPrompt(messages: GoalMessages) {
+  return messages.tui.refreshPrompt
 }
 
-function clearGoalPrompt() {
-  return "Clear the current session goal by calling clear_goal. Report whether a goal was cleared."
+function clearGoalPrompt(messages: GoalMessages) {
+  return messages.tui.clearPrompt
 }
 
-function pauseGoalPrompt() {
-  return 'Pause the current session goal by calling update_goal_status with status "paused". Report the result briefly.'
+function pauseGoalPrompt(messages: GoalMessages) {
+  return messages.tui.pausePrompt
 }
 
-function resumeGoalPrompt() {
-  return 'Resume the current session goal by calling update_goal_status with status "active", then continue working toward it.'
+function resumeGoalPrompt(messages: GoalMessages) {
+  return messages.tui.resumePrompt
 }
 
-function historyGoalPrompt() {
-  return "Call get_goal_history for this session and report the current goal history briefly."
+function historyGoalPrompt(messages: GoalMessages) {
+  return messages.tui.historyPrompt
 }
 
-function actionOption(api: TuiPluginApi, sessionID: string, title: string, value: string, description: string, prompt: string) {
+function actionOption(
+  api: TuiPluginApi,
+  messages: GoalMessages,
+  sessionID: string,
+  title: string,
+  value: string,
+  description: string,
+  prompt: string,
+) {
   return {
     title,
     value,
@@ -233,25 +248,75 @@ function actionOption(api: TuiPluginApi, sessionID: string, title: string, value
     onSelect: () => {
       void sendGoalPrompt(api, sessionID, prompt)
         .then(() => api.ui.dialog.clear())
-        .catch((error) => toast(api, error instanceof Error ? error.message : String(error), "error"))
+        .catch((error) => toast(api, messages, error instanceof Error ? error.message : String(error), "error"))
     },
   }
 }
 
-function showSummary(api: TuiPluginApi, sessionID: string, goal: GoalSnapshot | null) {
+function showSummary(
+  api: TuiPluginApi,
+  messages: GoalMessages,
+  locale: ReturnType<typeof resolveLocale>,
+  sessionID: string,
+  goal: GoalSnapshot | null,
+) {
   const DialogSelect = api.ui.DialogSelect
   const options = [
-    actionOption(api, sessionID, "Refresh", "refresh", "Ask the agent to read the current goal state", refreshGoalPrompt()),
+    actionOption(
+      api,
+      messages,
+      sessionID,
+      messages.tui.refresh,
+      "refresh",
+      messages.tui.refreshDescription,
+      refreshGoalPrompt(messages),
+    ),
     ...(goal
       ? [
-          actionOption(api, sessionID, "History", "history", "Ask the agent to show lifecycle history", historyGoalPrompt()),
+          actionOption(
+            api,
+            messages,
+            sessionID,
+            messages.tui.history,
+            "history",
+            messages.tui.historyDescription,
+            historyGoalPrompt(messages),
+          ),
           ...(goal.status === "active"
-            ? [actionOption(api, sessionID, "Pause", "pause", "Pause auto-continuation without clearing", pauseGoalPrompt())]
+            ? [
+                actionOption(
+                  api,
+                  messages,
+                  sessionID,
+                  messages.tui.pause,
+                  "pause",
+                  messages.tui.pauseDescription,
+                  pauseGoalPrompt(messages),
+                ),
+              ]
             : []),
           ...(goal.status === "paused" || goal.status === "budgetLimited" || goal.status === "usageLimited"
-            ? [actionOption(api, sessionID, "Resume", "resume", "Resume the goal and continue", resumeGoalPrompt())]
+            ? [
+                actionOption(
+                  api,
+                  messages,
+                  sessionID,
+                  messages.tui.resume,
+                  "resume",
+                  messages.tui.resumeDescription,
+                  resumeGoalPrompt(messages),
+                ),
+              ]
             : []),
-          actionOption(api, sessionID, "Clear", "clear", "Ask the agent to clear this session goal", clearGoalPrompt()),
+          actionOption(
+            api,
+            messages,
+            sessionID,
+            messages.tui.clear,
+            "clear",
+            messages.tui.clearDescription,
+            clearGoalPrompt(messages),
+          ),
         ]
       : []),
   ]
@@ -259,8 +324,8 @@ function showSummary(api: TuiPluginApi, sessionID: string, goal: GoalSnapshot | 
   api.ui.dialog.setSize("large")
   api.ui.dialog.replace(() =>
     DialogSelect({
-      title: "Goal",
-      placeholder: formatGoal(goal),
+      title: messages.tui.title,
+      placeholder: formatGoal(goal, messages, locale),
       options,
       onSelect(option) {
         option.onSelect?.()
@@ -269,9 +334,9 @@ function showSummary(api: TuiPluginApi, sessionID: string, goal: GoalSnapshot | 
   )
 }
 
-function sessionIDOrToast(api: TuiPluginApi) {
+function sessionIDOrToast(api: TuiPluginApi, messages: GoalMessages) {
   const sessionID = currentSessionID(api)
-  if (!sessionID) toast(api, "Open a session before viewing goal state.", "warning")
+  if (!sessionID) toast(api, messages, messages.tui.openSession, "warning")
   return sessionID
 }
 
@@ -384,34 +449,37 @@ function goalFromSession(api: TuiPluginApi, sessionID: string) {
   return goalStateFromSession(api, sessionID).goal
 }
 
-function formatGoal(goal: GoalSnapshot | null) {
-  if (!goal) return "No recent goal state found in this session."
+export function formatGoal(goal: GoalSnapshot | null, messages: GoalMessages, locale: ReturnType<typeof resolveLocale>) {
+  if (!goal) return messages.tui.noGoal
   const lines = [
-    `Objective: ${goal.objective}`,
-    `Status: ${goal.status}`,
-    `Time used: ${formatDuration(goal.timeUsedSeconds)}`,
-    `Tokens: ${goal.tokensUsed}${goal.tokenBudget == null ? "" : `/${goal.tokenBudget}`}`,
-    `Auto-continues: ${goal.autoTurns}${goal.maxAutoTurns == null ? "" : `/${goal.maxAutoTurns}`}`,
+    `${messages.tui.objective}: ${goal.objective}`,
+    `${messages.tui.status}: ${presentGoalStatus(goal.status, locale)}`,
+    `${messages.tui.timeUsed}: ${formatDuration(goal.timeUsedSeconds)}`,
+    `${messages.tui.tokens}: ${goal.tokensUsed}${goal.tokenBudget == null ? "" : `/${goal.tokenBudget}`}`,
+    `${messages.tui.autoContinues}: ${goal.autoTurns}${goal.maxAutoTurns == null ? "" : `/${goal.maxAutoTurns}`}`,
   ]
-  if (goal.remainingTokens != null) lines.push(`Tokens remaining: ${goal.remainingTokens}`)
-  if (goal.maxDurationSeconds != null) lines.push(`Duration limit: ${formatDuration(goal.maxDurationSeconds)}`)
-  if (goal.noProgressTurns > 0) lines.push(`No-progress turns: ${goal.noProgressTurns}`)
-  if (goal.lastCheckpoint) lines.push(`Latest checkpoint: ${goal.lastCheckpoint.summary}`)
-  if (goal.stopReason) lines.push(`Stop reason: ${goal.stopReason}`)
-  if (goal.lastStatus) lines.push(`Last status: ${goal.lastStatus}`)
-  if (goal.completionEvidence) lines.push(`Completion evidence: ${goal.completionEvidence}`)
-  if (goal.blocker) lines.push(`Blocker: ${goal.blocker}`)
+  if (goal.remainingTokens != null) lines.push(`${messages.tui.tokensRemaining}: ${goal.remainingTokens}`)
+  if (goal.maxDurationSeconds != null) lines.push(`${messages.tui.durationLimit}: ${formatDuration(goal.maxDurationSeconds)}`)
+  if (goal.noProgressTurns > 0) lines.push(`${messages.tui.noProgressTurns}: ${goal.noProgressTurns}`)
+  if (goal.lastCheckpoint) lines.push(`${messages.tui.latestCheckpoint}: ${goal.lastCheckpoint.summary}`)
+  if (goal.stopReason) lines.push(`${messages.tui.stopReason}: ${presentGoalStopReason(goal.stopReason, locale)}`)
+  if (goal.lastStatus) lines.push(`${messages.tui.lastStatus}: ${presentGoalLastStatus(goal.lastStatus, locale)}`)
+  if (goal.completionEvidence) lines.push(`${messages.tui.completionEvidence}: ${goal.completionEvidence}`)
+  if (goal.blocker) lines.push(`${messages.tui.blocker}: ${presentGoalLastStatus(goal.blocker, locale)}`)
   return lines.join("\n")
 }
 
-function GoalSidebar(api: TuiPluginApi, sessionID: string) {
+function GoalSidebar(api: TuiPluginApi, messages: GoalMessages, locale: ReturnType<typeof resolveLocale>, sessionID: string) {
   const theme = api.theme.current
   const state = goalStateFromSession(api, sessionID)
   const goal = state.goal
   if (!goal) return null
   if (goal.status === "complete" || goal.status === "unmet") {
     const elapsed = liveTimeUsedSeconds(goal)
-    return text({ fg: goal.status === "complete" ? theme.primary : theme.textMuted }, [`${goal.status === "complete" ? "Goal achieved" : "Goal unmet"} (${formatDurationBadge(elapsed)})`])
+    const label = goal.status === "complete" ? messages.tui.achieved : messages.tui.unmet
+    return text({ fg: goal.status === "complete" ? theme.primary : theme.textMuted }, [
+      `${label} (${formatDurationBadge(elapsed)})`,
+    ])
   }
   const [nowSeconds, setNowSeconds] = createSignal(currentEpochSeconds())
   if (goal.status === "active") {
@@ -419,14 +487,22 @@ function GoalSidebar(api: TuiPluginApi, sessionID: string) {
     onCleanup(() => clearInterval(timer))
   }
   return box({}, [
-    text({ fg: theme.text }, ["Goal"]),
-    text({ fg: theme.textMuted }, [`Status: ${goal.status}`]),
-    text({ fg: theme.textMuted }, [() => `Time: ${formatDuration(liveTimeUsedSeconds(goal, nowSeconds()))}`]),
-    text({ fg: theme.textMuted }, [`Tokens: ${goal.tokensUsed}${goal.tokenBudget == null ? "" : `/${goal.tokenBudget}`}`]),
-    text({ fg: theme.textMuted }, [`Auto-continues: ${goal.autoTurns}${goal.maxAutoTurns == null ? "" : `/${goal.maxAutoTurns}`}`]),
-    ...(goal.lastCheckpoint ? [text({ fg: theme.textMuted }, [`Checkpoint: ${goal.lastCheckpoint.summary}`])] : []),
-    ...(goal.stopReason ? [text({ fg: theme.textMuted }, [`Stop: ${goal.stopReason}`])] : []),
-    ...(goal.lastStatus ? [text({ fg: theme.textMuted }, [goal.lastStatus])] : []),
+    text({ fg: theme.text }, [messages.tui.title]),
+    text({ fg: theme.textMuted }, [`${messages.tui.status}: ${presentGoalStatus(goal.status, locale)}`]),
+    text({ fg: theme.textMuted }, [() => `${messages.tui.time}: ${formatDuration(liveTimeUsedSeconds(goal, nowSeconds()))}`]),
+    text({ fg: theme.textMuted }, [
+      `${messages.tui.tokens}: ${goal.tokensUsed}${goal.tokenBudget == null ? "" : `/${goal.tokenBudget}`}`,
+    ]),
+    text({ fg: theme.textMuted }, [
+      `${messages.tui.autoContinues}: ${goal.autoTurns}${goal.maxAutoTurns == null ? "" : `/${goal.maxAutoTurns}`}`,
+    ]),
+    ...(goal.lastCheckpoint
+      ? [text({ fg: theme.textMuted }, [`${messages.tui.checkpoint}: ${goal.lastCheckpoint.summary}`])]
+      : []),
+    ...(goal.stopReason
+      ? [text({ fg: theme.textMuted }, [`${messages.tui.stop}: ${presentGoalStopReason(goal.stopReason, locale)}`])]
+      : []),
+    ...(goal.lastStatus ? [text({ fg: theme.textMuted }, [presentGoalLastStatus(goal.lastStatus, locale)])] : []),
     text({ fg: theme.textMuted }, [goal.objective]),
   ])
 }
@@ -452,25 +528,27 @@ function registerGoalCommand(api: TuiPluginApi, command: TuiCommand) {
   api.command?.register(() => [command])
 }
 
-const tui: TuiPlugin = async (api) => {
+const tui: TuiPlugin = async (api, options) => {
+  const locale = resolveLocale(typeof options?.locale === "string" ? options.locale : undefined)
+  const messages = messagesFor(locale)
   api.slots.register({
     order: 125,
     slots: {
       sidebar_content(_ctx, props) {
-        return GoalSidebar(api, props.session_id)
+        return GoalSidebar(api, messages, locale, props.session_id)
       },
     },
   })
 
   registerGoalCommand(api, {
-    title: "Goal",
+    title: messages.tui.title,
     value: "goal.show",
-    category: "Goal",
-    description: "View, pause, resume, or clear the long-running session goal",
+    category: messages.tui.title,
+    description: messages.tui.commandDescription,
     onSelect: () => {
-      const sessionID = sessionIDOrToast(api)
+      const sessionID = sessionIDOrToast(api, messages)
       if (!sessionID) return
-      showSummary(api, sessionID, goalFromSession(api, sessionID))
+      showSummary(api, messages, locale, sessionID, goalFromSession(api, sessionID))
     },
   })
 }
@@ -516,43 +594,63 @@ function currentSessionIDV2(api: TuiPluginV2.Context) {
   return route.sessionID
 }
 
-function toastV2(api: TuiPluginV2.Context, message: string, variant: "info" | "success" | "warning" | "error" = "info") {
-  api.ui.toast.show({ title: "Goal", message, variant, duration: 2500 })
+function toastV2(
+  api: TuiPluginV2.Context,
+  messages: GoalMessages,
+  message: string,
+  variant: "info" | "success" | "warning" | "error" = "info",
+) {
+  api.ui.toast.show({ title: messages.tui.title, message, variant, duration: 2500 })
 }
 
-async function showSummaryV2(api: TuiPluginV2.Context, sessionID: string, goal: GoalSnapshot | null) {
+async function showSummaryV2(
+  api: TuiPluginV2.Context,
+  messages: GoalMessages,
+  locale: ReturnType<typeof resolveLocale>,
+  sessionID: string,
+  goal: GoalSnapshot | null,
+) {
   const options = [
-    { title: "Refresh", value: "refresh", description: "Ask the agent to read the current goal state" },
+    { title: messages.tui.refresh, value: "refresh", description: messages.tui.refreshDescription },
     ...(goal
       ? [
-          { title: "History", value: "history", description: "Ask the agent to show lifecycle history" },
+          { title: messages.tui.history, value: "history", description: messages.tui.historyDescription },
           ...(goal.status === "active"
-            ? [{ title: "Pause", value: "pause", description: "Pause auto-continuation without clearing" }]
+            ? [{ title: messages.tui.pause, value: "pause", description: messages.tui.pauseDescription }]
             : []),
           ...(goal.status === "paused" || goal.status === "budgetLimited" || goal.status === "usageLimited"
-            ? [{ title: "Resume", value: "resume", description: "Resume the goal and continue" }]
+            ? [{ title: messages.tui.resume, value: "resume", description: messages.tui.resumeDescription }]
             : []),
-          { title: "Clear", value: "clear", description: "Ask the agent to clear this session goal" },
+          { title: messages.tui.clear, value: "clear", description: messages.tui.clearDescription },
         ]
       : []),
   ]
   api.ui.dialog.set({ size: "large" })
-  const selected = await api.ui.dialog.select({ title: "Goal", placeholder: formatGoal(goal), options })
-  const prompt = selected === "refresh" ? refreshGoalPrompt()
-    : selected === "history" ? historyGoalPrompt()
-    : selected === "pause" ? pauseGoalPrompt()
-    : selected === "resume" ? resumeGoalPrompt()
-    : selected === "clear" ? clearGoalPrompt()
+  const selected = await api.ui.dialog.select({
+    title: messages.tui.title,
+    placeholder: formatGoal(goal, messages, locale),
+    options,
+  })
+  const prompt = selected === "refresh" ? refreshGoalPrompt(messages)
+    : selected === "history" ? historyGoalPrompt(messages)
+    : selected === "pause" ? pauseGoalPrompt(messages)
+    : selected === "resume" ? resumeGoalPrompt(messages)
+    : selected === "clear" ? clearGoalPrompt(messages)
     : undefined
   if (!prompt) return
   try {
     await api.client.session.prompt({ sessionID, text: prompt })
   } catch (error) {
-    toastV2(api, error instanceof Error ? error.message : String(error), "error")
+    toastV2(api, messages, error instanceof Error ? error.message : String(error), "error")
   }
 }
 
-function GoalSidebarV2(api: TuiPluginV2.Context, sessionID: string) {
+function GoalSidebarV2(
+  api: TuiPluginV2.Context,
+  messages: GoalMessages,
+  locale: ReturnType<typeof resolveLocale>,
+  sessionID: string,
+) {
   const colors = goalColorsV2(api.theme)
   const [cache, setCache] = api.storage.memory<{ goal: GoalSnapshot | null }>(`goal-mode.v2.${sessionID}`, {
     initial: { goal: null },
@@ -579,40 +677,58 @@ function GoalSidebarV2(api: TuiPluginV2.Context, sessionID: string) {
     if (snapshot.status === "complete" || snapshot.status === "unmet") {
       const elapsed = liveTimeUsedSeconds(snapshot)
       return text({ fg: snapshot.status === "complete" ? colors.achieved : colors.muted }, [
-        `${snapshot.status === "complete" ? "Goal achieved" : "Goal unmet"} (${formatDurationBadge(elapsed)})`,
+        `${snapshot.status === "complete" ? messages.tui.achieved : messages.tui.unmet} (${formatDurationBadge(elapsed)})`,
       ])
     }
     return box({}, [
-      text({ fg: colors.text }, ["Goal"]),
-      text({ fg: colors.muted }, [`Status: ${snapshot.status}`]),
-      text({ fg: colors.muted }, [`Time: ${formatDuration(liveTimeUsedSeconds(snapshot, nowSeconds()))}`]),
-      text({ fg: colors.muted }, [`Tokens: ${snapshot.tokensUsed}${snapshot.tokenBudget == null ? "" : `/${snapshot.tokenBudget}`}`]),
-      text({ fg: colors.muted }, [`Auto-continues: ${snapshot.autoTurns}${snapshot.maxAutoTurns == null ? "" : `/${snapshot.maxAutoTurns}`}`]),
-      ...(snapshot.lastCheckpoint ? [text({ fg: colors.muted }, [`Checkpoint: ${snapshot.lastCheckpoint.summary}`])] : []),
-      ...(snapshot.stopReason ? [text({ fg: colors.muted }, [`Stop: ${snapshot.stopReason}`])] : []),
-      ...(snapshot.lastStatus ? [text({ fg: colors.muted }, [snapshot.lastStatus])] : []),
+      text({ fg: colors.text }, [messages.tui.title]),
+      text({ fg: colors.muted }, [`${messages.tui.status}: ${presentGoalStatus(snapshot.status, locale)}`]),
+      text({ fg: colors.muted }, [`${messages.tui.time}: ${formatDuration(liveTimeUsedSeconds(snapshot, nowSeconds()))}`]),
+      text({ fg: colors.muted }, [
+        `${messages.tui.tokens}: ${snapshot.tokensUsed}${snapshot.tokenBudget == null ? "" : `/${snapshot.tokenBudget}`}`,
+      ]),
+      text({ fg: colors.muted }, [
+        `${messages.tui.autoContinues}: ${snapshot.autoTurns}${
+          snapshot.maxAutoTurns == null ? "" : `/${snapshot.maxAutoTurns}`
+        }`,
+      ]),
+      ...(snapshot.lastCheckpoint
+        ? [text({ fg: colors.muted }, [`${messages.tui.checkpoint}: ${snapshot.lastCheckpoint.summary}`])]
+        : []),
+      ...(snapshot.stopReason
+        ? [
+            text(
+              { fg: colors.muted },
+              [`${messages.tui.stop}: ${presentGoalStopReason(snapshot.stopReason, locale)}`],
+            ),
+          ]
+        : []),
+      ...(snapshot.lastStatus
+        ? [text({ fg: colors.muted }, [presentGoalLastStatus(snapshot.lastStatus, locale)])]
+        : []),
       text({ fg: colors.muted }, [snapshot.objective]),
     ])
   }])
 }
 
-function GoalKeymapLayerV2(api: TuiPluginV2.Context) {
+function GoalKeymapLayerV2(api: TuiPluginV2.Context, messages: GoalMessages, locale: ReturnType<typeof resolveLocale>) {
   api.keymap.layer(() => ({
     mode: "global",
     commands: [
       {
         id: "goal.show",
-        title: "Goal",
-        description: "View, pause, resume, or clear the long-running session goal",
-        group: "Goal",
+        title: messages.tui.title,
+        description: messages.tui.commandDescription,
+        group: messages.tui.title,
         palette: true,
         run: () => {
           const sessionID = currentSessionIDV2(api)
           if (!sessionID) {
-            toastV2(api, "Open a session before viewing goal state.", "warning")
+            toastV2(api, messages, messages.tui.openSession, "warning")
             return
           }
-          void showSummaryV2(api, sessionID, goalFromV2Messages(api.data.session.message.list(sessionID)) ?? null)
+          const goal = goalFromV2Messages(api.data.session.message.list(sessionID)) ?? null
+          void showSummaryV2(api, messages, locale, sessionID, goal)
         },
       },
     ],
@@ -629,8 +745,12 @@ function GoalKeymapLayerV2(api: TuiPluginV2.Context) {
  * needs to dispose the two `ui.slot` registrations.
  */
 export function setupTuiV2(context: TuiPluginV2.Context): TuiPluginV2.Cleanup {
-  const offSidebar = registerSlotV2(context, "sidebar.content", (props) => GoalSidebarV2(context, props.sessionID))
-  const offApp = registerSlotV2(context, "app", () => GoalKeymapLayerV2(context))
+  const locale = resolveLocale(typeof context.options?.locale === "string" ? context.options.locale : undefined)
+  const messages = messagesFor(locale)
+  const offSidebar = registerSlotV2(context, "sidebar.content", (props) =>
+    GoalSidebarV2(context, messages, locale, props.sessionID),
+  )
+  const offApp = registerSlotV2(context, "app", () => GoalKeymapLayerV2(context, messages, locale))
   return () => {
     offSidebar()
     offApp()

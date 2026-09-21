@@ -440,6 +440,39 @@ test("V2 sidebar renders the parsed goal from session messages", async () => {
   }
 })
 
+
+test("V2 TUI uses zh-CN labels and palette text when locale is configured", async () => {
+  const { mock, slots, layers, setMessages } = makeMockContext({ options: { locale: "zh-CN" } })
+  const cleanup = setupTuiV2(mock as never)
+  const sidebar = slots.get("sidebar.content")
+  const app = slots.get("app")
+  setMessages([
+    assistantMessage("created", [
+      goalTool("create_goal", JSON.stringify({ goal: goal({ objective: "完成中文界面", status: "paused" }) })),
+    ]),
+  ])
+
+  const sidebarRender = await testRender(() => sidebar?.({ sessionID: "session" }) as never, { width: 80, height: 20 })
+  const appRender = await testRender(() => app?.({ sessionID: "" }) as never, { width: 80, height: 20 })
+  try {
+    await sidebarRender.renderOnce()
+    await appRender.renderOnce()
+    const frame = sidebarRender.captureCharFrame()
+    expect(frame).toContain("目标")
+    expect(frame).toContain("状态: 已暂停")
+    expect(frame).toContain("目标已设置。")
+    expect(frame).toContain("完成中文界面")
+
+    const command = layers[0]?.().commands?.find((candidate) => candidate.id === "goal.show")
+    expect(command?.title).toBe("目标")
+    expect(command?.description).toContain("查看、暂停、继续或清除")
+  } finally {
+    sidebarRender.renderer.destroy()
+    appRender.renderer.destroy()
+    cleanup()
+  }
+})
+
 test("V2 sidebar shows a completion badge for complete goals", async () => {
   const { mock, slots, setMessages } = makeMockContext()
   const cleanup = setupTuiV2(mock as never)
