@@ -459,7 +459,8 @@ test("V2 TUI uses zh-CN labels and palette text when locale is configured", asyn
     await appRender.renderOnce()
     const frame = sidebarRender.captureCharFrame()
     expect(frame).toContain("目标")
-    expect(frame).toContain("状态: paused")
+    expect(frame).toContain("状态: 已暂停")
+    expect(frame).toContain("目标已设置。")
     expect(frame).toContain("完成中文界面")
 
     const command = layers[0]?.().commands?.find((candidate) => candidate.id === "goal.show")

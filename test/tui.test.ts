@@ -209,15 +209,31 @@ test("formats goal durations for display", () => {
 
 test("formats plugin-owned statuses and stop reasons for zh-CN presentation only", () => {
   const formatted = formatGoal(
-    goal({ status: "paused", stopReason: "token budget reached (1200/1000)", objective: "Keep this user text unchanged" }),
+    goal({
+      status: "paused",
+      stopReason: "token budget reached (1200/1000)",
+      lastStatus: "Goal paused.",
+      blocker: "Auto-continue prompt failed repeatedly. Resume the goal to retry.",
+      objective: "Keep this user text unchanged",
+    }),
     messagesFor("zh-CN"),
     "zh-CN",
   )
 
   expect(formatted).toContain("状态: 已暂停")
   expect(formatted).toContain("停止原因: 已达到 Token 预算（1200/1000）")
+  expect(formatted).toContain("最近状态: 目标已暂停。")
+  expect(formatted).toContain("阻塞原因: 自动继续提示反复失败。请继续目标后重试。")
   expect(formatted).toContain("目标: Keep this user text unchanged")
   expect(formatted).not.toContain("状态: paused")
+})
+
+test("keeps unknown last-status and blocker text verbatim in zh-CN presentation", () => {
+  const userText = "Do not alter <user-authored status>"
+  const blocker = "Keep this user blocker unchanged"
+  const formatted = formatGoal(goal({ lastStatus: userText, blocker }), messagesFor("zh-CN"), "zh-CN")
+  expect(formatted).toContain(`最近状态: ${userText}`)
+  expect(formatted).toContain(`阻塞原因: ${blocker}`)
 })
 
 test("keeps the last goal visible when a newer turn has no goal tool output", () => {

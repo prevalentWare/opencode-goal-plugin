@@ -48,6 +48,7 @@ export type GoalMessages = {
     tokenUsage: string
     evidence: string
     blocker: string
+    seconds: string
   }
   tui: {
     title: string
@@ -98,19 +99,30 @@ const EN_MESSAGES: GoalMessages = {
   },
   tools: {
     getGoal:
-      "Get the current goal for this OpenCode session, including status, observed token usage, elapsed-time usage, budgets, checkpoints, and history.",
+      "Get the current goal for this OpenCode session, including status, observed token usage, elapsed-time usage, " +
+      "budgets, checkpoints, and history.",
     getGoalHistory: "Get the current goal lifecycle history and recent checkpoints for this OpenCode session.",
     listAllGoals:
-      "List up to 50 public goal summaries across all sessions in this state file, ordered by most recently updated first. Elapsed time is the last persisted value; total and truncated report omitted older goals.",
+      "List up to 50 public goal summaries across all sessions in this state file, ordered by most recently updated " +
+      "first. Elapsed time is the last persisted value; total and truncated report omitted older goals.",
     createGoal:
-      "Create a goal only when explicitly requested by the user or system/developer instructions; do not infer goals from ordinary tasks. If any non-closed goal exists, this returns the existing goal as either reused or conflicting and must not be retried. While the session is in Plan mode, the goal is recorded as paused and execution requires the user to switch to Build mode.",
+      "Create a goal only when explicitly requested by the user or system/developer instructions; do not infer goals " +
+      "from ordinary tasks. If any non-closed goal exists, this returns the existing goal as either reused or " +
+      "conflicting and must not be retried. While the session is in Plan mode, the goal is recorded as paused and " +
+      "execution requires the user to switch to Build mode.",
     setGoal:
-      "Set a new goal when the user explicitly asks the agent to formulate and set its own goal. The model should write the objective itself based on the user's explicit request. If any non-closed goal exists, this returns the existing goal as either reused or conflicting and must not be retried. While the session is in Plan mode, the goal is recorded as paused and execution requires the user to switch to Build mode.",
+      "Set a new goal when the user explicitly asks the agent to formulate and set its own goal. The model should " +
+      "write the objective itself based on the user's explicit request. If any non-closed goal exists, this returns " +
+      "the existing goal as either reused or conflicting and must not be retried. While the session is in Plan mode, " +
+      "the goal is recorded as paused and execution requires the user to switch to Build mode.",
     updateGoalObjective: "Edit the current OpenCode goal objective when the user explicitly asks to edit or replace it.",
     updateGoal:
-      "Close the existing goal only after an audit against real evidence. Use status complete only when the objective is achieved and no required work remains, and include evidence. Use status unmet only when the objective cannot be achieved or is blocked, and include the blocker. Do not close a goal merely because work is stopping.",
+      "Close the existing goal only after an audit against real evidence. Use status complete only when the objective " +
+      "is achieved and no required work remains, and include evidence. Use status unmet only when the objective " +
+      "cannot be achieved or is blocked, and include the blocker. Do not close a goal merely because work is stopping.",
     updateGoalStatus:
-      "Pause or resume the current OpenCode goal when the user explicitly asks to pause or resume it. Resuming is not allowed while the session is in Plan mode; the user must switch to Build mode first.",
+      "Pause or resume the current OpenCode goal when the user explicitly asks to pause or resume it. Resuming is not " +
+      "allowed while the session is in Plan mode; the user must switch to Build mode first.",
     clearGoal: "Clear the current OpenCode goal for this session when the user explicitly asks to clear it.",
     objective: "The concrete objective to start pursuing.",
     modelObjective: "The model-formulated concrete objective to start pursuing.",
@@ -126,17 +138,24 @@ const EN_MESSAGES: GoalMessages = {
   },
   notices: {
     planModeCreate:
-      'Goal recorded while the session is in Plan mode, so execution is paused. Do not start implementation work now. Ask the user to switch to Build mode and resume the goal (for example with "/goal resume") to begin execution.',
+      "Goal recorded while the session is in Plan mode, so execution is paused. Do not start implementation work " +
+      'now. Ask the user to switch to Build mode and resume the goal (for example with "/goal resume") to begin execution.',
     limitedGoal:
-      "Safety limit reached. Do not start or continue substantive work for this goal. Summarize useful progress, remaining work, and blockers, then wait for the user to resume or edit the goal.",
+      "Safety limit reached. Do not start or continue substantive work for this goal. Summarize useful progress, " +
+      "remaining work, and blockers, then wait for the user to resume or edit the goal.",
     duplicateGoal:
-      "This non-closed goal already exists. Do not call create_goal or set_goal again. The existing objective and limits were preserved; repeated-call arguments were not applied. Use the returned goal state and continue only when its status permits execution.",
+      "This non-closed goal already exists. Do not call create_goal or set_goal again. The existing objective and " +
+      "limits were preserved; repeated-call arguments were not applied. Use the returned goal state and continue only " +
+      "when its status permits execution.",
     conflictingGoal:
-      "A different non-closed goal already exists. Do not call create_goal or set_goal again. Report the conflict instead of replacing the goal; edit, clear, complete, or mark it unmet only when explicitly requested.",
+      "A different non-closed goal already exists. Do not call create_goal or set_goal again. Report the conflict " +
+      "instead of replacing the goal; edit, clear, complete, or mark it unmet only when explicitly requested.",
     restrictedGoal:
-      "Goal execution is not allowed from the current restricted agent or while the goal is paused for Plan mode. Switch to Build mode and resume the goal before doing substantive work.",
+      "Goal execution is not allowed from the current restricted agent or while the goal is paused for Plan mode. " +
+      "Switch to Build mode and resume the goal before doing substantive work.",
     cannotResumeInPlan:
-      "cannot resume the goal while the session is in Plan mode; ask the user to switch to Build mode and resume the goal from there",
+      "cannot resume the goal while the session is in Plan mode; ask the user to switch to Build mode and resume the " +
+      "goal from there",
   },
   reports: {
     achieved: "Goal achieved.",
@@ -145,6 +164,7 @@ const EN_MESSAGES: GoalMessages = {
     tokenUsage: "Token usage",
     evidence: "Evidence",
     blocker: "Blocker",
+    seconds: "seconds",
   },
   tui: {
     title: "Goal",
@@ -200,9 +220,13 @@ const ZH_CN_MESSAGES: GoalMessages = {
     listAllGoals:
       "列出此状态文件中所有会话里最近更新的最多 50 个公开目标摘要。已用时间采用最后一次持久化的值；total 和 truncated 字段用于说明是否省略了更早的目标。",
     createGoal:
-      "仅当用户或 system/developer 指令明确要求时创建目标，不要从普通任务中推断目标。如果已有未关闭目标，则返回该目标并标记为复用或冲突，不得重试。在 Plan 模式下创建目标时，目标会以暂停状态记录；用户切换到 Build 模式后才能执行。",
+      "仅当用户或 system/developer 指令明确要求时创建目标，不要从普通任务中推断目标。" +
+      "如果已有未关闭目标，则返回该目标并标记为复用或冲突，不得重试。" +
+      "在 Plan 模式下创建目标时，目标会以暂停状态记录；用户切换到 Build 模式后才能执行。",
     setGoal:
-      "仅当用户明确要求 Agent 自行制定并设置目标时创建新目标。模型应依据用户的明确请求自行撰写目标。如果已有未关闭目标，则返回该目标并标记为复用或冲突，不得重试。在 Plan 模式下创建目标时，目标会以暂停状态记录；用户切换到 Build 模式后才能执行。",
+      "仅当用户明确要求 Agent 自行制定并设置目标时创建新目标。模型应依据用户的明确请求自行撰写目标。" +
+      "如果已有未关闭目标，则返回该目标并标记为复用或冲突，不得重试。" +
+      "在 Plan 模式下创建目标时，目标会以暂停状态记录；用户切换到 Build 模式后才能执行。",
     updateGoalObjective: "仅当用户明确要求编辑或替换目标时，修改当前 OpenCode 目标的内容。",
     updateGoal:
       "只有在依据真实证据完成审计后才能关闭现有目标。仅当目标已经达成且没有剩余必需工作时使用 complete，并提供证据；仅当目标无法达成或被阻塞时使用 unmet，并提供阻塞原因。不要仅因为准备停止工作就关闭目标。",
@@ -241,6 +265,7 @@ const ZH_CN_MESSAGES: GoalMessages = {
     tokenUsage: "Token 使用量",
     evidence: "证据",
     blocker: "阻塞原因",
+    seconds: "秒",
   },
   tui: {
     title: "目标",
@@ -380,4 +405,128 @@ export function presentGoalStopReason(reason: string, locale: GoalLocale): strin
   const duration = /^max duration reached \((\d+)s\)$/.exec(reason)
   if (duration) return `已达到持续时间上限（${duration[1]} 秒）`
   return reason
+}
+
+/**
+ * Formats status text generated by this plugin. Unknown text can come from a
+ * user-authored blocker, checkpoint, or older plugin and stays byte-for-byte
+ * intact at the presentation boundary.
+ */
+export function presentGoalLastStatus(status: string, locale: GoalLocale): string {
+  if (locale !== "zh-CN") return status
+
+  const direct: Record<string, string> = {
+    "Goal set.": "目标已设置。",
+    "Goal recorded from Plan mode; execution paused until resumed from Build mode.":
+      "目标已在 Plan 模式下记录；执行已暂停，需在 Build 模式下继续。",
+    "Goal objective updated; execution paused while the session is in Plan mode.":
+      "目标内容已更新；会话处于 Plan 模式，因此执行已暂停。",
+    "Goal objective updated and resumed.": "目标内容已更新并继续执行。",
+    "Goal objective updated and paused.": "目标内容已更新并暂停。",
+    "Auto-continue paused while the session is in Plan mode.": "会话处于 Plan 模式，因此自动继续已暂停。",
+    "Goal resumed.": "目标已继续。",
+    "Goal paused.": "目标已暂停。",
+    "Goal completed.": "目标已完成。",
+    "Goal marked unmet.": "目标已标记为未达成。",
+    "Auto-continue attempt canceled before delivery.": "自动继续尝试已在发送前取消。",
+    "Auto-continue prompt sent.": "自动继续提示已发送。",
+    "Auto-continue prompt failed repeatedly. Resume the goal to retry.": "自动继续提示反复失败。请继续目标后重试。",
+    "Goal execution is paused while the session is in Plan mode. Switch to Build mode and resume the goal to continue.":
+      "会话处于 Plan 模式，因此目标执行已暂停。请切换到 Build 模式并继续目标。",
+  }
+  if (direct[status]) return direct[status]
+
+  const lowProgressPausePattern =
+    /^Auto-continue paused after (\d+) low-progress continuation turn\(s\)\. Resume the goal to retry\.$/
+  const lowProgressPause = lowProgressPausePattern.exec(status)
+  if (lowProgressPause) return `自动继续已在 ${lowProgressPause[1]} 个低进展轮次后暂停。请继续目标后重试。`
+
+  const lowProgress = /^Low-progress continuation turn detected \((\d+)\/(\d+|unbounded)\)\.$/.exec(status)
+  if (lowProgress) {
+    const limit = lowProgress[2] === "unbounded" ? "不限" : lowProgress[2]
+    return `检测到低进展的继续轮次（${lowProgress[1]}/${limit}）。`
+  }
+
+  const reserved = /^Auto-continue (\d+) reserved\.$/.exec(status)
+  if (reserved) return `已预留第 ${reserved[1]} 次自动继续。`
+  const failed = /^Auto-continue failed (\d+) time\(s\)\.$/.exec(status)
+  if (failed) return `自动继续已失败 ${failed[1]} 次。`
+  const pausedAfterFailures = /^Paused after (\d+) auto-continue failure\(s\)\.$/.exec(status)
+  if (pausedAfterFailures) return `已在 ${pausedAfterFailures[1]} 次自动继续失败后暂停。`
+
+  const wrapUp = /^(.*); wrap-up required\.$/.exec(status)
+  if (wrapUp) return `${presentGoalStopReason(wrapUp[1]!, locale)}；需要收尾。`
+  return status
+}
+
+const HISTORY_TYPE_PRESENTATIONS: Record<GoalLocale, Record<string, string>> = {
+  en: {},
+  "zh-CN": {
+    created: "已创建",
+    updated: "已更新",
+    paused: "已暂停",
+    resumed: "已继续",
+    completed: "已完成",
+    unmet: "未达成",
+    autoContinue: "自动继续",
+    checkpoint: "检查点",
+    warning: "警告",
+    limited: "已受限",
+    error: "错误",
+  },
+}
+
+export function presentGoalHistoryType(type: string, locale: GoalLocale): string {
+  return HISTORY_TYPE_PRESENTATIONS[locale][type] ?? type
+}
+
+/** Localizes only plugin-owned history framing and preserves embedded user text. */
+export function presentGoalHistoryDetail(detail: string, locale: GoalLocale): string {
+  if (locale !== "zh-CN") return detail
+  const lastStatus = presentGoalLastStatus(detail, locale)
+  if (lastStatus !== detail) return lastStatus
+
+  if (detail === "Goal set with default continuation limits.") return "目标已按默认继续限制设置。"
+  const objectiveUpdate = /^Goal objective updated: (.*)$/.exec(detail)
+  if (objectiveUpdate) return `目标内容已更新：${objectiveUpdate[1]}`
+
+  const configuredLimits = /^Goal set with (.*)\.$/.exec(detail)
+  if (configuredLimits) {
+    const limits = configuredLimits[1]!
+      .split(", ")
+      .map((value) => {
+        const tokenBudget = /^(\d+) token budget$/.exec(value)
+        if (tokenBudget) return `Token 预算 ${tokenBudget[1]}`
+        const autoContinues = /^(\d+) auto-continue limit$/.exec(value)
+        if (autoContinues) return `自动继续次数上限 ${autoContinues[1]}`
+        const duration = /^(\d+)s duration limit$/.exec(value)
+        if (duration) return `持续时间上限 ${duration[1]} 秒`
+        return value
+      })
+      .join("，")
+    return `目标已设置，限制为：${limits}。`
+  }
+
+  const finalHandoff = /^(\w+): (.*); requested final handoff\.$/.exec(detail)
+  if (finalHandoff) {
+    return `${presentGoalStatus(finalHandoff[1]!, locale)}：${presentGoalStopReason(finalHandoff[2]!, locale)}；已请求最终交接。`
+  }
+  return detail
+}
+
+type PresentableGoalHistory = {
+  history: Array<{ type: string; detail: string; timestamp: number }>
+}
+
+export function formatGoalHistoryPresentation(goal: PresentableGoalHistory | null, locale: GoalLocale): string {
+  if (!goal) return locale === "zh-CN" ? "此会话没有可用的目标历史。" : "No goal history is available for this session."
+  if (goal.history.length === 0) return locale === "zh-CN" ? "尚未记录目标历史。" : "No goal history recorded yet."
+  return goal.history
+    .map((entry) => {
+      const timestamp = new Date(entry.timestamp * 1000).toISOString()
+      const type = presentGoalHistoryType(entry.type, locale)
+      const detail = presentGoalHistoryDetail(entry.detail, locale)
+      return `- [${timestamp}] ${type}: ${detail}`
+    })
+    .join("\n")
 }
