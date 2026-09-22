@@ -178,7 +178,7 @@ Defaults:
 - `auto_continue`: `true`
 - `defer_while_tasks_active`: `true`; when enabled, goal auto-continuation waits for active OpenCode Task child sessions and their orchestrator reconciliation before sending the next goal prompt. A deferral re-checks child sessions on a short timer, so a goal deferred by a task never depends on a further idle event to resume.
 - `max_task_block_seconds`: `900`; wall-clock ceiling on how long a single Task child session may defer goal continuation. A child that stays listed but never reports a terminal state, or a terminal child whose result is never reconciled, stops blocking once the ceiling passes. Set a smaller value for shorter subagents, `0` to remove the ceiling, or disable deferral entirely with `defer_while_tasks_active: false`.
-- `max_auto_turns`: `25`
+- `max_auto_turns`: `25`; explicitly resuming a goal with `/goal resume` or `/resume_goal` after it reaches this limit starts a fresh auto-turn window. Token usage and elapsed-time usage are preserved.
 - `min_continue_interval_seconds`: `3`
 - Fast V2 executions that finish inside this interval schedule a delayed continuation; they do not require another user message to wake up.
 - `max_turn_time`: unset by default; set a positive number of seconds to retry one active-goal continuation prompt when a model turn remains busy for that long. Each new busy event resets the watchdog. Idle, built-in retry, session deletion, active Task children, and restricted agents suppress the retry. Watchdog retries are independent of `min_continue_interval_seconds` and never consume auto-turn or no-progress budgets, but recognized transport failures still count toward the `max_prompt_failures` ceiling.

@@ -35,6 +35,7 @@ test("zh-CN wrap-up and system prompts are localized", () => {
   expect(limited).not.toContain("状态：budgetLimited")
   expect(limited).not.toContain("停止原因：token budget reached")
   expect(limited).toContain("不要为此目标开始新的实质性工作")
+  expect(limited).toContain("不要调用 update_goal_status 来继续目标")
   expect(limited).toContain("update_goal")
 
   const reminder = systemReminder("zh-CN")

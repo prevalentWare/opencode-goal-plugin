@@ -140,7 +140,7 @@ ${budgetLines(goal, locale)}
 状态：${presentGoalStatus(goal.status, locale)}
 停止原因：${presentGoalStopReason(goal.stopReason ?? "goal limit reached", locale)}
 
-不要为此目标开始新的实质性工作。尽快结束本轮：使用简体中文总结有效进展，指出剩余工作或阻塞项，并给用户一个清晰的下一步。除非目标确实已经完成，否则不要调用 update_goal。`
+不要为此目标开始新的实质性工作。不要调用 update_goal_status 来继续目标；只有用户明确发出继续命令后才能继续。尽快结束本轮：使用简体中文总结有效进展，指出剩余工作或阻塞项，并给用户一个清晰的下一步。除非目标确实已经完成，否则不要调用 update_goal。`
   }
   return `The active session goal has reached a safety limit.
 
@@ -156,7 +156,7 @@ ${budgetLines(goal, locale)}
 Status: ${goal.status}
 Stop reason: ${goal.stopReason ?? "goal limit reached"}
 
-Do not start new substantive work for this goal. Wrap up this turn soon: summarize useful progress, identify remaining work or blockers, and leave the user with a clear next step. Do not call update_goal unless the goal is actually complete.`
+Do not start new substantive work for this goal. Do not call update_goal_status to resume it; only an explicit user resume command may continue the goal. Wrap up this turn soon: summarize useful progress, identify remaining work or blockers, and leave the user with a clear next step. Do not call update_goal unless the goal is actually complete.`
 }
 
 export function systemReminder(locale: GoalLocale = "en") {

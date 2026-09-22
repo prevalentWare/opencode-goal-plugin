@@ -146,6 +146,7 @@ const MAX_LISTED_GOALS = 50
 const CHECKPOINT_CHAR_LIMIT = 280
 const DEFAULT_NO_PROGRESS_TOKEN_THRESHOLD = 50
 const DEFAULT_MAX_NO_PROGRESS_TURNS = 2
+const MAX_AUTO_CONTINUES_STOP_REASON_PREFIX = "max auto-continues reached ("
 export const PLAN_MODE_STOP_REASON = "plan mode"
 export const PLAN_MODE_BLOCKER =
   "Goal execution is paused while the session is in Plan mode. Switch to Build mode and resume the goal to continue."
@@ -883,7 +884,12 @@ export async function pauseGoalForPlanMode(sessionID: string) {
   })
 }
 
-export async function setGoalStatus(sessionID: string, status: MutableGoalStatus, agent?: string | null) {
+export async function setGoalStatus(
+  sessionID: string,
+  status: MutableGoalStatus,
+  agent?: string | null,
+  options?: { resetAutoTurnLimit?: boolean },
+) {
   const agentValue = typeof agent === "string" && agent.trim() ? agent.trim() : null
   return mutate((state) => {
     const goal = state.goals[sessionID]
@@ -891,10 +897,16 @@ export async function setGoalStatus(sessionID: string, status: MutableGoalStatus
     if (isClosed(goal.status)) throw new Error("cannot update goal status because this goal is closed")
     if (goal.status === status) return snapshot(goal)
     if (status === "paused" && goal.status !== "active") return snapshot(goal)
+    const resumesAutoTurnLimit =
+      options?.resetAutoTurnLimit === true &&
+      status === "active" &&
+      goal.status === "usageLimited" &&
+      goal.stopReason?.startsWith(MAX_AUTO_CONTINUES_STOP_REASON_PREFIX) === true
     accountWallClock(goal)
     goal.status = status
     goal.updatedAt = nowSeconds()
     goal.lastAccountedAt = status === "active" ? goal.updatedAt : null
+    goal.autoTurns = resumesAutoTurnLimit ? 0 : goal.autoTurns
     goal.continuationFailures = status === "active" ? 0 : goal.continuationFailures
     goal.pendingAttempt = status === "active" ? null : goal.pendingAttempt
     goal.noProgressTurns = status === "active" ? 0 : goal.noProgressTurns
@@ -1328,7 +1340,7 @@ function maybeStopForUsageLimit(goal: Goal, defaultMaxAutoTurns: number, now = n
   if (effectiveMaxAutoTurns > 0 && goal.autoTurns >= effectiveMaxAutoTurns) {
     goal.status = "usageLimited"
     goal.lastAccountedAt = null
-    goal.stopReason = `max auto-continues reached (${effectiveMaxAutoTurns})`
+    goal.stopReason = `${MAX_AUTO_CONTINUES_STOP_REASON_PREFIX}${effectiveMaxAutoTurns})`
     goal.lastStatus = `${goal.stopReason}; wrap-up required.`
     pushHistory(goal, "limited", goal.lastStatus)
     return true

@@ -446,6 +446,34 @@ test("V2 setup registers /goal, /pause_goal, and /resume_goal via command transf
   await cleanup()
 })
 
+test("V2 only renews the auto-turn window after an explicit resume command", async () => {
+  const mock = makeMockContext({ auto_continue: false })
+  const cleanup = await setupPlugin(mock as never)
+  await goalTool(mock, "create_goal").execute(
+    { objective: "continue through another window", max_auto_turns: 1 },
+    toolContext("ses_resume_limit"),
+  )
+  await reserveContinuation("ses_resume_limit", 25, 0)
+  await reserveContinuation("ses_resume_limit", 25, 0)
+
+  const statusTool = goalTool(mock, "update_goal_status")
+  await statusTool.execute({ status: "active" }, toolContext("ses_resume_limit"))
+  expect((await getGoal("ses_resume_limit"))?.autoTurns).toBe(1)
+  await reserveContinuation("ses_resume_limit", 25, 0)
+  expect((await getGoal("ses_resume_limit"))?.status).toBe("usageLimited")
+
+  const resume = mock.commands.find((candidate) => candidate.name === "resume_goal")
+  await resume?.execute({ sessionID: "ses_resume_limit", prompt: { text: "" }, delivery: "steer" })
+  const resumePrompt = mock.promptCalls.at(-1)
+  if (!resumePrompt) throw new Error("expected resume command prompt")
+  await mock.hooks.prompt?.({ sessionID: "ses_resume_limit", prompt: resumePrompt })
+  await statusTool.execute({ status: "active" }, toolContext("ses_resume_limit"))
+  expect(await getGoal("ses_resume_limit")).toMatchObject({ status: "active", autoTurns: 0 })
+
+  mock.stream.end()
+  await cleanup()
+})
+
 test("V2 goal command XML-escapes delimiter breakouts while preserving objective text", async () => {
   const mock = makeMockContext({ auto_continue: false })
   const cleanup = await setupPlugin(mock as never)

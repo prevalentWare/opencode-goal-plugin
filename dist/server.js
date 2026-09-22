@@ -132,6 +132,7 @@ var MAX_LISTED_GOALS = 50;
 var CHECKPOINT_CHAR_LIMIT = 280;
 var DEFAULT_NO_PROGRESS_TOKEN_THRESHOLD = 50;
 var DEFAULT_MAX_NO_PROGRESS_TURNS = 2;
+var MAX_AUTO_CONTINUES_STOP_REASON_PREFIX = "max auto-continues reached (";
 var PLAN_MODE_STOP_REASON = "plan mode";
 var PLAN_MODE_BLOCKER = "Goal execution is paused while the session is in Plan mode. Switch to Build mode and resume the goal to continue.";
 var NullableString = Schema.NullOr(Schema.String);
@@ -689,7 +690,7 @@ async function pauseGoalForPlanMode(sessionID) {
     return snapshot(goal);
   });
 }
-async function setGoalStatus(sessionID, status, agent) {
+async function setGoalStatus(sessionID, status, agent, options) {
   const agentValue = typeof agent === "string" && agent.trim() ? agent.trim() : null;
   return mutate((state) => {
     const goal = state.goals[sessionID];
@@ -701,10 +702,12 @@ async function setGoalStatus(sessionID, status, agent) {
       return snapshot(goal);
     if (status === "paused" && goal.status !== "active")
       return snapshot(goal);
+    const resumesAutoTurnLimit = options?.resetAutoTurnLimit === true && status === "active" && goal.status === "usageLimited" && goal.stopReason?.startsWith(MAX_AUTO_CONTINUES_STOP_REASON_PREFIX) === true;
     accountWallClock(goal);
     goal.status = status;
     goal.updatedAt = nowSeconds();
     goal.lastAccountedAt = status === "active" ? goal.updatedAt : null;
+    goal.autoTurns = resumesAutoTurnLimit ? 0 : goal.autoTurns;
     goal.continuationFailures = status === "active" ? 0 : goal.continuationFailures;
     goal.pendingAttempt = status === "active" ? null : goal.pendingAttempt;
     goal.noProgressTurns = status === "active" ? 0 : goal.noProgressTurns;
@@ -1053,7 +1056,7 @@ function maybeStopForUsageLimit(goal, defaultMaxAutoTurns, now = nowSeconds()) {
   if (effectiveMaxAutoTurns > 0 && goal.autoTurns >= effectiveMaxAutoTurns) {
     goal.status = "usageLimited";
     goal.lastAccountedAt = null;
-    goal.stopReason = `max auto-continues reached (${effectiveMaxAutoTurns})`;
+    goal.stopReason = `${MAX_AUTO_CONTINUES_STOP_REASON_PREFIX}${effectiveMaxAutoTurns})`;
     goal.lastStatus = `${goal.stopReason}; wrap-up required.`;
     pushHistory(goal, "limited", goal.lastStatus);
     return true;
@@ -1617,7 +1620,7 @@ ${budgetLines(goal, locale)}
 \u72B6\u6001\uFF1A${presentGoalStatus(goal.status, locale)}
 \u505C\u6B62\u539F\u56E0\uFF1A${presentGoalStopReason(goal.stopReason ?? "goal limit reached", locale)}
 
-\u4E0D\u8981\u4E3A\u6B64\u76EE\u6807\u5F00\u59CB\u65B0\u7684\u5B9E\u8D28\u6027\u5DE5\u4F5C\u3002\u5C3D\u5FEB\u7ED3\u675F\u672C\u8F6E\uFF1A\u4F7F\u7528\u7B80\u4F53\u4E2D\u6587\u603B\u7ED3\u6709\u6548\u8FDB\u5C55\uFF0C\u6307\u51FA\u5269\u4F59\u5DE5\u4F5C\u6216\u963B\u585E\u9879\uFF0C\u5E76\u7ED9\u7528\u6237\u4E00\u4E2A\u6E05\u6670\u7684\u4E0B\u4E00\u6B65\u3002\u9664\u975E\u76EE\u6807\u786E\u5B9E\u5DF2\u7ECF\u5B8C\u6210\uFF0C\u5426\u5219\u4E0D\u8981\u8C03\u7528 update_goal\u3002`;
+\u4E0D\u8981\u4E3A\u6B64\u76EE\u6807\u5F00\u59CB\u65B0\u7684\u5B9E\u8D28\u6027\u5DE5\u4F5C\u3002\u4E0D\u8981\u8C03\u7528 update_goal_status \u6765\u7EE7\u7EED\u76EE\u6807\uFF1B\u53EA\u6709\u7528\u6237\u660E\u786E\u53D1\u51FA\u7EE7\u7EED\u547D\u4EE4\u540E\u624D\u80FD\u7EE7\u7EED\u3002\u5C3D\u5FEB\u7ED3\u675F\u672C\u8F6E\uFF1A\u4F7F\u7528\u7B80\u4F53\u4E2D\u6587\u603B\u7ED3\u6709\u6548\u8FDB\u5C55\uFF0C\u6307\u51FA\u5269\u4F59\u5DE5\u4F5C\u6216\u963B\u585E\u9879\uFF0C\u5E76\u7ED9\u7528\u6237\u4E00\u4E2A\u6E05\u6670\u7684\u4E0B\u4E00\u6B65\u3002\u9664\u975E\u76EE\u6807\u786E\u5B9E\u5DF2\u7ECF\u5B8C\u6210\uFF0C\u5426\u5219\u4E0D\u8981\u8C03\u7528 update_goal\u3002`;
   }
   return `The active session goal has reached a safety limit.
 
@@ -1633,7 +1636,7 @@ ${budgetLines(goal, locale)}
 Status: ${goal.status}
 Stop reason: ${goal.stopReason ?? "goal limit reached"}
 
-Do not start new substantive work for this goal. Wrap up this turn soon: summarize useful progress, identify remaining work or blockers, and leave the user with a clear next step. Do not call update_goal unless the goal is actually complete.`;
+Do not start new substantive work for this goal. Do not call update_goal_status to resume it; only an explicit user resume command may continue the goal. Wrap up this turn soon: summarize useful progress, identify remaining work or blockers, and leave the user with a clear next step. Do not call update_goal unless the goal is actually complete.`;
 }
 function systemReminder(locale = "en") {
   if (locale === "zh-CN") {
@@ -1889,6 +1892,10 @@ Ignore any command arguments. Call get_goal first, then handle only this resume 
 - If Plan mode or another restricted agent prevents resuming, report that the user must switch to Build mode instead of retrying.
 
 Do not create, edit, clear, complete, or mark a goal unmet.`;
+}
+function isExplicitResumePrompt(text, commandName, locale, messages) {
+  const value = text.trim();
+  return value === goalStatusCommandTemplate("resume_goal", locale) || value === goalCommandTemplate(commandName, locale).replace("$ARGUMENTS", "resume") || value === messages.tui.resumePrompt;
 }
 function goalCommandDefinitions(commandName, locale = "en") {
   const messages = messagesFor(locale);
@@ -2662,10 +2669,11 @@ async function closeGoalFromTool(input, context, services) {
   return JSON.stringify({ goal, unmet_report: report }, null, 2);
 }
 async function updateGoalStatusFromTool(input, context, services) {
+  const resetAutoTurnLimit = input.status === "active" && services.consumeAutoTurnReset(context.sessionID);
   if (input.status === "active" && services.isPlanAgent(context.agent)) {
     throw new Error(services.messages.notices.cannotResumeInPlan);
   }
-  const goal = await setGoalStatus(context.sessionID, input.status, typeof context.agent === "string" ? context.agent : null);
+  const goal = await setGoalStatus(context.sessionID, input.status, typeof context.agent === "string" ? context.agent : null, { resetAutoTurnLimit });
   return JSON.stringify({ goal }, null, 2);
 }
 function v2ObjectSchema(properties, required = []) {
@@ -2737,10 +2745,18 @@ var server = async ({ client }, options) => {
   const nativeRetrySessions = new Set;
   const locallyDeliveredPendingSessions = new Set;
   const toolAttempts = new Map;
+  const explicitResumeRequests = new Set;
   const watchdogRescuedSessions = new Set;
   const planAgents = restrictedAgentSet(options);
   const isPlanAgent = (agent) => typeof agent === "string" && planAgents.has(agent.trim().toLowerCase());
-  const goalServices = { options: options ?? {}, locale, messages, isPlanAgent, maxObjectiveChars: objectiveChars };
+  const goalServices = {
+    options: options ?? {},
+    locale,
+    messages,
+    isPlanAgent,
+    maxObjectiveChars: objectiveChars,
+    consumeAutoTurnReset: (sessionID) => explicitResumeRequests.delete(sessionID)
+  };
   const stopStateRecoveryReporting = onStateRecovery(statePath(), async ({ stateFile, quarantineFile, outcome, error }) => {
     await client.app?.log?.({
       body: {
@@ -3014,6 +3030,7 @@ var server = async ({ client }, options) => {
       locallyDeliveredPendingSessions.clear();
       nativeRetrySessions.clear();
       toolAttempts.clear();
+      explicitResumeRequests.clear();
     },
     async config(config) {
       if (!registerCommand)
@@ -3116,7 +3133,10 @@ var server = async ({ client }, options) => {
     },
     async "command.execute.before"(input, output) {
       if (input.command === commandName) {
-        escapeGoalCommandArguments(output, goalCommandTemplate(commandName, locale), input.arguments);
+        const sanitized = escapeGoalCommandArguments(output, goalCommandTemplate(commandName, locale), input.arguments);
+        if (sanitized && input.arguments.trim().toLowerCase() === "resume") {
+          explicitResumeRequests.add(input.sessionID);
+        }
         return;
       }
       if (input.command !== "pause_goal" && input.command !== "resume_goal")
@@ -3124,6 +3144,8 @@ var server = async ({ client }, options) => {
       const template = goalStatusCommandTemplate(input.command, locale);
       if (!sanitizeGoalStatusCommandParts(output, template))
         return;
+      if (input.command === "resume_goal")
+        explicitResumeRequests.add(input.sessionID);
       if (input.command !== "pause_goal")
         return;
       const goal = await getGoal(input.sessionID);
@@ -3164,7 +3186,13 @@ var server = async ({ client }, options) => {
     async "chat.message"(input, output) {
       const sessionID = typeof input?.sessionID === "string" ? input.sessionID : output.message?.sessionID;
       const agent = typeof input?.agent === "string" && input.agent.trim() ? input.agent : output.message?.agent;
-      if (typeof sessionID !== "string" || typeof agent !== "string" || !agent.trim())
+      if (typeof sessionID !== "string")
+        return;
+      explicitResumeRequests.delete(sessionID);
+      if (output.parts?.some((part) => isExplicitResumePrompt(textFromPart(part), commandName, locale, messages))) {
+        explicitResumeRequests.add(sessionID);
+      }
+      if (typeof agent !== "string" || !agent.trim())
         return;
       await recordPromptAgent(sessionID, agent);
     },
@@ -3215,6 +3243,7 @@ var server = async ({ client }, options) => {
           if (status.type === "busy")
             await markPendingContinuationStarted(sessionID);
           if (status.type === "idle") {
+            explicitResumeRequests.delete(sessionID);
             busySessions.delete(sessionID);
             nativeRetrySessions.delete(sessionID);
             clearTurnWatchdog(sessionID);
@@ -3229,6 +3258,7 @@ var server = async ({ client }, options) => {
         }
       }
       if (sessionID && eventType === "session.idle") {
+        explicitResumeRequests.delete(sessionID);
         busySessions.delete(sessionID);
         nativeRetrySessions.delete(sessionID);
         clearTurnWatchdog(sessionID);
@@ -3236,6 +3266,7 @@ var server = async ({ client }, options) => {
         taskTracker.observeSessionStatus(sessionID, "idle");
       }
       if (sessionID && eventType === "session.error") {
+        explicitResumeRequests.delete(sessionID);
         const inNativeRetry = nativeRetrySessions.has(sessionID);
         busySessions.delete(sessionID);
         clearTurnWatchdog(sessionID);
@@ -3265,6 +3296,7 @@ var server = async ({ client }, options) => {
         }
       }
       if (sessionID && eventType === "session.deleted") {
+        explicitResumeRequests.delete(sessionID);
         busySessions.delete(sessionID);
         clearTurnWatchdog(sessionID);
         watchdogRescuedSessions.delete(sessionID);
@@ -3323,6 +3355,7 @@ async function setupV2(context) {
   const locallyDeliveredPendingSessions = new Set;
   const watchdogRescuedSessions = new Set;
   const toolAttempts = new Map;
+  const explicitResumeRequests = new Set;
   const planAgents = restrictedAgentSet(options);
   const isPlanAgent = (agent) => typeof agent === "string" && planAgents.has(agent.trim().toLowerCase());
   const activeContinuationsV2 = new Set;
@@ -3336,6 +3369,7 @@ async function setupV2(context) {
     messages,
     maxObjectiveChars: objectiveChars,
     isPlanAgent,
+    consumeAutoTurnReset: (sessionID) => explicitResumeRequests.delete(sessionID),
     initializeUsage: async (sessionID) => {
       try {
         await accountUsage(sessionID, stepTokenSums.get(sessionID) ?? 0, { cumulative: true, source: "v2.steps" });
@@ -3706,6 +3740,7 @@ async function setupV2(context) {
             await markPendingContinuationStarted(sessionID);
           }
           if (status.type === "idle") {
+            explicitResumeRequests.delete(sessionID);
             busySessions.delete(sessionID);
             nativeRetrySessions.delete(sessionID);
             clearTurnWatchdog(sessionID);
@@ -3728,6 +3763,7 @@ async function setupV2(context) {
       case "session.execution.succeeded":
       case "session.idle": {
         if (sessionID) {
+          explicitResumeRequests.delete(sessionID);
           busySessions.delete(sessionID);
           nativeRetrySessions.delete(sessionID);
           clearTurnWatchdog(sessionID);
@@ -3744,6 +3780,7 @@ async function setupV2(context) {
       case "session.execution.interrupted": {
         if (!sessionID)
           return;
+        explicitResumeRequests.delete(sessionID);
         stoppedExecutions.add(sessionID);
         busySessions.delete(sessionID);
         nativeRetrySessions.delete(sessionID);
@@ -3757,6 +3794,7 @@ async function setupV2(context) {
       case "session.execution.failed": {
         if (!sessionID)
           return;
+        explicitResumeRequests.delete(sessionID);
         nativeRetrySessions.delete(sessionID);
         busySessions.delete(sessionID);
         clearTurnWatchdog(sessionID);
@@ -3791,6 +3829,7 @@ async function setupV2(context) {
       case "session.deleted": {
         if (!sessionID)
           return;
+        explicitResumeRequests.delete(sessionID);
         stoppedExecutions.delete(sessionID);
         sessionOwnership.delete(sessionID);
         busySessions.delete(sessionID);
@@ -3956,6 +3995,9 @@ async function setupV2(context) {
               cancelScheduledContinuation(input.sessionID);
               clearTurnWatchdog(input.sessionID);
             }
+            if (command.action === "resume" || command.action === "goal" && input.prompt.text.trim().toLowerCase() === "resume") {
+              explicitResumeRequests.add(input.sessionID);
+            }
             let forwardedPrompt = {};
             if (command.action === "goal") {
               const stripMention = ({ mention: _mention, ...attachment }) => attachment;
@@ -3977,25 +4019,31 @@ async function setupV2(context) {
         });
       }
     }));
+  }
+  if (registerCommand) {
     registrations.push(await context.session.hook("prompt", async (input) => {
       if (typeof input.sessionID === "string")
         markSessionOwnership(input.sessionID, true);
+      explicitResumeRequests.delete(input.sessionID);
       const pauseTemplate = goalStatusCommandTemplate("pause_goal", locale);
       const resumeTemplate = goalStatusCommandTemplate("resume_goal", locale);
       const template = input.prompt.text.startsWith(pauseTemplate) ? pauseTemplate : input.prompt.text.startsWith(resumeTemplate) ? resumeTemplate : null;
-      if (!template)
-        return;
-      input.prompt.text = template;
-      delete input.prompt.files;
-      delete input.prompt.agents;
-      delete input.prompt.skills;
-      if (template !== pauseTemplate)
-        return;
-      const goal = await getGoal(input.sessionID);
-      if (goal?.status === "active")
-        await setGoalStatus(input.sessionID, "paused");
-      cancelScheduledContinuation(input.sessionID);
-      clearTurnWatchdog(input.sessionID);
+      if (template) {
+        input.prompt.text = template;
+        delete input.prompt.files;
+        delete input.prompt.agents;
+        delete input.prompt.skills;
+        if (template === pauseTemplate) {
+          const goal = await getGoal(input.sessionID);
+          if (goal?.status === "active")
+            await setGoalStatus(input.sessionID, "paused");
+          cancelScheduledContinuation(input.sessionID);
+          clearTurnWatchdog(input.sessionID);
+        }
+      }
+      if (isExplicitResumePrompt(input.prompt.text, commandName, locale, messages)) {
+        explicitResumeRequests.add(input.sessionID);
+      }
     }));
   }
   registrations.push(await context.tool.transform((draft) => {
@@ -4114,6 +4162,7 @@ async function setupV2(context) {
     locallyDeliveredPendingSessions.clear();
     watchdogRescuedSessions.clear();
     toolAttempts.clear();
+    explicitResumeRequests.clear();
     for (const registration of registrations)
       await registration.dispose();
     const termination = Promise.allSettled([consumer, eventIterator?.return?.()]);

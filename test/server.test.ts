@@ -739,6 +739,58 @@ test("goal status tool pauses and resumes a goal", async () => {
   expect(String(resumed)).toContain('"lastStatus": "Goal resumed."')
 })
 
+test("only an explicit resume command resets the auto-turn counter", async () => {
+  const hooks = await setupServer(
+    {
+      client: {
+        session: {
+          promptAsync: async () => {},
+        },
+      },
+    } as never,
+    { auto_continue: false },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+
+  const context = { sessionID: "ses_resume_limit", agent: "build" } as never
+  await requireTool(tools.create_goal, "create_goal").execute(
+    { objective: "finish after another continuation window", max_auto_turns: 1 },
+    context,
+  )
+  await reserveContinuation("ses_resume_limit", 25, 0)
+  expect((await reserveContinuation("ses_resume_limit", 25, 0))?.status).toBe("usageLimited")
+
+  const genericResume = await requireTool(tools.update_goal_status, "update_goal_status").execute(
+    { status: "active" },
+    context,
+  )
+  expect(String(genericResume)).toContain('"autoTurns": 1')
+  expect((await reserveContinuation("ses_resume_limit", 25, 0))?.status).toBe("usageLimited")
+
+  const config = {} as { command?: Record<string, { template: string }> }
+  await hooks.config?.(config as never)
+  const goalTemplate = config.command?.goal?.template
+  if (!goalTemplate) throw new Error("expected goal command")
+  const resumeOutput = { parts: [{ type: "text", text: goalTemplate.replace("$ARGUMENTS", "resume") }] }
+  await hooks["command.execute.before"]?.(
+    { command: "goal", sessionID: "ses_resume_limit", arguments: "resume" },
+    resumeOutput as never,
+  )
+  await hooks["chat.message"]?.(
+    { sessionID: "ses_resume_limit", agent: "build" } as never,
+    { message: { sessionID: "ses_resume_limit", agent: "build" }, parts: resumeOutput.parts } as never,
+  )
+
+  const resumed = await requireTool(tools.update_goal_status, "update_goal_status").execute({ status: "active" }, context)
+  expect(String(resumed)).toContain('"status": "active"')
+  expect(String(resumed)).toContain('"autoTurns": 0')
+  expect((await reserveContinuation("ses_resume_limit", 25, 0))?.autoTurns).toBe(1)
+  await reserveContinuation("ses_resume_limit", 25, 0)
+  const repeated = await requireTool(tools.update_goal_status, "update_goal_status").execute({ status: "active" }, context)
+  expect(String(repeated)).toContain('"autoTurns": 1')
+})
+
 test("server plugin does not overwrite existing goal commands", async () => {
   const hooks = await setupServer(
     {
