@@ -270,6 +270,15 @@ Ignore any command arguments. Call get_goal first, then handle only this resume 
 Do not create, edit, clear, complete, or mark a goal unmet.`
 }
 
+function isExplicitResumePrompt(text: string, commandName: string, locale: GoalLocale, messages: GoalMessages) {
+  const value = text.trim()
+  return (
+    value === goalStatusCommandTemplate("resume_goal", locale) ||
+    value === goalCommandTemplate(commandName, locale).replace("$ARGUMENTS", "resume") ||
+    value === messages.tui.resumePrompt
+  )
+}
+
 type GoalCommandDefinition = {
   name: string
   description: string
@@ -1017,6 +1026,7 @@ type GoalServices = {
   messages: GoalMessages
   maxObjectiveChars: number
   isPlanAgent: (agent: unknown) => boolean
+  consumeAutoTurnReset: (sessionID: string) => boolean
   initializeUsage?: (sessionID: string) => Promise<void>
 }
 
@@ -1150,12 +1160,18 @@ async function updateGoalStatusFromTool(
   context: ToolExecContext,
   services: GoalServices,
 ) {
+  const resetAutoTurnLimit = input.status === "active" && services.consumeAutoTurnReset(context.sessionID)
   if (input.status === "active" && services.isPlanAgent(context.agent)) {
     throw new Error(
       services.messages.notices.cannotResumeInPlan,
     )
   }
-  const goal = await setGoalStatus(context.sessionID, input.status, typeof context.agent === "string" ? context.agent : null)
+  const goal = await setGoalStatus(
+    context.sessionID,
+    input.status,
+    typeof context.agent === "string" ? context.agent : null,
+    { resetAutoTurnLimit },
+  )
   return JSON.stringify({ goal }, null, 2)
 }
 
@@ -1260,13 +1276,21 @@ const server: Plugin = async ({ client }, options?: Options) => {
   // actually ran under. Entries are removed on execute.after, session deletion,
   // and dispose.
   const toolAttempts = new Map<string, string | null>()
+  const explicitResumeRequests = new Set<string>()
   // Sessions whose busy episode already received a watchdog rescue. Cleared
   // when the episode ends (idle/deleted), so each busy episode rescues at most
   // once and a rescue prompt cannot recursively re-arm the watchdog.
   const watchdogRescuedSessions = new Set<string>()
   const planAgents = restrictedAgentSet(options)
   const isPlanAgent = (agent: unknown) => typeof agent === "string" && planAgents.has(agent.trim().toLowerCase())
-  const goalServices: GoalServices = { options: options ?? {}, locale, messages, isPlanAgent, maxObjectiveChars: objectiveChars }
+  const goalServices: GoalServices = {
+    options: options ?? {},
+    locale,
+    messages,
+    isPlanAgent,
+    maxObjectiveChars: objectiveChars,
+    consumeAutoTurnReset: (sessionID) => explicitResumeRequests.delete(sessionID),
+  }
   const stopStateRecoveryReporting = onStateRecovery(statePath(), async ({ stateFile, quarantineFile, outcome, error }) => {
     await client.app?.log?.({
       body: {
@@ -1606,6 +1630,7 @@ const server: Plugin = async ({ client }, options?: Options) => {
       locallyDeliveredPendingSessions.clear()
       nativeRetrySessions.clear()
       toolAttempts.clear()
+      explicitResumeRequests.clear()
     },
     async config(config) {
       if (!registerCommand) return
@@ -1729,12 +1754,16 @@ const server: Plugin = async ({ client }, options?: Options) => {
     },
     async "command.execute.before"(input, output) {
       if (input.command === commandName) {
-        escapeGoalCommandArguments(output, goalCommandTemplate(commandName, locale), input.arguments)
+        const sanitized = escapeGoalCommandArguments(output, goalCommandTemplate(commandName, locale), input.arguments)
+        if (sanitized && input.arguments.trim().toLowerCase() === "resume") {
+          explicitResumeRequests.add(input.sessionID)
+        }
         return
       }
       if (input.command !== "pause_goal" && input.command !== "resume_goal") return
       const template = goalStatusCommandTemplate(input.command, locale)
       if (!sanitizeGoalStatusCommandParts(output, template)) return
+      if (input.command === "resume_goal") explicitResumeRequests.add(input.sessionID)
       if (input.command !== "pause_goal") return
       const goal = await getGoal(input.sessionID)
       if (goal?.status === "active") await setGoalStatus(input.sessionID, "paused")
@@ -1775,7 +1804,12 @@ const server: Plugin = async ({ client }, options?: Options) => {
     async "chat.message"(input, output) {
       const sessionID = typeof input?.sessionID === "string" ? input.sessionID : output.message?.sessionID
       const agent = typeof input?.agent === "string" && input.agent.trim() ? input.agent : output.message?.agent
-      if (typeof sessionID !== "string" || typeof agent !== "string" || !agent.trim()) return
+      if (typeof sessionID !== "string") return
+      explicitResumeRequests.delete(sessionID)
+      if (output.parts?.some((part) => isExplicitResumePrompt(textFromPart(part), commandName, locale, messages))) {
+        explicitResumeRequests.add(sessionID)
+      }
+      if (typeof agent !== "string" || !agent.trim()) return
       await recordPromptAgent(sessionID, agent)
     },
     async "experimental.chat.messages.transform"(input, output) {
@@ -1821,6 +1855,7 @@ const server: Plugin = async ({ client }, options?: Options) => {
           if (status.type === "busy") armTurnWatchdog(sessionID)
           if (status.type === "busy") await markPendingContinuationStarted(sessionID)
           if (status.type === "idle") {
+            explicitResumeRequests.delete(sessionID)
             busySessions.delete(sessionID)
             nativeRetrySessions.delete(sessionID)
             clearTurnWatchdog(sessionID)
@@ -1835,6 +1870,7 @@ const server: Plugin = async ({ client }, options?: Options) => {
         }
       }
       if (sessionID && eventType === "session.idle") {
+        explicitResumeRequests.delete(sessionID)
         busySessions.delete(sessionID)
         nativeRetrySessions.delete(sessionID)
         clearTurnWatchdog(sessionID)
@@ -1842,6 +1878,7 @@ const server: Plugin = async ({ client }, options?: Options) => {
         taskTracker.observeSessionStatus(sessionID, "idle")
       }
       if (sessionID && eventType === "session.error") {
+        explicitResumeRequests.delete(sessionID)
         const inNativeRetry = nativeRetrySessions.has(sessionID)
         busySessions.delete(sessionID)
         clearTurnWatchdog(sessionID)
@@ -1888,6 +1925,7 @@ const server: Plugin = async ({ client }, options?: Options) => {
         }
       }
       if (sessionID && eventType === "session.deleted") {
+        explicitResumeRequests.delete(sessionID)
         busySessions.delete(sessionID)
         clearTurnWatchdog(sessionID)
         watchdogRescuedSessions.delete(sessionID)
@@ -1953,6 +1991,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
   // See the V1 comment: pending-attempt id captured at tool-call start so a
   // delayed tool output cannot clear a newer pending attempt.
   const toolAttempts = new Map<string, string | null>()
+  const explicitResumeRequests = new Set<string>()
   const planAgents = restrictedAgentSet(options)
   const isPlanAgent = (agent: unknown) => typeof agent === "string" && planAgents.has(agent.trim().toLowerCase())
   const activeContinuationsV2 = new Set<string>()
@@ -1969,6 +2008,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
     messages,
     maxObjectiveChars: objectiveChars,
     isPlanAgent,
+    consumeAutoTurnReset: (sessionID) => explicitResumeRequests.delete(sessionID),
     initializeUsage: async (sessionID) => {
       try {
         await accountUsage(sessionID, stepTokenSums.get(sessionID) ?? 0, { cumulative: true, source: "v2.steps" })
@@ -2412,6 +2452,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
             await markPendingContinuationStarted(sessionID)
           }
           if (status.type === "idle") {
+            explicitResumeRequests.delete(sessionID)
             busySessions.delete(sessionID)
             nativeRetrySessions.delete(sessionID)
             clearTurnWatchdog(sessionID)
@@ -2439,6 +2480,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       case "session.execution.succeeded":
       case "session.idle": {
         if (sessionID) {
+          explicitResumeRequests.delete(sessionID)
           busySessions.delete(sessionID)
           nativeRetrySessions.delete(sessionID)
           clearTurnWatchdog(sessionID)
@@ -2455,6 +2497,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       }
       case "session.execution.interrupted": {
         if (!sessionID) return
+        explicitResumeRequests.delete(sessionID)
         stoppedExecutions.add(sessionID)
         busySessions.delete(sessionID)
         nativeRetrySessions.delete(sessionID)
@@ -2467,6 +2510,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       }
       case "session.execution.failed": {
         if (!sessionID) return
+        explicitResumeRequests.delete(sessionID)
         // execution.failed is emitted only after the host's retry episode has
         // ended, so the failure can still recover.
         nativeRetrySessions.delete(sessionID)
@@ -2514,6 +2558,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       }
       case "session.deleted": {
         if (!sessionID) return
+        explicitResumeRequests.delete(sessionID)
         stoppedExecutions.delete(sessionID)
         sessionOwnership.delete(sessionID)
         busySessions.delete(sessionID)
@@ -2670,6 +2715,12 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
                 cancelScheduledContinuation(input.sessionID)
                 clearTurnWatchdog(input.sessionID)
               }
+              if (
+                command.action === "resume" ||
+                (command.action === "goal" && input.prompt.text.trim().toLowerCase() === "resume")
+              ) {
+                explicitResumeRequests.add(input.sessionID)
+              }
               let forwardedPrompt: Partial<typeof input.prompt> = {}
               if (command.action === "goal") {
                 const stripMention = <T extends { mention?: unknown }>({ mention: _mention, ...attachment }: T) => attachment
@@ -2693,12 +2744,17 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       }),
     )
 
-    // V1-compatible config commands bypass V2 command executors, so enforce
-    // their lifecycle action again at the shared prompt-admission boundary.
+  }
+
+  if (registerCommand) {
+    // Keep the auto-turn reset behind an explicit user resume request. The
+    // status tool remains model-callable, but it cannot renew the safety limit
+    // unless this prompt-admission boundary grants one single-use reset.
     registrations.push(
       await context.session.hook("prompt", async (input) => {
         // Prompt hooks only fire in the session's owning location.
         if (typeof input.sessionID === "string") markSessionOwnership(input.sessionID, true)
+        explicitResumeRequests.delete(input.sessionID)
         const pauseTemplate = goalStatusCommandTemplate("pause_goal", locale)
         const resumeTemplate = goalStatusCommandTemplate("resume_goal", locale)
         const template = input.prompt.text.startsWith(pauseTemplate)
@@ -2706,16 +2762,21 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
           : input.prompt.text.startsWith(resumeTemplate)
             ? resumeTemplate
             : null
-        if (!template) return
-        input.prompt.text = template
-        delete input.prompt.files
-        delete input.prompt.agents
-        delete input.prompt.skills
-        if (template !== pauseTemplate) return
-        const goal = await getGoal(input.sessionID)
-        if (goal?.status === "active") await setGoalStatus(input.sessionID, "paused")
-        cancelScheduledContinuation(input.sessionID)
-        clearTurnWatchdog(input.sessionID)
+        if (template) {
+          input.prompt.text = template
+          delete input.prompt.files
+          delete input.prompt.agents
+          delete input.prompt.skills
+          if (template === pauseTemplate) {
+            const goal = await getGoal(input.sessionID)
+            if (goal?.status === "active") await setGoalStatus(input.sessionID, "paused")
+            cancelScheduledContinuation(input.sessionID)
+            clearTurnWatchdog(input.sessionID)
+          }
+        }
+        if (isExplicitResumePrompt(input.prompt.text, commandName, locale, messages)) {
+          explicitResumeRequests.add(input.sessionID)
+        }
       }),
     )
   }
@@ -2861,6 +2922,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
     locallyDeliveredPendingSessions.clear()
     watchdogRescuedSessions.clear()
     toolAttempts.clear()
+    explicitResumeRequests.clear()
     for (const registration of registrations) await registration.dispose()
     // Best-effort termination of the event consumer. Never block plugin
     // unload on a stream that does not close promptly.

@@ -357,6 +357,35 @@ test("reserves continuation until max auto turns is reached", async () => {
   expect((await getGoal("ses_1"))?.status).toBe("usageLimited")
 })
 
+test("resuming after the auto-turn limit starts a fresh continuation window", async () => {
+  await createGoal("ses_1", "continue", { maxAutoTurns: 2 })
+  expect((await reserveContinuation("ses_1", 25, 0))?.autoTurns).toBe(1)
+  expect((await reserveContinuation("ses_1", 25, 0))?.autoTurns).toBe(2)
+  expect((await reserveContinuation("ses_1", 25, 0))?.status).toBe("usageLimited")
+
+  const resumed = await setGoalStatus("ses_1", "active", null, { resetAutoTurnLimit: true })
+  expect(resumed).toMatchObject({
+    status: "active",
+    autoTurns: 0,
+    budgetWrapupSent: false,
+    stopReason: null,
+  })
+
+  expect((await reserveContinuation("ses_1", 25, 0))?.autoTurns).toBe(1)
+  expect((await reserveContinuation("ses_1", 25, 0))?.autoTurns).toBe(2)
+  expect((await reserveContinuation("ses_1", 25, 0))?.status).toBe("usageLimited")
+})
+
+test("a generic status update cannot renew the auto-turn limit", async () => {
+  await createGoal("ses_1", "continue", { maxAutoTurns: 1 })
+  await reserveContinuation("ses_1", 25, 0)
+  await reserveContinuation("ses_1", 25, 0)
+
+  const resumed = await setGoalStatus("ses_1", "active")
+  expect(resumed.autoTurns).toBe(1)
+  expect((await reserveContinuation("ses_1", 25, 0))?.status).toBe("usageLimited")
+})
+
 test("generic assistant observations record checkpoints but never pause the goal", async () => {
   await createGoal("ses_1", "continue", { noProgressTokenThreshold: 50, maxNoProgressTurns: 2 })
   const first = await recordAssistantProgress("ses_1", { messageID: "m1", text: "Inspected the repo", outputTokens: 10 })
