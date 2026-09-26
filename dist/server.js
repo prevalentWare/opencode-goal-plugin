@@ -4115,6 +4115,8 @@ async function setupV2(context) {
       if (item.status === "complete" || item.status === "unmet")
         continue;
       try {
+        if (!await ownsSession(item.sessionID))
+          continue;
         const transcript = await context.session.context({ sessionID: item.sessionID });
         if (disposed)
           return;
