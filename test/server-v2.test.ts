@@ -799,6 +799,30 @@ test("V2 rebuilds task deferral from session transcripts after a plugin restart"
   })
 })
 
+test("V2 only reads recovery transcripts for goals owned by the plugin location", async () => {
+  await createGoal("ses_local", "Recover the local task state")
+  await createGoal("ses_foreign", "Leave another project's transcript alone")
+  const location = { directory: "/work/current", workspaceID: "workspace-current" }
+  const mock = makeMockContext(
+    {},
+    [],
+    { ses_local: [], ses_foreign: [] },
+    location,
+    {
+      ses_local: { location },
+      ses_foreign: { location: { directory: "/work/other", workspaceID: "workspace-other" } },
+    },
+  )
+  const cleanup = await setupPlugin(mock as never)
+
+  await waitFor(() => mock.sessionGetCalls.includes("ses_local") && mock.sessionGetCalls.includes("ses_foreign"))
+  await waitFor(() => mock.contextCalls.includes("ses_local"))
+  expect(mock.contextCalls).toEqual(["ses_local"])
+
+  mock.stream.end()
+  await cleanup()
+})
+
 test("V2 continuation proceeds after restart when transcripts show no blocking tasks", async () => {
   await createGoal("ses_v2", "Verify continuation without recovered tasks")
   const mock = makeMockContext({}, [], { ses_v2: [] })

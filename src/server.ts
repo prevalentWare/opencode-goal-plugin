@@ -2868,8 +2868,11 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
 
   // Rebuild task-deferral state for goals that survived a plugin restart. The
   // plugin context exposes no live child-session query, so this replays each
-  // non-closed goal session's persisted transcript through the tracker. Best
-  // effort: unfetchable transcripts fall back to live-event observation only.
+  // locally owned, non-closed goal session's persisted transcript through the
+  // tracker. Every directory has its own plugin instance, so loading foreign
+  // transcripts here would make each new instance replay every open goal in
+  // the shared state file. Best effort: unresolvable or unfetchable sessions
+  // fall back to live-event observation only.
   // Continuation decisions await this recovery, so a settled lifecycle event
   // cannot slip past a pending transcript load.
   async function recoverTrackedTasks() {
@@ -2877,6 +2880,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       if (disposed) return
       if (item.status === "complete" || item.status === "unmet") continue
       try {
+        if (!(await ownsSession(item.sessionID))) continue
         const transcript = await context.session.context({ sessionID: item.sessionID })
         if (disposed) return
         taskTracker.recoverFromTranscript(item.sessionID, transcript)
