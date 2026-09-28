@@ -20,6 +20,8 @@ export type GoalMessages = {
     updateGoalObjective: string
     updateGoal: string
     updateGoalStatus: string
+    stopGoal: string
+    replaceGoal: string
     clearGoal: string
     objective: string
     modelObjective: string
@@ -123,7 +125,15 @@ const EN_MESSAGES: GoalMessages = {
     updateGoalStatus:
       "Pause or resume the current OpenCode goal when the user explicitly asks to pause or resume it. Resuming is not " +
       "allowed while the session is in Plan mode; the user must switch to Build mode first.",
-    clearGoal: "Clear the current OpenCode goal for this session when the user explicitly asks to clear it.",
+    stopGoal:
+      "Cancel the current OpenCode goal when the user explicitly asks to stop or cancel it. Cancellation is terminal " +
+      "and prevents further autonomous continuation while preserving the goal and its history.",
+    replaceGoal:
+      "Atomically cancel and archive the current goal, then create a new independent goal in the same session. Use only " +
+      "when the user explicitly asks to replace the goal.",
+    clearGoal:
+      "Detach the current OpenCode goal from this session when the user explicitly asks to clear it. The goal is " +
+      "archived instead of deleted; an active goal is cancelled before it is cleared.",
     objective: "The concrete objective to start pursuing.",
     modelObjective: "The model-formulated concrete objective to start pursuing.",
     updatedObjective: "The updated concrete objective.",
@@ -232,7 +242,9 @@ const ZH_CN_MESSAGES: GoalMessages = {
       "只有在依据真实证据完成审计后才能关闭现有目标。仅当目标已经达成且没有剩余必需工作时使用 complete，并提供证据；仅当目标无法达成或被阻塞时使用 unmet，并提供阻塞原因。不要仅因为准备停止工作就关闭目标。",
     updateGoalStatus:
       "仅当用户明确要求暂停或继续目标时，暂停或继续当前 OpenCode 目标。在 Plan 模式下不能继续目标；用户必须先切换到 Build 模式。",
-    clearGoal: "仅当用户明确要求清除目标时，清除当前 OpenCode 会话的目标。",
+    stopGoal: "仅当用户明确要求停止或取消目标时，取消当前 OpenCode 目标。取消是终态，会阻止后续自动继续，并保留目标及其历史。",
+    replaceGoal: "仅当用户明确要求替换目标时，原子地取消并归档当前目标，然后在同一会话中创建新的独立目标。",
+    clearGoal: "仅当用户明确要求清除目标时，将当前目标从会话中分离并归档；若目标仍在活动，会先取消再清除。",
     objective: "要开始执行的具体目标。",
     modelObjective: "由模型制定、要开始执行的具体目标。",
     updatedObjective: "更新后的具体目标。",
@@ -362,6 +374,7 @@ const STATUS_PRESENTATIONS: Record<GoalLocale, Record<string, string>> = {
     usageLimited: "usage limited",
     complete: "complete",
     unmet: "unmet",
+    cancelled: "cancelled",
   },
   "zh-CN": {
     active: "进行中",
@@ -370,6 +383,7 @@ const STATUS_PRESENTATIONS: Record<GoalLocale, Record<string, string>> = {
     usageLimited: "使用量已达上限",
     complete: "已完成",
     unmet: "未达成",
+    cancelled: "已取消",
   },
 }
 
@@ -388,6 +402,9 @@ export function presentGoalStopReason(reason: string, locale: GoalLocale): strin
   const direct: Record<string, string> = {
     paused: "已暂停",
     blocked: "已阻塞",
+    cancelled: "已取消",
+    cleared: "已清除",
+    replaced: "已替换",
     "plan mode": "Plan 模式",
     "no progress": "无进展",
     "auto-continue failures": "自动继续失败",
@@ -428,6 +445,8 @@ export function presentGoalLastStatus(status: string, locale: GoalLocale): strin
     "Goal paused.": "目标已暂停。",
     "Goal completed.": "目标已完成。",
     "Goal marked unmet.": "目标已标记为未达成。",
+    "Goal cancelled.": "目标已取消。",
+    "Goal cancelled because it was replaced.": "目标因被替换而取消。",
     "Auto-continue attempt canceled before delivery.": "自动继续尝试已在发送前取消。",
     "Auto-continue prompt sent.": "自动继续提示已发送。",
     "Auto-continue prompt failed repeatedly. Resume the goal to retry.": "自动继续提示反复失败。请继续目标后重试。",
@@ -468,6 +487,8 @@ const HISTORY_TYPE_PRESENTATIONS: Record<GoalLocale, Record<string, string>> = {
     resumed: "已继续",
     completed: "已完成",
     unmet: "未达成",
+    cancelled: "已取消",
+    cleared: "已清除",
     autoContinue: "自动继续",
     checkpoint: "检查点",
     warning: "警告",

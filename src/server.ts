@@ -7,12 +7,14 @@ import { z } from "zod"
 import type { GoalSnapshot, InternalGoalSnapshot, PendingAttempt } from "./state"
 import {
   accountUsage,
+  cancelGoal,
   clearGoal,
   completeGoal,
   createGoal,
   estimateTokensFromText,
   getAllGoals,
   getGoal,
+  getGoalHistory,
   getGoalInternal,
   markGoalUnmet,
   onStateRecovery,
@@ -24,6 +26,7 @@ import {
   recordToolProgress,
   markPendingContinuationStarted,
   reserveContinuation,
+  replaceGoal,
   rollbackContinuationAttempt,
   setGoalStatus,
   resolveMaxObjectiveChars,
@@ -157,7 +160,9 @@ $ARGUMENTS
 - 如果参数为空，调用 get_goal，并简要报告当前目标状态。
 - 如果参数是 "status"、"show" 或 "current"，调用 get_goal，并简要报告当前目标状态。
 - 如果参数是 "history"，调用 get_goal_history，并简要报告当前目标历史。
-- 如果参数是 "clear"、"stop"、"off"、"reset"、"none" 或 "cancel"，调用 clear_goal，并报告是否清除了目标。
+- 如果参数是 "stop" 或 "cancel"，调用 stop_goal，取消当前目标并报告结果。不要调用 clear_goal。
+- 如果参数是 "clear"、"off"、"reset" 或 "none"，调用 clear_goal，将当前目标归档并从活动会话中清除。
+- 如果参数以 "replace " 开头，调用 replace_goal，使用其后的完整文本原子地取消并归档当前目标，然后创建新目标。
 - 如果参数是 "pause"，调用 update_goal_status 并将 status 设为 "paused" 来暂停当前目标，然后报告结果。
 - 如果参数是 "resume"，调用 update_goal_status 并将 status 设为 "active" 来继续当前目标，然后继续推进目标。
 - 如果参数以 "edit " 开头，调用 update_goal_objective，使用其后的文本更新当前目标。
@@ -204,7 +209,9 @@ Use the goal tools to handle this command:
 - If the arguments are empty, call get_goal and briefly report the current goal state.
 - If the arguments are "status", "show", or "current", call get_goal and briefly report the current goal state.
 - If the arguments are "history", call get_goal_history and briefly report the current goal history.
-- If the arguments are "clear", "stop", "off", "reset", "none", or "cancel", call clear_goal and report whether a goal was cleared.
+- If the arguments are "stop" or "cancel", call stop_goal to cancel the current goal and report the result. Do not call clear_goal.
+- If the arguments are "clear", "off", "reset", or "none", call clear_goal to archive and detach the current goal.
+- If the arguments start with "replace ", call replace_goal with the complete remaining text to atomically cancel and archive the current goal, then create the new goal.
 - If the arguments are "pause", pause the current goal by calling update_goal_status with status "paused" and report the result.
 - If the arguments are "resume", resume the current goal by calling update_goal_status with status "active" and continue working toward it.
 - If the arguments start with "edit ", update the current goal objective by calling update_goal_objective with the remaining text.
@@ -1028,6 +1035,7 @@ type GoalServices = {
   isPlanAgent: (agent: unknown) => boolean
   consumeAutoTurnReset: (sessionID: string) => boolean
   initializeUsage?: (sessionID: string) => Promise<void>
+  stopAutonomy?: (sessionID: string, mode?: "stop" | "replace") => void
 }
 
 function boundedGoalTextSchema(limit: number, description: string, validate: (value: string) => string) {
@@ -1075,11 +1083,59 @@ async function createGoalFromTool(input: CreateGoalArgs, context: ToolExecContex
     throw error
   }
   await services.initializeUsage?.(context.sessionID)
+  if (goal.status === "active") services.stopAutonomy?.(context.sessionID, "replace")
   return JSON.stringify(planningOnly ? { goal, plan_mode_notice: services.messages.notices.planModeCreate } : { goal }, null, 2)
 }
 
-function isClosedGoal(goal: GoalSnapshot) {
-  return goal.status === "complete" || goal.status === "unmet"
+function isClosedGoal(goal: Pick<GoalSnapshot, "status">) {
+  return goal.status === "complete" || goal.status === "unmet" || goal.status === "cancelled"
+}
+
+async function stopGoalFromTool(context: ToolExecContext, services: GoalServices) {
+  const goal = await cancelGoal(context.sessionID)
+  services.stopAutonomy?.(context.sessionID)
+  return JSON.stringify({ goal, cancelled: goal?.status === "cancelled" }, null, 2)
+}
+
+async function clearGoalFromTool(context: ToolExecContext, services: GoalServices) {
+  const cleared = await clearGoal(context.sessionID)
+  services.stopAutonomy?.(context.sessionID)
+  return JSON.stringify({ goal: null, cleared }, null, 2)
+}
+
+async function replaceGoalFromTool(input: CreateGoalArgs, context: ToolExecContext, services: GoalServices) {
+  const planningOnly = services.isPlanAgent(context.agent)
+  const result = await replaceGoal(context.sessionID, input.objective, {
+    tokenBudget: input.token_budget ?? services.options.default_token_budget ?? null,
+    maxAutoTurns: input.max_auto_turns ?? null,
+    maxDurationSeconds: input.max_duration_seconds ?? services.options.max_goal_duration_seconds ?? null,
+    noProgressTokenThreshold: services.options.no_progress_token_threshold ?? null,
+    maxNoProgressTurns: services.options.max_no_progress_turns ?? null,
+    agent: typeof context.agent === "string" ? context.agent : null,
+    initialStatus: planningOnly ? "paused" : "active",
+    maxObjectiveChars: services.maxObjectiveChars,
+  })
+  services.stopAutonomy?.(context.sessionID, "replace")
+  await services.initializeUsage?.(context.sessionID)
+  return JSON.stringify(
+    planningOnly ? { ...result, plan_mode_notice: services.messages.notices.planModeCreate } : result,
+    null,
+    2,
+  )
+}
+
+function formatSessionGoalHistory(
+  history: Awaited<ReturnType<typeof getGoalHistory>>,
+  locale: GoalLocale,
+) {
+  const goals = [...history.previous, ...(history.current ? [history.current] : [])]
+  if (goals.length === 0) return formatGoalHistoryPresentation(null, locale)
+  return goals
+    .map(
+      (goal, index) =>
+        `Goal ${index + 1}: ${goal.objective}\nStatus: ${goal.status}\n${formatGoalHistoryPresentation(goal, locale)}`,
+    )
+    .join("\n\n")
 }
 
 // A task-block deferral re-arms a poll that records nothing on the goal, so it must not
@@ -1277,6 +1333,7 @@ const server: Plugin = async ({ client }, options?: Options) => {
   // and dispose.
   const toolAttempts = new Map<string, string | null>()
   const explicitResumeRequests = new Set<string>()
+  const restartAfterContinuation = new Set<string>()
   // Sessions whose busy episode already received a watchdog rescue. Cleared
   // when the episode ends (idle/deleted), so each busy episode rescues at most
   // once and a rescue prompt cannot recursively re-arm the watchdog.
@@ -1290,6 +1347,14 @@ const server: Plugin = async ({ client }, options?: Options) => {
     isPlanAgent,
     maxObjectiveChars: objectiveChars,
     consumeAutoTurnReset: (sessionID) => explicitResumeRequests.delete(sessionID),
+    stopAutonomy: (sessionID, mode = "stop") => {
+      cancelScheduledContinuation(sessionID)
+      if (mode === "stop") clearTurnWatchdog(sessionID)
+      taskDeferredSessions.delete(sessionID)
+      locallyDeliveredPendingSessions.delete(sessionID)
+      if (mode === "replace" && activeContinuations.has(sessionID)) restartAfterContinuation.add(sessionID)
+      else restartAfterContinuation.delete(sessionID)
+    },
   }
   const stopStateRecoveryReporting = onStateRecovery(statePath(), async ({ stateFile, quarantineFile, outcome, error }) => {
     await client.app?.log?.({
@@ -1340,6 +1405,7 @@ const server: Plugin = async ({ client }, options?: Options) => {
 
   async function runTurnWatchdog(sessionID: string, watchdog: TurnWatchdog) {
     let claimedContinuation = false
+    let claimedGoalID: string | undefined
     try {
       if (disposed) return
       if (
@@ -1369,6 +1435,7 @@ const server: Plugin = async ({ client }, options?: Options) => {
       turnWatchdogs.delete(sessionID)
       activeContinuations.add(sessionID)
       claimedContinuation = true
+      claimedGoalID = current.id
       watchdogRescuedSessions.add(sessionID)
       await sendContinuation(
         client,
@@ -1381,7 +1448,11 @@ const server: Plugin = async ({ client }, options?: Options) => {
       // never arms the no-progress evaluation. The rescue delivers while the
       // session is already inside a busy episode, so the pending attempt is
       // marked started immediately, and this busy episode rescues only once.
-      await recordContinuationResult(sessionID, "success", maxPromptFailures, { armNoProgress: false, started: true })
+      await recordContinuationResult(sessionID, "success", maxPromptFailures, {
+        armNoProgress: false,
+        started: true,
+        expectedGoalID: claimedGoalID,
+      })
       locallyDeliveredPendingSessions.add(sessionID)
       clearTurnWatchdog(sessionID)
     } catch (error) {
@@ -1390,7 +1461,7 @@ const server: Plugin = async ({ client }, options?: Options) => {
         // transport errors accumulate toward max_prompt_failures without
         // consuming auto-turn budgets.
         if (claimedContinuation && isTransportError(error)) {
-          await recordContinuationResult(sessionID, "failure", maxPromptFailures)
+          await recordContinuationResult(sessionID, "failure", maxPromptFailures, { expectedGoalID: claimedGoalID })
         }
         await client.app?.log?.({
           body: {
@@ -1404,7 +1475,12 @@ const server: Plugin = async ({ client }, options?: Options) => {
         return
       }
     } finally {
-      if (claimedContinuation) activeContinuations.delete(sessionID)
+      if (claimedContinuation) {
+        activeContinuations.delete(sessionID)
+        if (restartAfterContinuation.delete(sessionID) && !disposed && !busySessions.has(sessionID)) {
+          scheduleSettledContinuation(sessionID)
+        }
+      }
       if (turnWatchdogs.get(sessionID) === watchdog) turnWatchdogs.delete(sessionID)
     }
   }
@@ -1457,6 +1533,8 @@ const server: Plugin = async ({ client }, options?: Options) => {
     // Anchor for bounded-retry scheduling, declared at function scope so the
     // catch block can use it. Initialized to "now" as a safe default.
     let attemptReservedAt = Date.now()
+    let attemptGoalID: string | undefined
+    let attemptID: string | undefined
     try {
       const latestAssistant = await fetchLatestAssistant(client, sessionID)
       taskTracker.observeAssistantMessage(sessionID, latestAssistant)
@@ -1521,6 +1599,8 @@ const server: Plugin = async ({ client }, options?: Options) => {
         }
         const afterFailure = await recordContinuationResult(sessionID, "failure", maxPromptFailures, {
           requirePending: true,
+          expectedGoalID: current.id,
+          expectedAttemptID: attempt.id,
         })
         if (afterFailure) locallyDeliveredPendingSessions.delete(sessionID)
         if (autoContinue && afterFailure?.status === "active") {
@@ -1547,12 +1627,14 @@ const server: Plugin = async ({ client }, options?: Options) => {
       const goal = await reserveContinuation(sessionID, maxAutoTurns, minInterval)
       if (!goal) return
       attemptReservedAt = goal.pendingAttempt?.reservedAt ?? Date.now()
+      attemptGoalID = goal.id
+      attemptID = goal.pendingAttempt?.id
       if (nativeRetrySessions.has(sessionID)) {
-        await rollbackContinuationAttempt(sessionID)
+        await rollbackContinuationAttempt(sessionID, { goalID: attemptGoalID, attemptID })
         return
       }
       if (scheduled && scheduledContinuations.get(sessionID) !== scheduled) {
-        await rollbackContinuationAttempt(sessionID)
+        await rollbackContinuationAttempt(sessionID, { goalID: attemptGoalID, attemptID })
         return
       }
       await sendContinuation(
@@ -1564,17 +1646,19 @@ const server: Plugin = async ({ client }, options?: Options) => {
       if (disposed) {
         // The plugin was torn down while the prompt was in flight: roll the
         // reserved turn back instead of committing a continuation afterward.
-        await rollbackContinuationAttempt(sessionID)
+        await rollbackContinuationAttempt(sessionID, { goalID: attemptGoalID, attemptID })
         return
       }
       // Commit the delivered attempt. A busy that raced the resolution already
       // marked it started (started=true is preserved).
-      const delivered = await recordContinuationResult(sessionID, "success", maxPromptFailures)
+      const delivered = await recordContinuationResult(sessionID, "success", maxPromptFailures, {
+        expectedGoalID: attemptGoalID,
+      })
       locallyDeliveredPendingSessions.add(sessionID)
       if (!delivered?.pendingAttempt?.delivered) {
         // The attempt was not present at delivery time (e.g. disposed mid-send):
         // do not leave a phantom reserved turn.
-        await rollbackContinuationAttempt(sessionID)
+        await rollbackContinuationAttempt(sessionID, { goalID: attemptGoalID, attemptID })
       }
     } catch (error) {
       if (disposed) {
@@ -1582,14 +1666,17 @@ const server: Plugin = async ({ client }, options?: Options) => {
         // prompt then failed: the reserved attempt was never delivered, so
         // roll it back instead of counting a transport failure or consuming an
         // auto-turn.
-        await rollbackContinuationAttempt(sessionID)
+        await rollbackContinuationAttempt(sessionID, { goalID: attemptGoalID, attemptID })
         return
       }
       if (isTransportError(error)) {
         // A transport failure is a real attempt: count it toward the
         // max_prompt_failures ceiling and schedule a bounded retry at the
         // remaining minimum interval. Keep the reserved autoTurn consumed.
-        const afterFailure = await recordContinuationResult(sessionID, "failure", maxPromptFailures)
+        const afterFailure = await recordContinuationResult(sessionID, "failure", maxPromptFailures, {
+          expectedGoalID: attemptGoalID,
+          expectedAttemptID: attemptID,
+        })
         if (autoContinue && afterFailure?.status === "active") {
           scheduleSettledContinuation(
             sessionID,
@@ -1603,7 +1690,7 @@ const server: Plugin = async ({ client }, options?: Options) => {
         // transport or no-response failures: they do not increment the ceiling
         // or auto-retry. Roll back the unconsumed reserved turn so it does not
         // waste an auto-continue budget, and preserve useful error logging.
-        await rollbackContinuationAttempt(sessionID)
+        await rollbackContinuationAttempt(sessionID, { goalID: attemptGoalID, attemptID })
       }
       await client.app?.log?.({
         body: {
@@ -1615,6 +1702,9 @@ const server: Plugin = async ({ client }, options?: Options) => {
       })
     } finally {
       activeContinuations.delete(sessionID)
+      if (restartAfterContinuation.delete(sessionID) && !disposed && !busySessions.has(sessionID)) {
+        scheduleSettledContinuation(sessionID)
+      }
     }
   }
 
@@ -1649,8 +1739,16 @@ const server: Plugin = async ({ client }, options?: Options) => {
         description: messages.tools.getGoalHistory,
         args: {},
         async execute(_args, context) {
-          const goal = await getGoal(context.sessionID)
-          return JSON.stringify({ goal, history_report: formatGoalHistoryPresentation(goal, locale) }, null, 2)
+          const history = await getGoalHistory(context.sessionID)
+          return JSON.stringify(
+            {
+              goal: history.current,
+              previous_goals: history.previous,
+              history_report: formatSessionGoalHistory(history, locale),
+            },
+            null,
+            2,
+          )
         },
       },
       list_all_goals: {
@@ -1735,11 +1833,32 @@ const server: Plugin = async ({ client }, options?: Options) => {
           return updateGoalStatusFromTool(args as { status: "active" | "paused" }, context, goalServices)
         },
       },
+      stop_goal: {
+        description: messages.tools.stopGoal,
+        args: {},
+        async execute(_args, context) {
+          return stopGoalFromTool(context, goalServices)
+        },
+      },
+      replace_goal: {
+        description: messages.tools.replaceGoal,
+        args: {
+          objective: boundedGoalTextSchema(objectiveChars, messages.tools.objective, (value) =>
+            validateObjective(value, objectiveChars),
+          ),
+          token_budget: z.number().int().positive().nullable().optional().describe(messages.tools.tokenBudget),
+          max_auto_turns: z.number().int().positive().nullable().optional().describe(messages.tools.maxAutoTurns),
+          max_duration_seconds: z.number().int().positive().nullable().optional().describe(messages.tools.maxDurationSeconds),
+        },
+        async execute(args, context) {
+          return replaceGoalFromTool(args as CreateGoalArgs, context, goalServices)
+        },
+      },
       clear_goal: {
         description: messages.tools.clearGoal,
         args: {},
         async execute(_args, context) {
-          return JSON.stringify({ cleared: await clearGoal(context.sessionID) }, null, 2)
+          return clearGoalFromTool(context, goalServices)
         },
       },
     },
@@ -1995,6 +2114,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
   const planAgents = restrictedAgentSet(options)
   const isPlanAgent = (agent: unknown) => typeof agent === "string" && planAgents.has(agent.trim().toLowerCase())
   const activeContinuationsV2 = new Set<string>()
+  const restartAfterContinuation = new Set<string>()
   // Interruptions and terminal failures are not successful idle boundaries.
   // Keep legacy idle notifications and queued recovery from restarting them;
   // only a new execution started by the host may lift this local suppression.
@@ -2015,6 +2135,16 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       } catch (error) {
         v2ErrorLog("Failed to initialize goal usage accounting", error)
       }
+    },
+    stopAutonomy: (sessionID, mode = "stop") => {
+      cancelScheduledContinuation(sessionID)
+      if (mode === "stop") clearTurnWatchdog(sessionID)
+      taskDeferredSessions.delete(sessionID)
+      locallyDeliveredPendingSessions.delete(sessionID)
+      if (mode === "replace" && activeContinuationsV2.has(sessionID)) restartAfterContinuation.add(sessionID)
+      else restartAfterContinuation.delete(sessionID)
+      if (mode === "replace") stoppedExecutions.delete(sessionID)
+      else stoppedExecutions.add(sessionID)
     },
   }
   const registrations: Array<{ dispose(): Promise<void> }> = []
@@ -2063,6 +2193,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
 
   async function runTurnWatchdog(sessionID: string, watchdog: TurnWatchdog) {
     let claimedContinuation = false
+    let claimedGoalID: string | undefined
     try {
       if (disposed) return
       await taskRecoveryComplete
@@ -2083,13 +2214,18 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       turnWatchdogs.delete(sessionID)
       activeContinuationsV2.add(sessionID)
       claimedContinuation = true
+      claimedGoalID = current.id
       watchdogRescuedSessions.add(sessionID)
       await sendContinuation(sessionID, continuationPrompt(current, locale), current.lastPromptAgent ?? latestStep?.agent ?? null)
       // Watchdog rescues are untracked retries: a delivered prompt arms the
       // pending-continuation window but never consumes an auto-turn or
       // no-progress budget (armNoProgress: false). The rescue delivers while
       // already busy, so the pending attempt is marked started immediately.
-      await recordContinuationResult(sessionID, "success", maxPromptFailures, { armNoProgress: false, started: true })
+      await recordContinuationResult(sessionID, "success", maxPromptFailures, {
+        armNoProgress: false,
+        started: true,
+        expectedGoalID: claimedGoalID,
+      })
       locallyDeliveredPendingSessions.add(sessionID)
       clearTurnWatchdog(sessionID)
     } catch (error) {
@@ -2098,14 +2234,19 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
           // Watchdog rescues share the same prompt-failure ceiling: recognized
           // transport errors accumulate toward max_prompt_failures without
           // consuming auto-turn budgets.
-          await recordContinuationResult(sessionID, "failure", maxPromptFailures)
+          await recordContinuationResult(sessionID, "failure", maxPromptFailures, { expectedGoalID: claimedGoalID })
         }
         v2ErrorLog("Turn watchdog retry failed", error)
       } catch {
         return
       }
     } finally {
-      if (claimedContinuation) activeContinuationsV2.delete(sessionID)
+      if (claimedContinuation) {
+        activeContinuationsV2.delete(sessionID)
+        if (restartAfterContinuation.delete(sessionID) && !disposed && !busySessions.has(sessionID)) {
+          scheduleSettledContinuation(sessionID)
+        }
+      }
       if (turnWatchdogs.get(sessionID) === watchdog) turnWatchdogs.delete(sessionID)
     }
   }
@@ -2158,6 +2299,8 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
     if (disposed || stoppedExecutions.has(sessionID) || busySessions.has(sessionID)) return
     activeContinuationsV2.add(sessionID)
     let attemptReservedAt = Date.now()
+    let attemptGoalID: string | undefined
+    let attemptID: string | undefined
     try {
       const latestStep = latestStepBySession.get(sessionID)
       if (latestStep?.messageID) {
@@ -2232,6 +2375,8 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
         }
         const afterFailure = await recordContinuationResult(sessionID, "failure", maxPromptFailures, {
           requirePending: true,
+          expectedGoalID: current.id,
+          expectedAttemptID: attempt.id,
         })
         if (afterFailure) locallyDeliveredPendingSessions.delete(sessionID)
         if (autoContinue && afterFailure?.status === "active") {
@@ -2266,15 +2411,17 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
         return
       }
       attemptReservedAt = goal.pendingAttempt?.reservedAt ?? Date.now()
+      attemptGoalID = goal.id
+      attemptID = goal.pendingAttempt?.id
       if (nativeRetrySessions.has(sessionID)) {
-        await rollbackContinuationAttempt(sessionID)
+        await rollbackContinuationAttempt(sessionID, { goalID: attemptGoalID, attemptID })
         return
       }
       if (scheduled && scheduledContinuations.get(sessionID) !== scheduled) {
         // Ownership of the scheduled continuation was lost (replaced or
         // canceled) while we reserved: roll the reserved turn back so it does
         // not consume an auto-turn.
-        await rollbackContinuationAttempt(sessionID)
+        await rollbackContinuationAttempt(sessionID, { goalID: attemptGoalID, attemptID })
         return
       }
       await sendContinuation(
@@ -2283,27 +2430,32 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
         goal.lastPromptAgent ?? latestTurnAgent ?? null,
       )
       if (disposed) {
-        await rollbackContinuationAttempt(sessionID)
+        await rollbackContinuationAttempt(sessionID, { goalID: attemptGoalID, attemptID })
         return
       }
       // Delivery succeeded, so commit the attempt even if the timer that
       // started it was canceled while the prompt was in flight. Rolling back
       // here would refund an accepted prompt and allow a duplicate on idle.
-      const delivered = await recordContinuationResult(sessionID, "success", maxPromptFailures)
+      const delivered = await recordContinuationResult(sessionID, "success", maxPromptFailures, {
+        expectedGoalID: attemptGoalID,
+      })
       locallyDeliveredPendingSessions.add(sessionID)
       if (!delivered?.pendingAttempt?.delivered) {
-        await rollbackContinuationAttempt(sessionID)
+        await rollbackContinuationAttempt(sessionID, { goalID: attemptGoalID, attemptID })
       }
     } catch (error) {
       if (disposed) {
         // See the V1 catch block: torn down while the prompt was in flight, so
         // roll back the reserved undelivered attempt without counting a
         // transport failure or consuming an auto-turn.
-        await rollbackContinuationAttempt(sessionID)
+        await rollbackContinuationAttempt(sessionID, { goalID: attemptGoalID, attemptID })
         return
       }
       if (isTransportError(error)) {
-        const afterFailure = await recordContinuationResult(sessionID, "failure", maxPromptFailures)
+        const afterFailure = await recordContinuationResult(sessionID, "failure", maxPromptFailures, {
+          expectedGoalID: attemptGoalID,
+          expectedAttemptID: attemptID,
+        })
         if (autoContinue && afterFailure?.status === "active") {
           scheduleSettledContinuation(
             sessionID,
@@ -2313,11 +2465,14 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
           )
         }
       } else {
-        await rollbackContinuationAttempt(sessionID)
+        await rollbackContinuationAttempt(sessionID, { goalID: attemptGoalID, attemptID })
       }
       v2ErrorLog("Auto-continue failed", error)
     } finally {
       activeContinuationsV2.delete(sessionID)
+      if (restartAfterContinuation.delete(sessionID) && !disposed && !busySessions.has(sessionID)) {
+        scheduleSettledContinuation(sessionID)
+      }
     }
   }
 
@@ -2878,7 +3033,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
   async function recoverTrackedTasks() {
     for (const item of (await getAllGoals()).goals) {
       if (disposed) return
-      if (item.status === "complete" || item.status === "unmet") continue
+      if (isClosedGoal(item)) continue
       try {
         if (!(await ownsSession(item.sessionID))) continue
         const transcript = await context.session.context({ sessionID: item.sessionID })
@@ -2954,9 +3109,17 @@ function goalToolsV2(services: GoalServices): ToolV2Info[] {
       input: v2ObjectSchema({}),
       options: { codemode: false },
       execute: async (_args, toolContext) => {
-        const goal = await getGoal(toolContext.sessionID)
+        const history = await getGoalHistory(toolContext.sessionID)
         return {
-          content: JSON.stringify({ goal, history_report: formatGoalHistoryPresentation(goal, services.locale) }, null, 2),
+          content: JSON.stringify(
+            {
+              goal: history.current,
+              previous_goals: history.previous,
+              history_report: formatSessionGoalHistory(history, services.locale),
+            },
+            null,
+            2,
+          ),
         }
       },
     },
@@ -3068,12 +3231,38 @@ function goalToolsV2(services: GoalServices): ToolV2Info[] {
       }),
     },
     {
+      name: "stop_goal",
+      description: messages.tools.stopGoal,
+      input: v2ObjectSchema({}),
+      options: { codemode: false },
+      execute: async (_args, toolContext) => ({
+        content: await stopGoalFromTool(toolContext, services),
+      }),
+    },
+    {
+      name: "replace_goal",
+      description: messages.tools.replaceGoal,
+      input: v2ObjectSchema(
+        {
+          objective: v2GoalTextSchema(services.maxObjectiveChars, messages.tools.objective),
+          token_budget: { type: ["integer", "null"], minimum: 1, description: messages.tools.tokenBudget },
+          max_auto_turns: { type: ["integer", "null"], minimum: 1, description: messages.tools.maxAutoTurns },
+          max_duration_seconds: { type: ["integer", "null"], minimum: 1, description: messages.tools.maxDurationSeconds },
+        },
+        ["objective"],
+      ),
+      options: { codemode: false },
+      execute: async (args, toolContext) => ({
+        content: await replaceGoalFromTool(args as CreateGoalArgs, toolContext, services),
+      }),
+    },
+    {
       name: "clear_goal",
       description: messages.tools.clearGoal,
       input: v2ObjectSchema({}),
       options: { codemode: false },
       execute: async (_args, toolContext) => ({
-        content: JSON.stringify({ cleared: await clearGoal(toolContext.sessionID) }, null, 2),
+        content: await clearGoalFromTool(toolContext, services),
       }),
     },
   ]

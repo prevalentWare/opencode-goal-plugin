@@ -4,6 +4,7 @@ import { join } from "node:path"
 import { tmpdir } from "node:os"
 import {
   accountUsage,
+  cancelGoal,
   clearGoal,
   completeGoal,
   createGoal,
@@ -12,6 +13,7 @@ import {
   markPendingContinuationStarted,
   recordAssistantProgress,
   getGoal,
+  getGoalHistory,
   getGoalInternal,
   getGoalSync,
   markGoalUnmet,
@@ -20,6 +22,7 @@ import {
   recordPromptAgent,
   recordToolProgress,
   reserveContinuation,
+  replaceGoal,
   rollbackContinuationAttempt,
   setGoalStatus,
   updateGoalObjective,
@@ -56,6 +59,66 @@ test("creates, reads, pauses, resumes, completes, and clears a goal", async () =
   expect(completed.completionEvidence).toBe("tests passed")
   expect(await clearGoal("ses_1")).toBe(true)
   expect(await getGoal("ses_1")).toBeNull()
+})
+
+test("cancels, clears, and replaces goals while preserving per-session history", async () => {
+  await createGoal("ses_1", "first goal", null)
+  const cancelled = await cancelGoal("ses_1")
+  expect(cancelled).toMatchObject({ status: "cancelled", stopReason: "cancelled", closedAt: expect.any(Number) })
+  expect(await reserveContinuation("ses_1", 10, 0)).toBeNull()
+
+  const replacement = await replaceGoal("ses_1", "second goal", null)
+  expect(replacement.replaced).toMatchObject({ objective: "first goal", status: "cancelled" })
+  expect(replacement.goal).toMatchObject({ objective: "second goal", status: "active" })
+
+  expect(await clearGoal("ses_1")).toBe(true)
+  expect(await getGoal("ses_1")).toBeNull()
+  expect(await getGoalHistory("ses_1")).toMatchObject({
+    current: null,
+    previous: [
+      { objective: "first goal", status: "cancelled" },
+      { objective: "second goal", status: "cancelled", stopReason: "cleared" },
+    ],
+  })
+
+  const third = await createGoal("ses_1", "third goal", null)
+  expect(third.status).toBe("active")
+  expect((await getGoalHistory("ses_1")).previous).toHaveLength(2)
+})
+
+test("closed and cancelled goals cannot be edited or closed again", async () => {
+  await createGoal("ses_1", "do not reopen", null)
+  await cancelGoal("ses_1")
+
+  await expect(updateGoalObjective("ses_1", "reopened")).rejects.toThrow("goal is closed")
+  await expect(completeGoal("ses_1", "stale completion")).rejects.toThrow("already closed")
+  expect(await getGoal("ses_1")).toMatchObject({ objective: "do not reopen", status: "cancelled" })
+})
+
+test("archives compact goal state and writes version 2 after migrating version 1", async () => {
+  await writeFile(process.env.OPENCODE_GOAL_STATE_PATH!, JSON.stringify({ version: 1, goals: {} }), "utf8")
+  await createGoal("ses_1", "x".repeat(3_000), null)
+  await recordAssistantProgress("ses_1", { messageID: "message", text: "y".repeat(10_000), outputTokens: 100 })
+  await completeGoal("ses_1", "e".repeat(DEFAULT_MAX_OBJECTIVE_CHARS))
+  await clearGoal("ses_1")
+
+  const persisted = JSON.parse(await readFile(process.env.OPENCODE_GOAL_STATE_PATH!, "utf8")) as {
+    version: number
+    archives: Record<string, Array<Record<string, unknown>>>
+  }
+  expect(persisted.version).toBe(2)
+  expect(String(persisted.archives.ses_1?.[0]?.objective).length).toBeLessThanOrEqual(2_000)
+  expect(String(persisted.archives.ses_1?.[0]?.completionEvidence).length).toBeLessThanOrEqual(2_000)
+  expect(persisted.archives.ses_1?.[0]).not.toHaveProperty("lastAssistantText")
+  expect(persisted.archives.ses_1?.[0]).not.toHaveProperty("usageTrackers")
+  expect(persisted.archives.ses_1?.[0]).not.toHaveProperty("pendingAttempt")
+
+  persisted.archives.ses_1![0]!.completionEvidence = "z".repeat(5_000)
+  await writeFile(process.env.OPENCODE_GOAL_STATE_PATH!, JSON.stringify(persisted), "utf8")
+  expect((await getGoalHistory("ses_1")).previous[0]?.completionEvidence?.length).toBeLessThanOrEqual(2_000)
+  await accountUsage("missing")
+  const normalized = JSON.parse(await readFile(process.env.OPENCODE_GOAL_STATE_PATH!, "utf8")) as typeof persisted
+  expect(String(normalized.archives.ses_1?.[0]?.completionEvidence).length).toBeLessThanOrEqual(2_000)
 })
 
 test("status transitions are idempotent and cannot reopen closed goals", async () => {
@@ -617,7 +680,7 @@ test("creates and persists a goal from an empty state file", async () => {
   expect(created.objective).toBe("recover safely")
   expect((await getGoal("ses_1"))?.objective).toBe("recover safely")
   expect(JSON.parse(await readFile(process.env.OPENCODE_GOAL_STATE_PATH!, "utf8"))).toMatchObject({
-    version: 1,
+    version: 2,
     goals: { ses_1: { objective: "recover safely" } },
   })
   expect((await readdir(dir)).filter((name) => name.includes(".corrupt-"))).toEqual([])
@@ -932,6 +995,23 @@ test("rolling back a delivered attempt is a no-op and does not un-consume the tu
 
   expect(await rollbackContinuationAttempt("ses_1")).toBe(false)
   expect((await getGoal("ses_1"))?.autoTurns).toBe(1)
+})
+
+test("a replaced goal rejects stale continuation delivery and rollback", async () => {
+  await createGoal("ses_1", "old goal", null)
+  const reserved = await reserveContinuation("ses_1", 10, 0)
+  const identity = { goalID: reserved!.id, attemptID: reserved!.pendingAttempt!.id }
+
+  await replaceGoal("ses_1", "new goal", null)
+  expect(
+    await recordContinuationResult("ses_1", "success", 3, {
+      expectedGoalID: identity.goalID,
+      expectedAttemptID: identity.attemptID,
+    }),
+  ).toBeNull()
+  expect(await rollbackContinuationAttempt("ses_1", identity)).toBe(false)
+  expect(await getGoal("ses_1")).toMatchObject({ objective: "new goal", autoTurns: 0 })
+  expect((await getGoalInternal("ses_1"))?.pendingAttempt).toBeNull()
 })
 
 test("delayed prior-turn assistant output cannot clear a newer pending attempt", async () => {

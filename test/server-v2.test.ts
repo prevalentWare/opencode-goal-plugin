@@ -3,7 +3,7 @@ import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import plugin from "../src/server"
-import { createGoal, getGoal, getGoalInternal, recordContinuationResult, reserveContinuation } from "../src/state"
+import { cancelGoal, createGoal, getGoal, getGoalInternal, recordContinuationResult, reserveContinuation } from "../src/state"
 
 const TOOL_NAMES = [
   "clear_goal",
@@ -11,7 +11,9 @@ const TOOL_NAMES = [
   "get_goal",
   "get_goal_history",
   "list_all_goals",
+  "replace_goal",
   "set_goal",
+  "stop_goal",
   "update_goal",
   "update_goal_objective",
   "update_goal_status",
@@ -312,6 +314,90 @@ test("V2 setup registers goal tools with JSON Schema inputs, codemode:false, and
   mock.stream.end()
   await cleanup()
   expect(mock.promptCalls).toHaveLength(0)
+})
+
+test("V2 stop, replace, clear, and history tools preserve prior goals", async () => {
+  const mock = makeMockContext({ auto_continue: false })
+  const cleanup = await setupPlugin(mock as never)
+  await createGoalViaV2Tool(mock, "first")
+
+  expect(contentOf(await goalTool(mock, "stop_goal").execute({}, toolContext()))).toContain('"status": "cancelled"')
+  expect(contentOf(await goalTool(mock, "replace_goal").execute({ objective: "second" }, toolContext()))).toContain(
+    '"objective": "second"',
+  )
+  await goalTool(mock, "clear_goal").execute({}, toolContext())
+  const history = JSON.parse(contentOf(await goalTool(mock, "get_goal_history").execute({}, toolContext())))
+  expect(history.goal).toBeNull()
+  expect(history.previous_goals.map((goal: { objective: string }) => goal.objective)).toEqual(["first", "second"])
+
+  mock.stream.end()
+  await cleanup()
+})
+
+test("V2 replacement continues the new goal after the command execution settles", async () => {
+  const mock = makeMockContext({ auto_continue: true, min_continue_interval_seconds: 0 })
+  const cleanup = await setupPlugin(mock as never)
+  await createGoalViaV2Tool(mock, "old objective")
+  await goalTool(mock, "replace_goal").execute({ objective: "new objective" }, toolContext())
+
+  await mock.stream.push({ type: "session.execution.succeeded", created: Date.now(), data: { sessionID: "ses_v2" } })
+  await waitFor(() => mock.promptCalls.length === 1)
+  expect(mock.promptCalls[0]?.text).toContain("new objective")
+
+  mock.stream.end()
+  await cleanup()
+})
+
+for (const action of ["stop_goal", "clear_goal"] as const) {
+  test(`V2 create_goal after ${action} clears session-level continuation suppression`, async () => {
+    const mock = makeMockContext({ auto_continue: true, min_continue_interval_seconds: 0 })
+    const cleanup = await setupPlugin(mock as never)
+    const context = toolContext(`ses_${action}`)
+    await goalTool(mock, "create_goal").execute({ objective: "old" }, context)
+    await goalTool(mock, action).execute({}, context)
+    await goalTool(mock, "create_goal").execute({ objective: "new" }, context)
+
+    await mock.stream.push({
+      type: "session.execution.succeeded",
+      created: Date.now(),
+      data: { sessionID: `ses_${action}` },
+    })
+    await waitFor(() => mock.promptCalls.length === 1)
+    expect(mock.promptCalls[0]?.text).toContain("new")
+
+    mock.stream.end()
+    await cleanup()
+  })
+}
+
+test("V2 replacement during an in-flight continuation cannot mutate or overlap the new goal", async () => {
+  let resolveFirstPrompt: (() => void) | undefined
+  let firstPrompt = true
+  const mock = makeMockContext({ auto_continue: true, min_continue_interval_seconds: 0 })
+  mock.session.prompt = async (input) => {
+    mock.promptCalls.push(input)
+    if (!firstPrompt) return { id: "next" }
+    firstPrompt = false
+    await new Promise<void>((resolve) => {
+      resolveFirstPrompt = resolve
+    })
+    return { id: "old" }
+  }
+  const cleanup = await setupPlugin(mock as never)
+  await createGoalViaV2Tool(mock, "old objective")
+  void mock.stream.push({ type: "session.idle", created: 1, data: { sessionID: "ses_v2" } })
+  await waitFor(() => mock.promptCalls.length === 1)
+
+  await goalTool(mock, "replace_goal").execute({ objective: "new objective" }, toolContext())
+  expect(mock.promptCalls).toHaveLength(1)
+  resolveFirstPrompt?.()
+
+  await waitFor(() => mock.promptCalls.length === 2)
+  expect(mock.promptCalls[1]?.text).toContain("new objective")
+  expect(await getGoal("ses_v2")).toMatchObject({ objective: "new objective", autoTurns: 1 })
+
+  mock.stream.end()
+  await cleanup()
 })
 
 test("V2 list_all_goals returns goals from other sessions", async () => {
@@ -823,6 +909,21 @@ test("V2 only reads recovery transcripts for goals owned by the plugin location"
   await cleanup()
 })
 
+test("V2 skips cancelled goals during transcript recovery", async () => {
+  await createGoal("ses_cancelled", "Do not recover this cancelled goal")
+  await cancelGoal("ses_cancelled")
+  await createGoal("ses_active", "Recover this active goal")
+  const mock = makeMockContext({}, [], { ses_cancelled: [], ses_active: [] })
+  const cleanup = await setupPlugin(mock as never)
+
+  await waitFor(() => mock.contextCalls.includes("ses_active"))
+  expect(mock.contextCalls).toEqual(["ses_active"])
+  expect(mock.sessionGetCalls).not.toContain("ses_cancelled")
+
+  mock.stream.end()
+  await cleanup()
+})
+
 test("V2 continuation proceeds after restart when transcripts show no blocking tasks", async () => {
   await createGoal("ses_v2", "Verify continuation without recovered tasks")
   const mock = makeMockContext({}, [], { ses_v2: [] })
@@ -1298,7 +1399,7 @@ test("V2 idle event triggers auto-continue via ctx.session.prompt", async () => 
   await cleanup()
 })
 
-for (const state of ["paused", "plan", "complete", "unmet", "disabled"] as const) {
+for (const state of ["paused", "plan", "complete", "unmet", "cancelled", "disabled"] as const) {
   test(`V2 execution success respects ${state} goals`, async () => {
     const mock = makeMockContext({ auto_continue: state !== "disabled", min_continue_interval_seconds: 0 })
     const cleanup = await setupPlugin(mock as never)
@@ -1306,6 +1407,7 @@ for (const state of ["paused", "plan", "complete", "unmet", "disabled"] as const
     if (state === "paused") await goalTool(mock, "update_goal_status").execute({ status: "paused" }, toolContext())
     if (state === "complete") await goalTool(mock, "update_goal").execute({ status: "complete", evidence: "verified fixture" }, toolContext())
     if (state === "unmet") await goalTool(mock, "update_goal").execute({ status: "unmet", blocker: "fixture unavailable" }, toolContext())
+    if (state === "cancelled") await goalTool(mock, "stop_goal").execute({}, toolContext())
     mock.stream.push({ type: "session.execution.started", created: 1, data: { sessionID: "ses_v2" } })
     await mock.stream.push({ type: "session.execution.succeeded", created: 2, data: { sessionID: "ses_v2" } })
     mock.stream.end()
@@ -1832,6 +1934,23 @@ test("V2 watchdog rescues a busy active goal without consuming auto-turn budgets
   expect(mock.promptCalls).toHaveLength(1)
   expect((await getGoal("ses_v2"))?.autoTurns).toBe(0)
 
+  mock.stream.end()
+  await cleanup()
+})
+
+test("V2 create_goal keeps the current busy-turn watchdog armed", async () => {
+  const mock = makeMockContext({ auto_continue: false, max_turn_time: 0.03 })
+  const cleanup = await setupPlugin(mock as never)
+
+  await mock.stream.push({
+    type: "session.status",
+    created: Date.now(),
+    data: { sessionID: "ses_v2", status: { type: "busy" } },
+  })
+  await createGoalViaV2Tool(mock, "rescue this same creation turn")
+  await waitFor(() => mock.promptCalls.length === 1)
+
+  expect(mock.promptCalls[0]?.text).toContain("rescue this same creation turn")
   mock.stream.end()
   await cleanup()
 })

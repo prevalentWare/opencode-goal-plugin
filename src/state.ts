@@ -6,7 +6,7 @@ import { dirname, join } from "node:path"
 import { Data, Effect, Schema } from "effect"
 import { atomicWriteFile } from "./atomic-write"
 
-export type GoalStatus = "active" | "paused" | "budgetLimited" | "usageLimited" | "complete" | "unmet"
+export type GoalStatus = "active" | "paused" | "budgetLimited" | "usageLimited" | "complete" | "unmet" | "cancelled"
 export type MutableGoalStatus = "active" | "paused"
 export type GoalHistoryType =
   | "created"
@@ -15,6 +15,8 @@ export type GoalHistoryType =
   | "resumed"
   | "completed"
   | "unmet"
+  | "cancelled"
+  | "cleared"
   | "autoContinue"
   | "checkpoint"
   | "warning"
@@ -79,6 +81,7 @@ export type PendingAttempt = {
 }
 
 export type Goal = {
+  id: string
   sessionID: string
   objective: string
   status: GoalStatus
@@ -124,9 +127,29 @@ type UsageTracker = {
 }
 
 type State = {
-  version: 1
+  version: 2
   goals: Record<string, Goal>
+  archives: Record<string, ArchivedGoal[]>
 }
+
+export type ArchivedGoal = Pick<
+  Goal,
+  | "id"
+  | "sessionID"
+  | "objective"
+  | "status"
+  | "tokenBudget"
+  | "tokensUsed"
+  | "timeUsedSeconds"
+  | "createdAt"
+  | "updatedAt"
+  | "completionEvidence"
+  | "blocker"
+  | "closedAt"
+  | "stopReason"
+  | "history"
+  | "checkpoints"
+>
 
 class StateReadError extends Data.TaggedError("StateReadError")<{
   readonly cause: unknown
@@ -143,6 +166,10 @@ class StateWriteError extends Data.TaggedError("StateWriteError")<{
 const MAX_HISTORY_ENTRIES = 50
 const MAX_CHECKPOINTS = 8
 const MAX_LISTED_GOALS = 50
+const MAX_ARCHIVED_GOALS_PER_SESSION = 20
+const MAX_ARCHIVED_GOALS_TOTAL = 200
+const MAX_ARCHIVED_OBJECTIVE_CHARS = 2_000
+const MAX_ARCHIVED_HISTORY_ENTRIES = 20
 const CHECKPOINT_CHAR_LIMIT = 280
 const DEFAULT_NO_PROGRESS_TOKEN_THRESHOLD = 50
 const DEFAULT_MAX_NO_PROGRESS_TURNS = 2
@@ -160,6 +187,8 @@ const HistoryEntrySchema = Schema.Struct({
     "resumed",
     "completed",
     "unmet",
+    "cancelled",
+    "cleared",
     "autoContinue",
     "checkpoint",
     "warning",
@@ -190,9 +219,10 @@ const UsageTrackerSchema = Schema.Struct({
   pendingBaseTokens: Schema.optionalWith(Schema.Unknown, { default: () => null }),
 })
 const GoalSchema = Schema.Struct({
+  id: Schema.optionalWith(Schema.String, { default: () => "" }),
   sessionID: Schema.String,
   objective: Schema.String,
-  status: Schema.Literal("active", "paused", "budgetLimited", "usageLimited", "complete", "unmet"),
+  status: Schema.Literal("active", "paused", "budgetLimited", "usageLimited", "complete", "unmet", "cancelled"),
   tokenBudget: NullableNumber,
   tokensUsed: Schema.Number,
   usageTrackers: Schema.optionalWith(Schema.Record({ key: Schema.String, value: UsageTrackerSchema }), { default: () => ({}) }),
@@ -225,10 +255,35 @@ const GoalSchema = Schema.Struct({
   continuationBaselineMessageID: Schema.optionalWith(Schema.String, { default: () => "" }),
   continuationBaselineSummary: Schema.optionalWith(Schema.String, { default: () => "" }),
 })
-const StateSchema = Schema.Struct({
+const ArchivedGoalSchema = Schema.Struct({
+  id: Schema.String,
+  sessionID: Schema.String,
+  objective: Schema.String,
+  status: Schema.Literal("active", "paused", "budgetLimited", "usageLimited", "complete", "unmet", "cancelled"),
+  tokenBudget: NullableNumber,
+  tokensUsed: Schema.Number,
+  timeUsedSeconds: Schema.Number,
+  createdAt: Schema.Number,
+  updatedAt: Schema.Number,
+  completionEvidence: Schema.optionalWith(NullableString, { default: () => null }),
+  blocker: Schema.optionalWith(NullableString, { default: () => null }),
+  closedAt: Schema.optionalWith(NullableNumber, { default: () => null }),
+  stopReason: Schema.optionalWith(NullableString, { default: () => null }),
+  history: Schema.Array(HistoryEntrySchema),
+  checkpoints: Schema.Array(CheckpointSchema),
+})
+const LegacyStateSchema = Schema.Struct({
   version: Schema.Literal(1),
   goals: Schema.Record({ key: Schema.String, value: GoalSchema }),
 })
+const StateSchema = Schema.Struct({
+  version: Schema.Literal(2),
+  goals: Schema.Record({ key: Schema.String, value: GoalSchema }),
+  archives: Schema.optionalWith(Schema.Record({ key: Schema.String, value: Schema.Array(ArchivedGoalSchema) }), {
+    default: () => ({}),
+  }),
+})
+const PersistedStateSchema = Schema.Union(LegacyStateSchema, StateSchema)
 
 // The public snapshot omits internal transport-recovery fields. The internal
 // continuation machinery (server and tests) reads them through
@@ -281,15 +336,16 @@ function nowSeconds() {
 }
 
 function emptyState(): State {
-  return { version: 1, goals: {} }
+  return { version: 2, goals: {}, archives: {} }
 }
 
 function isMissingStateFile(error: unknown) {
   return typeof error === "object" && error !== null && (error as NodeJS.ErrnoException).code === "ENOENT"
 }
 
-function mutableState(state: Schema.Schema.Type<typeof StateSchema>): State {
-  return JSON.parse(JSON.stringify(state)) as State
+function mutableState(state: Schema.Schema.Type<typeof PersistedStateSchema>): State {
+  const value = JSON.parse(JSON.stringify(state)) as Schema.Schema.Type<typeof PersistedStateSchema>
+  return value.version === 1 ? { version: 2, goals: value.goals as Record<string, Goal>, archives: {} } : (value as State)
 }
 
 const warnedEmptyStatePaths = new Set<string>()
@@ -351,7 +407,7 @@ function parseStateText(raw: string, file: string) {
 }
 
 function decodeState(value: unknown) {
-  return Schema.decodeUnknown(StateSchema)(value).pipe(
+  return Schema.decodeUnknown(PersistedStateSchema)(value).pipe(
     Effect.map(mutableState),
     Effect.map(normalizeState),
     Effect.mapError((cause) => new StateDecodeError({ cause })),
@@ -445,7 +501,7 @@ function readStateSync(): State {
   try {
     const file = statePath()
     const raw = readFileSync(file, "utf8")
-    return normalizeState(mutableState(Schema.decodeUnknownSync(StateSchema)(parseStateText(raw, file).value)))
+    return normalizeState(mutableState(Schema.decodeUnknownSync(PersistedStateSchema)(parseStateText(raw, file).value)))
   } catch (error) {
     if (isMissingStateFile(error)) return emptyState()
     throw error
@@ -547,10 +603,26 @@ export function validateEvidence(evidence: string | null | undefined, label: str
 
 function normalizeState(state: State): State {
   for (const goal of Object.values(state.goals)) normalizeGoal(goal)
+  for (const [sessionID, goals] of Object.entries(state.archives ?? {})) {
+    state.archives[sessionID] = goals.map(normalizeArchivedGoal).slice(-MAX_ARCHIVED_GOALS_PER_SESSION)
+  }
+  pruneArchives(state)
   return state
 }
 
+function normalizeArchivedGoal(goal: ArchivedGoal) {
+  goal.objective = summarizeText(goal.objective, MAX_ARCHIVED_OBJECTIVE_CHARS)
+  goal.completionEvidence = goal.completionEvidence
+    ? summarizeText(goal.completionEvidence, MAX_ARCHIVED_OBJECTIVE_CHARS)
+    : null
+  goal.blocker = goal.blocker ? summarizeText(goal.blocker, MAX_ARCHIVED_OBJECTIVE_CHARS) : null
+  goal.history = goal.history.slice(-MAX_ARCHIVED_HISTORY_ENTRIES)
+  goal.checkpoints = goal.checkpoints.slice(-MAX_CHECKPOINTS)
+  return goal
+}
+
 function normalizeGoal(goal: Goal) {
+  goal.id ||= `legacy:${goal.sessionID}:${goal.createdAt}`
   goal.history = (goal.history ?? []).slice(-MAX_HISTORY_ENTRIES)
   goal.checkpoints = (goal.checkpoints ?? []).slice(-MAX_CHECKPOINTS)
   goal.lastCheckpoint = goal.lastCheckpoint ?? goal.checkpoints.at(-1) ?? null
@@ -658,7 +730,7 @@ function nonNegativeIntegerOrNull(value: unknown) {
 }
 
 function isClosed(status: GoalStatus) {
-  return status === "complete" || status === "unmet"
+  return status === "complete" || status === "unmet" || status === "cancelled"
 }
 
 function canContinue(status: GoalStatus) {
@@ -676,6 +748,7 @@ export function snapshot(goal: Goal): GoalSnapshot {
     goal.status === "active" && goal.lastAccountedAt != null ? Math.max(0, sampledAt - goal.lastAccountedAt) : 0
   const timeUsedSeconds = goal.timeUsedSeconds + activeSeconds
   return {
+    id: goal.id,
     sessionID: goal.sessionID,
     objective: goal.objective,
     status: goal.status,
@@ -722,6 +795,15 @@ export async function getGoal(sessionID: string) {
   return goal ? snapshot(goal) : null
 }
 
+export async function getGoalHistory(sessionID: string) {
+  const state = await readState()
+  const current = state.goals[sessionID]
+  return {
+    current: current ? snapshot(current) : null,
+    previous: state.archives[sessionID] ?? [],
+  }
+}
+
 export async function getAllGoals() {
   const state = await readState()
   const sorted = Object.values(state.goals).sort(
@@ -763,6 +845,120 @@ export function getGoalSync(sessionID: string) {
   return goal ? snapshot(goal) : null
 }
 
+function createGoalRecord(
+  sessionID: string,
+  objective: string,
+  normalizedOptions: Required<CreateGoalOptions>,
+  now = nowSeconds(),
+) {
+  const paused = normalizedOptions.initialStatus === "paused"
+  const goal: Goal = {
+    id: randomUUID(),
+    sessionID,
+    objective,
+    status: normalizedOptions.initialStatus,
+    tokenBudget: normalizedOptions.tokenBudget,
+    tokensUsed: 0,
+    usageTrackers: {},
+    timeUsedSeconds: 0,
+    createdAt: now,
+    updatedAt: now,
+    completionEvidence: null,
+    blocker: paused ? PLAN_MODE_BLOCKER : null,
+    closedAt: null,
+    lastAccountedAt: paused ? null : now,
+    autoTurns: 0,
+    lastContinuationAt: null,
+    continuationFailures: 0,
+    pendingAttempt: null,
+    lastStatus: paused ? "Goal recorded from Plan mode; execution paused until resumed from Build mode." : "Goal set.",
+    maxAutoTurns: normalizedOptions.maxAutoTurns,
+    maxDurationSeconds: normalizedOptions.maxDurationSeconds,
+    noProgressTokenThreshold: normalizedOptions.noProgressTokenThreshold,
+    maxNoProgressTurns: normalizedOptions.maxNoProgressTurns,
+    noProgressTurns: 0,
+    budgetWrapupSent: false,
+    stopReason: paused ? PLAN_MODE_STOP_REASON : null,
+    history: [],
+    checkpoints: [],
+    lastCheckpoint: null,
+    lastAssistantText: "",
+    lastAssistantMessageID: "",
+    lastPromptAgent: normalizedOptions.agent,
+    awaitingContinuationProgress: false,
+    continuationBaselineMessageID: "",
+    continuationBaselineSummary: "",
+  }
+  pushHistory(goal, "created", goalLimitSummary(goal))
+  if (paused) pushHistory(goal, "paused", goal.lastStatus)
+  return goal
+}
+
+function archivedGoal(goal: Goal): ArchivedGoal {
+  return {
+    id: goal.id,
+    sessionID: goal.sessionID,
+    objective: summarizeText(goal.objective, MAX_ARCHIVED_OBJECTIVE_CHARS),
+    status: goal.status,
+    tokenBudget: goal.tokenBudget,
+    tokensUsed: goal.tokensUsed,
+    timeUsedSeconds: goal.timeUsedSeconds,
+    createdAt: goal.createdAt,
+    updatedAt: goal.updatedAt,
+    completionEvidence: goal.completionEvidence
+      ? summarizeText(goal.completionEvidence, MAX_ARCHIVED_OBJECTIVE_CHARS)
+      : null,
+    blocker: goal.blocker ? summarizeText(goal.blocker, MAX_ARCHIVED_OBJECTIVE_CHARS) : null,
+    closedAt: goal.closedAt ?? null,
+    stopReason: goal.stopReason,
+    history: goal.history.slice(-MAX_ARCHIVED_HISTORY_ENTRIES),
+    checkpoints: goal.checkpoints.slice(-MAX_CHECKPOINTS),
+  }
+}
+
+function pruneArchives(state: State) {
+  let total = Object.values(state.archives).reduce((sum, goals) => sum + goals.length, 0)
+  while (total > MAX_ARCHIVED_GOALS_TOTAL) {
+    let oldestSession: string | null = null
+    let oldestUpdatedAt = Number.POSITIVE_INFINITY
+    for (const [sessionID, goals] of Object.entries(state.archives)) {
+      const candidate = goals[0]
+      if (candidate && candidate.updatedAt < oldestUpdatedAt) {
+        oldestSession = sessionID
+        oldestUpdatedAt = candidate.updatedAt
+      }
+    }
+    if (!oldestSession) break
+    state.archives[oldestSession]!.shift()
+    if (state.archives[oldestSession]!.length === 0) delete state.archives[oldestSession]
+    total -= 1
+  }
+}
+
+function archiveGoal(state: State, goal: Goal) {
+  state.archives[goal.sessionID] = [...(state.archives[goal.sessionID] ?? []), archivedGoal(goal)].slice(
+    -MAX_ARCHIVED_GOALS_PER_SESSION,
+  )
+  pruneArchives(state)
+}
+
+function cancelGoalRecord(goal: Goal, reason: "cancelled" | "cleared" | "replaced") {
+  if (isClosed(goal.status)) return
+  accountWallClock(goal)
+  const now = nowSeconds()
+  goal.status = "cancelled"
+  goal.updatedAt = now
+  goal.closedAt = now
+  goal.lastAccountedAt = null
+  goal.pendingAttempt = null
+  goal.awaitingContinuationProgress = false
+  goal.budgetWrapupSent = false
+  goal.stopReason = reason
+  goal.blocker = null
+  goal.lastStatus = reason === "replaced" ? "Goal cancelled because it was replaced." : "Goal cancelled."
+  pushHistory(goal, "cancelled", goal.lastStatus)
+}
+
 export async function createGoal(sessionID: string, objective: string, options?: number | null | CreateGoalOptions) {
   const normalizedOptions = normalizeCreateOptions(options)
   const value = validateObjective(objective, resolveMaxObjectiveChars(normalizedOptions.maxObjectiveChars))
@@ -771,46 +967,8 @@ export async function createGoal(sessionID: string, objective: string, options?:
     if (existing && !isClosed(existing.status)) {
       throw new Error("cannot create a new goal because this session already has a non-closed goal")
     }
-    const now = nowSeconds()
-    const paused = normalizedOptions.initialStatus === "paused"
-    const goal: Goal = {
-      sessionID,
-      objective: value,
-      status: normalizedOptions.initialStatus,
-      tokenBudget: normalizedOptions.tokenBudget,
-      tokensUsed: 0,
-      usageTrackers: {},
-      timeUsedSeconds: 0,
-      createdAt: now,
-      updatedAt: now,
-      completionEvidence: null,
-      blocker: paused ? PLAN_MODE_BLOCKER : null,
-      closedAt: null,
-      lastAccountedAt: paused ? null : now,
-      autoTurns: 0,
-      lastContinuationAt: null,
-      continuationFailures: 0,
-      pendingAttempt: null,
-      lastStatus: paused ? "Goal recorded from Plan mode; execution paused until resumed from Build mode." : "Goal set.",
-      maxAutoTurns: normalizedOptions.maxAutoTurns,
-      maxDurationSeconds: normalizedOptions.maxDurationSeconds,
-      noProgressTokenThreshold: normalizedOptions.noProgressTokenThreshold,
-      maxNoProgressTurns: normalizedOptions.maxNoProgressTurns,
-      noProgressTurns: 0,
-      budgetWrapupSent: false,
-      stopReason: paused ? PLAN_MODE_STOP_REASON : null,
-      history: [],
-      checkpoints: [],
-      lastCheckpoint: null,
-      lastAssistantText: "",
-      lastAssistantMessageID: "",
-      lastPromptAgent: normalizedOptions.agent,
-      awaitingContinuationProgress: false,
-      continuationBaselineMessageID: "",
-      continuationBaselineSummary: "",
-    }
-    pushHistory(goal, "created", goalLimitSummary(goal))
-    if (paused) pushHistory(goal, "paused", goal.lastStatus)
+    if (existing) archiveGoal(state, existing)
+    const goal = createGoalRecord(sessionID, value, normalizedOptions)
     state.goals[sessionID] = goal
     return snapshot(goal)
   })
@@ -828,6 +986,7 @@ export async function updateGoalObjective(
   return mutate((state) => {
     const goal = state.goals[sessionID]
     if (!goal) throw new Error("cannot update goal because this session has no goal")
+    if (isClosed(goal.status)) throw new Error("cannot update goal objective because this goal is closed; replace it instead")
     accountWallClock(goal)
     goal.objective = value
     goal.status = planModePause ? "paused" : status
@@ -937,6 +1096,7 @@ export async function closeGoal(
   return mutate((state) => {
     const goal = state.goals[sessionID]
     if (!goal) throw new Error("cannot update goal because this session has no goal")
+    if (isClosed(goal.status)) throw new Error("cannot close goal because this goal is already closed")
     accountWallClock(goal)
     const now = nowSeconds()
     goal.status = input.status
@@ -967,11 +1127,43 @@ export async function markGoalUnmet(sessionID: string, blocker: string, maxObjec
   return closeGoal(sessionID, { status: "unmet", blocker }, maxObjectiveChars)
 }
 
+export async function cancelGoal(sessionID: string, reason: "cancelled" | "replaced" = "cancelled") {
+  return mutate((state) => {
+    const goal = state.goals[sessionID]
+    if (!goal) return null
+    cancelGoalRecord(goal, reason)
+    return snapshot(goal)
+  })
+}
+
 export async function clearGoal(sessionID: string) {
   return mutate((state) => {
-    const existed = Boolean(state.goals[sessionID])
+    const goal = state.goals[sessionID]
+    if (!goal) return false
+    cancelGoalRecord(goal, "cleared")
+    pushHistory(goal, "cleared", "Goal cleared from the active session.")
+    archiveGoal(state, goal)
     delete state.goals[sessionID]
-    return existed
+    return true
+  })
+}
+
+export async function replaceGoal(
+  sessionID: string,
+  objective: string,
+  options?: number | null | CreateGoalOptions,
+) {
+  const normalizedOptions = normalizeCreateOptions(options)
+  const value = validateObjective(objective, resolveMaxObjectiveChars(normalizedOptions.maxObjectiveChars))
+  return mutate((state) => {
+    const existing = state.goals[sessionID]
+    if (existing) {
+      cancelGoalRecord(existing, "replaced")
+      archiveGoal(state, existing)
+    }
+    const goal = createGoalRecord(sessionID, value, normalizedOptions)
+    state.goals[sessionID] = goal
+    return { goal: snapshot(goal), replaced: existing ? snapshot(existing) : null }
   })
 }
 
@@ -1176,11 +1368,16 @@ export async function reserveContinuation(sessionID: string, maxAutoTurns: numbe
  * short-circuited before delivery). Returns true if a committed attempt was
  * rolled back.
  */
-export async function rollbackContinuationAttempt(sessionID: string) {
+export async function rollbackContinuationAttempt(
+  sessionID: string,
+  expected?: { goalID?: string; attemptID?: string },
+) {
   return mutate((state) => {
     const goal = state.goals[sessionID]
     if (!goal) return false
+    if (expected?.goalID && goal.id !== expected.goalID) return false
     const attempt = goal.pendingAttempt
+    if (expected?.attemptID && attempt?.id !== expected.attemptID) return false
     if (!attempt || attempt.delivered || !attempt.committed) {
       if (attempt && !attempt.delivered) goal.pendingAttempt = null
       return false
@@ -1199,11 +1396,19 @@ export async function recordContinuationResult(
   sessionID: string,
   result: "success" | "failure",
   maxFailures: number,
-  options?: { armNoProgress?: boolean; started?: boolean; requirePending?: boolean },
+  options?: {
+    armNoProgress?: boolean
+    started?: boolean
+    requirePending?: boolean
+    expectedGoalID?: string
+    expectedAttemptID?: string
+  },
 ) {
   return mutate((state) => {
     const goal = state.goals[sessionID]
     if (!goal || isClosed(goal.status)) return goal ? snapshotInternal(goal) : null
+    if (options?.expectedGoalID && goal.id !== options.expectedGoalID) return null
+    if (options?.expectedAttemptID && goal.pendingAttempt?.id !== options.expectedAttemptID) return null
     const now = nowSeconds()
     goal.updatedAt = now
     if (result === "success") {
@@ -1384,7 +1589,7 @@ function pushHistory(goal: Goal, type: GoalHistoryType, detail: string | null | 
 function summarizeText(text: string, limit = CHECKPOINT_CHAR_LIMIT) {
   const normalized = text.replace(/\s+/g, " ").trim()
   if (!normalized) return ""
-  return normalized.length > limit ? `${normalized.slice(0, limit - 1)}...` : normalized
+  return normalized.length > limit ? `${normalized.slice(0, Math.max(0, limit - 3))}...` : normalized
 }
 
 function goalLimitSummary(goal: Goal) {

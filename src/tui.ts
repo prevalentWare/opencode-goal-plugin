@@ -20,7 +20,7 @@ type GoalHistoryEntry = {
 type GoalSnapshot = {
   sessionID: string
   objective: string
-  status: "active" | "paused" | "budgetLimited" | "usageLimited" | "complete" | "unmet"
+  status: "active" | "paused" | "budgetLimited" | "usageLimited" | "complete" | "unmet" | "cancelled"
   tokenBudget: number | null
   tokensUsed: number
   timeUsedSeconds: number
@@ -95,6 +95,8 @@ const GOAL_TOOL_NAMES: readonly string[] = [
   "update_goal",
   "update_goal_objective",
   "update_goal_status",
+  "stop_goal",
+  "replace_goal",
   "clear_goal",
 ]
 
@@ -381,7 +383,7 @@ function isGoalSnapshot(value: unknown): value is GoalSnapshot {
   if (!isRecord(value)) return false
   if (typeof value.sessionID !== "string") return false
   if (typeof value.objective !== "string") return false
-  if (!["active", "paused", "budgetLimited", "usageLimited", "complete", "unmet"].includes(String(value.status))) return false
+  if (!["active", "paused", "budgetLimited", "usageLimited", "complete", "unmet", "cancelled"].includes(String(value.status))) return false
   if (value.tokenBudget !== null && typeof value.tokenBudget !== "number") return false
   if (typeof value.tokensUsed !== "number") return false
   if (typeof value.timeUsedSeconds !== "number") return false
