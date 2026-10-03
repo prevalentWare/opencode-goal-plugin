@@ -3,8 +3,10 @@ import type { Plugin as TuiPluginV2 } from "@opencode/plugin/tui"
 import type { SessionMessageInfo } from "@opencode/client"
 import { createElement, insert, setProp } from "@opentui/solid"
 import { createEffect, createMemo, createSignal, onCleanup } from "solid-js"
+import { readFile, stat } from "node:fs/promises"
 import type { GoalMessages } from "./i18n"
 import { messagesFor, presentGoalLastStatus, presentGoalStatus, presentGoalStopReason, resolveLocale } from "./i18n"
+import { statePath } from "./state-path"
 
 type GoalCheckpoint = {
   summary: string
@@ -413,6 +415,66 @@ function isGoalSnapshot(value: unknown): value is GoalSnapshot {
   return true
 }
 
+/** Read only the current session from the server's atomic state file. */
+export async function readPersistedGoal(sessionID: string): Promise<GoalSnapshot | null | undefined> {
+  try {
+    const state: unknown = JSON.parse(await readFile(statePath(), "utf8"))
+    if (!isRecord(state) || (state.version !== 1 && state.version !== 2) || !isRecord(state.goals)) return undefined
+    const stored = state.goals[sessionID]
+    if (stored === undefined) return null
+    if (!isRecord(stored) || stored.sessionID !== sessionID) return undefined
+    const sampledAt = currentEpochSeconds()
+    const timeUsedSeconds = typeof stored.timeUsedSeconds === "number" ? stored.timeUsedSeconds : 0
+    const activeSeconds = stored.status === "active" && typeof stored.lastAccountedAt === "number"
+      ? Math.max(0, sampledAt - stored.lastAccountedAt)
+      : 0
+    const tokenBudget = stored.tokenBudget
+    const tokensUsed = stored.tokensUsed
+    const snapshot = {
+      ...stored,
+      timeUsedSeconds: timeUsedSeconds + activeSeconds,
+      sampledAt,
+      remainingTokens: typeof tokenBudget === "number" && typeof tokensUsed === "number"
+        ? Math.max(0, tokenBudget - tokensUsed)
+        : null,
+    }
+    return isGoalSnapshot(snapshot) ? snapshot : undefined
+  } catch {
+    // Keep the last valid snapshot when the file is unavailable or incomplete.
+    return undefined
+  }
+}
+
+function usePersistedGoal(sessionID: string) {
+  const [persisted, setPersisted] = createSignal<GoalSnapshot | null | undefined>(undefined)
+  let disposed = false
+  let reading = false
+  let lastFile: { ino: number; mtimeMs: number; size: number } | undefined
+  const refresh = async () => {
+    if (reading) return
+    reading = true
+    try {
+      const file = await stat(statePath())
+      if (lastFile && lastFile.ino === file.ino && lastFile.mtimeMs === file.mtimeMs && lastFile.size === file.size) return
+      const next = await readPersistedGoal(sessionID)
+      if (next === undefined) return
+      lastFile = { ino: file.ino, mtimeMs: file.mtimeMs, size: file.size }
+      if (!disposed && (next !== null || persisted() !== undefined)) setPersisted(() => next)
+    } catch {
+      // Missing or unreadable state leaves the last valid view in place.
+    } finally {
+      reading = false
+    }
+  }
+  void refresh()
+  const timer = setInterval(() => void refresh(), 1000)
+  onCleanup(() => {
+    disposed = true
+    clearInterval(timer)
+  })
+  return persisted
+}
+
 function parseGoalToolOutput(part: GoalToolPart): GoalSnapshot | null | undefined {
   if (part.type !== "tool") return undefined
   if (!GOAL_TOOL_NAMES.includes(part.tool ?? "")) return undefined
@@ -474,39 +536,50 @@ export function formatGoal(goal: GoalSnapshot | null, messages: GoalMessages, lo
 function GoalSidebar(api: TuiPluginApi, messages: GoalMessages, locale: ReturnType<typeof resolveLocale>, sessionID: string) {
   const theme = api.theme.current
   const state = goalStateFromSession(api, sessionID)
-  const goal = state.goal
-  if (!goal) return null
-  if (goal.status === "complete" || goal.status === "unmet") {
-    const elapsed = liveTimeUsedSeconds(goal)
-    const label = goal.status === "complete" ? messages.tui.achieved : messages.tui.unmet
-    return text({ fg: goal.status === "complete" ? theme.primary : theme.textMuted }, [
-      `${label} (${formatDurationBadge(elapsed)})`,
-    ])
-  }
+  if (!state.goal) return null
+  const persisted = usePersistedGoal(sessionID)
+  const goal = createMemo(() => {
+    const live = persisted()
+    if (live === undefined) return state.goal
+    if (live && state.goal && (state.goal.createdAt > live.createdAt || state.goal.updatedAt > live.updatedAt)) return state.goal
+    return live
+  })
   const [nowSeconds, setNowSeconds] = createSignal(currentEpochSeconds())
-  if (goal.status === "active") {
+  const active = createMemo(() => goal()?.status === "active")
+  createEffect(() => {
+    if (!active()) return
     const timer = setInterval(() => setNowSeconds(currentEpochSeconds()), 1000)
     onCleanup(() => clearInterval(timer))
-  }
-  return box({}, [
-    text({ fg: theme.text }, [messages.tui.title]),
-    text({ fg: theme.textMuted }, [`${messages.tui.status}: ${presentGoalStatus(goal.status, locale)}`]),
-    text({ fg: theme.textMuted }, [() => `${messages.tui.time}: ${formatDuration(liveTimeUsedSeconds(goal, nowSeconds()))}`]),
-    text({ fg: theme.textMuted }, [
-      `${messages.tui.tokens}: ${goal.tokensUsed}${goal.tokenBudget == null ? "" : `/${goal.tokenBudget}`}`,
-    ]),
-    text({ fg: theme.textMuted }, [
-      `${messages.tui.autoContinues}: ${goal.autoTurns}${goal.maxAutoTurns == null ? "" : `/${goal.maxAutoTurns}`}`,
-    ]),
-    ...(goal.lastCheckpoint
-      ? [text({ fg: theme.textMuted }, [`${messages.tui.checkpoint}: ${goal.lastCheckpoint.summary}`])]
-      : []),
-    ...(goal.stopReason
-      ? [text({ fg: theme.textMuted }, [`${messages.tui.stop}: ${presentGoalStopReason(goal.stopReason, locale)}`])]
-      : []),
-    ...(goal.lastStatus ? [text({ fg: theme.textMuted }, [presentGoalLastStatus(goal.lastStatus, locale)])] : []),
-    text({ fg: theme.textMuted }, [goal.objective]),
-  ])
+  })
+  return box({}, [() => {
+    const snapshot = goal()
+    if (!snapshot) return null
+    if (snapshot.status === "complete" || snapshot.status === "unmet") {
+      const elapsed = liveTimeUsedSeconds(snapshot)
+      return text({ fg: snapshot.status === "complete" ? theme.primary : theme.textMuted }, [
+        `${snapshot.status === "complete" ? messages.tui.achieved : messages.tui.unmet} (${formatDurationBadge(elapsed)})`,
+      ])
+    }
+    return box({}, [
+      text({ fg: theme.text }, [messages.tui.title]),
+      text({ fg: theme.textMuted }, [`${messages.tui.status}: ${presentGoalStatus(snapshot.status, locale)}`]),
+      text({ fg: theme.textMuted }, [`${messages.tui.time}: ${formatDuration(liveTimeUsedSeconds(snapshot, nowSeconds()))}`]),
+      text({ fg: theme.textMuted }, [
+        `${messages.tui.tokens}: ${snapshot.tokensUsed}${snapshot.tokenBudget == null ? "" : `/${snapshot.tokenBudget}`}`,
+      ]),
+      text({ fg: theme.textMuted }, [
+        `${messages.tui.autoContinues}: ${snapshot.autoTurns}${snapshot.maxAutoTurns == null ? "" : `/${snapshot.maxAutoTurns}`}`,
+      ]),
+      ...(snapshot.lastCheckpoint
+        ? [text({ fg: theme.textMuted }, [`${messages.tui.checkpoint}: ${snapshot.lastCheckpoint.summary}`])]
+        : []),
+      ...(snapshot.stopReason
+        ? [text({ fg: theme.textMuted }, [`${messages.tui.stop}: ${presentGoalStopReason(snapshot.stopReason, locale)}`])]
+        : []),
+      ...(snapshot.lastStatus ? [text({ fg: theme.textMuted }, [presentGoalLastStatus(snapshot.lastStatus, locale)])] : []),
+      text({ fg: theme.textMuted }, [snapshot.objective]),
+    ])
+  }])
 }
 
 function registerGoalCommand(api: TuiPluginApi, command: TuiCommand) {
@@ -657,8 +730,16 @@ function GoalSidebarV2(
   const [cache, setCache] = api.storage.memory<{ goal: GoalSnapshot | null }>(`goal-mode.v2.${sessionID}`, {
     initial: { goal: null },
   })
+  const persisted = usePersistedGoal(sessionID)
+  const messageGoal = createMemo(() => goalFromV2Messages(api.data.session.message.list(sessionID)))
   const goal = createMemo<GoalSnapshot | null>(() => {
-    const found = goalFromV2Messages(api.data.session.message.list(sessionID))
+    const found = messageGoal()
+    if (found === null) return null
+    const live = persisted()
+    if (live !== undefined) {
+      if (found && live && (found.createdAt > live.createdAt || found.updatedAt > live.updatedAt)) return found
+      return live
+    }
     return found === undefined ? cache.goal : found
   })
   createEffect(() =>
@@ -668,8 +749,9 @@ function GoalSidebarV2(
   )
 
   const [nowSeconds, setNowSeconds] = createSignal(currentEpochSeconds())
+  const active = createMemo(() => goal()?.status === "active")
   createEffect(() => {
-    if (goal()?.status !== "active") return
+    if (!active()) return
     const timer = setInterval(() => setNowSeconds(currentEpochSeconds()), 1000)
     onCleanup(() => clearInterval(timer))
   })

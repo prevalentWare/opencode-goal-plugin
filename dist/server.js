@@ -5,8 +5,7 @@ import { z } from "zod";
 // src/state.ts
 import { randomUUID as randomUUID2 } from "crypto";
 import { mkdir, readFile } from "fs/promises";
-import { homedir } from "os";
-import { dirname as dirname2, join } from "path";
+import { dirname as dirname2 } from "path";
 import { Data, Effect, Schema } from "effect";
 
 // src/atomic-write.ts
@@ -115,6 +114,16 @@ async function atomicWriteFile(file, data, ops = defaultAtomicWriteOps) {
       await bestEffort(() => ops.unlink(tmp));
     throw error;
   }
+}
+
+// src/state-path.ts
+import { homedir } from "os";
+import { join } from "path";
+function statePath() {
+  if (process.env.OPENCODE_GOAL_STATE_PATH)
+    return process.env.OPENCODE_GOAL_STATE_PATH;
+  const dataHome = process.env.XDG_DATA_HOME || (process.platform === "win32" && process.env.APPDATA ? process.env.APPDATA : join(homedir(), ".local", "share"));
+  return join(dataHome, "opencode-goal-plugin", "goals.json");
 }
 
 // src/state.ts
@@ -232,13 +241,6 @@ var StateSchema = Schema.Struct({
   })
 });
 var PersistedStateSchema = Schema.Union(LegacyStateSchema, StateSchema);
-function defaultStateFile() {
-  const dataHome = process.env.XDG_DATA_HOME || (process.platform === "win32" && process.env.APPDATA ? process.env.APPDATA : join(homedir(), ".local", "share"));
-  return join(dataHome, "opencode-goal-plugin", "goals.json");
-}
-function statePath() {
-  return process.env.OPENCODE_GOAL_STATE_PATH || defaultStateFile();
-}
 function nowSeconds() {
   return Math.floor(Date.now() / 1000);
 }

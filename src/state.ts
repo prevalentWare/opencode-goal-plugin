@@ -1,10 +1,12 @@
 import { randomUUID } from "node:crypto"
 import { readFileSync } from "node:fs"
 import { mkdir, readFile } from "node:fs/promises"
-import { homedir } from "node:os"
-import { dirname, join } from "node:path"
+import { dirname } from "node:path"
 import { Data, Effect, Schema } from "effect"
 import { atomicWriteFile } from "./atomic-write"
+import { statePath } from "./state-path"
+
+export { statePath } from "./state-path"
 
 export type GoalStatus = "active" | "paused" | "budgetLimited" | "usageLimited" | "complete" | "unmet" | "cancelled"
 export type MutableGoalStatus = "active" | "paused"
@@ -319,17 +321,6 @@ export type GoalListItem = Pick<
   | "autoTurns"
   | "stopReason"
 > & { remainingTokens: number | null }
-
-function defaultStateFile() {
-  const dataHome =
-    process.env.XDG_DATA_HOME ||
-    (process.platform === "win32" && process.env.APPDATA ? process.env.APPDATA : join(homedir(), ".local", "share"))
-  return join(dataHome, "opencode-goal-plugin", "goals.json")
-}
-
-export function statePath() {
-  return process.env.OPENCODE_GOAL_STATE_PATH || defaultStateFile()
-}
 
 function nowSeconds() {
   return Math.floor(Date.now() / 1000)

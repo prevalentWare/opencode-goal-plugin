@@ -1,4 +1,8 @@
-import { expect, test } from "bun:test"
+import { afterAll, beforeAll, beforeEach, expect, test } from "bun:test"
+import { mkdtempSync, rmSync, unlinkSync } from "node:fs"
+import { rename, writeFile } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import { DEFAULT_THEME, resolveThemeDocument, type ResolvedTheme } from "@opencode/theme/tui"
 import { testRender } from "@opentui/solid"
 import { createSignal } from "solid-js"
@@ -7,12 +11,41 @@ import type { SessionMessageAssistantTool, SessionMessageInfo } from "@opencode/
 import plugin, {
   goalFromV2Messages,
   liveTimeUsedSeconds,
+  readPersistedGoal,
   registerSlotV2,
   setupTuiV2,
   themeColorV2,
 } from "../src/tui.ts"
 
 type GoalSnapshot = Parameters<typeof liveTimeUsedSeconds>[0]
+
+const previousStatePath = process.env.OPENCODE_GOAL_STATE_PATH
+const isolatedStateDir = mkdtempSync(join(tmpdir(), "goal-tui-v2-"))
+const isolatedStatePath = join(isolatedStateDir, "goals.json")
+
+async function writeGoalState(value: unknown) {
+  const temporary = `${isolatedStatePath}.tmp`
+  await writeFile(temporary, JSON.stringify(value))
+  await rename(temporary, isolatedStatePath)
+}
+
+beforeAll(() => {
+  process.env.OPENCODE_GOAL_STATE_PATH = isolatedStatePath
+})
+
+beforeEach(() => {
+  try {
+    unlinkSync(isolatedStatePath)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
+  }
+})
+
+afterAll(() => {
+  if (previousStatePath === undefined) delete process.env.OPENCODE_GOAL_STATE_PATH
+  else process.env.OPENCODE_GOAL_STATE_PATH = previousStatePath
+  rmSync(isolatedStateDir, { recursive: true, force: true })
+})
 
 function goal(overrides: Partial<GoalSnapshot> = {}): GoalSnapshot {
   return {
@@ -438,6 +471,87 @@ test("V2 sidebar renders the parsed goal from session messages", async () => {
     if (!destroyed) setup.renderer.destroy()
     cleanup()
   }
+})
+
+test("V2 sidebar refreshes persisted usage and checkpoint without a new goal tool result", async () => {
+  const initial = goal({ objective: "live counters" })
+  const { mock, slots, setMessages } = makeMockContext()
+  const cleanup = setupTuiV2(mock as never)
+  const sidebar = slots.get("sidebar.content")
+  setMessages([assistantMessage("created", [goalTool("create_goal", JSON.stringify({ goal: initial }))])])
+  await writeGoalState({ version: 2, goals: { session: { ...initial, lastAccountedAt: 100 } }, archives: {} })
+
+  const setup = await testRender(() => sidebar?.({ sessionID: "session" }) as never, { width: 80, height: 20 })
+  try {
+    await setup.renderOnce()
+    expect(setup.captureCharFrame()).toContain("Tokens: 0")
+
+    const updated = goal({
+      objective: "live counters",
+      tokensUsed: 42,
+      autoTurns: 2,
+      lastCheckpoint: { summary: "parser verified", timestamp: 101 },
+      updatedAt: 101,
+    })
+    await writeGoalState({ version: 2, goals: { session: { ...updated, lastAccountedAt: 101 } }, archives: {} })
+
+    const deadline = Date.now() + 5000
+    while (Date.now() < deadline) {
+      await setup.flush()
+      const frame = setup.captureCharFrame()
+      if (frame.includes("Tokens: 42") && frame.includes("Auto-continues: 2") && frame.includes("parser verified")) break
+      await new Promise((resolve) => setTimeout(resolve, 25))
+    }
+    const frame = setup.captureCharFrame()
+    expect(frame).toContain("Tokens: 42")
+    expect(frame).toContain("Auto-continues: 2")
+    expect(frame).toContain("parser verified")
+  } finally {
+    setup.renderer.destroy()
+    cleanup()
+  }
+})
+
+test("V2 sidebar removes a goal when the persisted session entry is cleared", async () => {
+  const initial = goal({ objective: "goal to clear" })
+  const { mock, slots, setMessages } = makeMockContext()
+  const cleanup = setupTuiV2(mock as never)
+  setMessages([assistantMessage("created", [goalTool("create_goal", JSON.stringify({ goal: initial }))])])
+  await writeGoalState({ version: 2, goals: { session: { ...initial, tokensUsed: 1, lastAccountedAt: 100 } }, archives: {} })
+
+  const setup = await testRender(() => slots.get("sidebar.content")?.({ sessionID: "session" }) as never, { width: 80, height: 20 })
+  try {
+    await setup.renderOnce()
+    expect(setup.captureCharFrame()).toContain("goal to clear")
+    const initialDeadline = Date.now() + 5000
+    while (Date.now() < initialDeadline) {
+      await setup.flush()
+      if (setup.captureCharFrame().includes("Tokens: 1")) break
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    expect(setup.captureCharFrame()).toContain("Tokens: 1")
+    await writeGoalState({ version: 2, goals: {}, archives: {} })
+
+    const deadline = Date.now() + 5000
+    while (Date.now() < deadline) {
+      await setup.flush()
+      if (!setup.captureCharFrame().includes("goal to clear")) break
+      await new Promise((resolve) => setTimeout(resolve, 25))
+    }
+    expect(setup.captureCharFrame()).not.toContain("goal to clear")
+  } finally {
+    setup.renderer.destroy()
+    cleanup()
+  }
+})
+
+test("V2 persisted reader distinguishes cleared sessions from unreadable state", async () => {
+  await writeFile(isolatedStatePath, JSON.stringify({ version: 2, goals: {}, archives: {} }))
+  expect(await readPersistedGoal("session")).toBeNull()
+  await writeFile(isolatedStatePath, "{ broken json")
+  expect(await readPersistedGoal("session")).toBeUndefined()
+  await writeFile(isolatedStatePath, "\0\0\0")
+  expect(await readPersistedGoal("session")).toBeUndefined()
 })
 
 

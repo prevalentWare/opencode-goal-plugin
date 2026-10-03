@@ -1,7 +1,39 @@
-import { expect, setSystemTime, spyOn, test } from "bun:test"
+import { afterAll, beforeAll, beforeEach, expect, setSystemTime, spyOn, test } from "bun:test"
+import { mkdtempSync, rmSync, unlinkSync } from "node:fs"
+import { rename, writeFile } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import { testRender } from "@opentui/solid"
 import plugin, { formatDuration, formatGoal, goalStateFromSession, liveTimeUsedSeconds } from "../src/tui.ts"
 import { messagesFor } from "../src/i18n"
+
+const previousStatePath = process.env.OPENCODE_GOAL_STATE_PATH
+const isolatedStateDir = mkdtempSync(join(tmpdir(), "goal-tui-v1-"))
+const isolatedStatePath = join(isolatedStateDir, "goals.json")
+
+async function writeGoalState(value: unknown) {
+  const temporary = `${isolatedStatePath}.tmp`
+  await writeFile(temporary, JSON.stringify(value))
+  await rename(temporary, isolatedStatePath)
+}
+
+beforeAll(() => {
+  process.env.OPENCODE_GOAL_STATE_PATH = isolatedStatePath
+})
+
+beforeEach(() => {
+  try {
+    unlinkSync(isolatedStatePath)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
+  }
+})
+
+afterAll(() => {
+  if (previousStatePath === undefined) delete process.env.OPENCODE_GOAL_STATE_PATH
+  else process.env.OPENCODE_GOAL_STATE_PATH = previousStatePath
+  rmSync(isolatedStateDir, { recursive: true, force: true })
+})
 
 function goal(overrides: Partial<Parameters<typeof liveTimeUsedSeconds>[0]> = {}): Parameters<typeof liveTimeUsedSeconds>[0] {
   return {
@@ -197,6 +229,55 @@ test("active goal sidebar advances visible elapsed time after a timer tick", asy
     clearIntervalSpy.mockRestore()
     setIntervalSpy.mockRestore()
     setSystemTime()
+  }
+})
+
+test("V1 sidebar refreshes persisted counters without another goal tool result", async () => {
+  let sidebar: ((ctx: unknown, props: { session_id: string }) => unknown) | undefined
+  const initial = goal({ objective: "live V1 goal" })
+  const api = {
+    slots: {
+      register(input: { slots: { sidebar_content: (ctx: unknown, props: { session_id: string }) => unknown } }) {
+        sidebar = input.slots.sidebar_content
+      },
+    },
+    command: { register() {} },
+    route: { current: { name: "session", params: { sessionID: "session" } } },
+    ui: { toast() {}, dialog: { setSize() {}, replace() {}, clear() {} } },
+    theme: { current: { text: "#ffffff", textMuted: "#888888", primary: "#00ff00" } },
+    state: {
+      session: { messages: () => [{ id: "created" }] },
+      part: () => [{ type: "tool", tool: "create_goal", state: { status: "completed", output: JSON.stringify({ goal: initial }) } }],
+    },
+  }
+  await writeGoalState({ version: 2, goals: { session: { ...initial, lastAccountedAt: 100 } }, archives: {} })
+  await plugin.tui(api as never, undefined, undefined as never)
+  const setup = await testRender(() => sidebar?.({}, { session_id: "session" }) as never, { width: 80, height: 20 })
+  try {
+    await setup.renderOnce()
+    expect(setup.captureCharFrame()).toContain("Tokens: 0")
+
+    const updated = goal({
+      objective: "live V1 goal",
+      tokensUsed: 73,
+      autoTurns: 3,
+      lastCheckpoint: { summary: "build verified", timestamp: 101 },
+      updatedAt: 101,
+    })
+    await writeGoalState({ version: 2, goals: { session: { ...updated, lastAccountedAt: 101 } }, archives: {} })
+    const deadline = Date.now() + 5000
+    while (Date.now() < deadline) {
+      await setup.flush()
+      const frame = setup.captureCharFrame()
+      if (frame.includes("Tokens: 73") && frame.includes("Auto-continues: 3") && frame.includes("build verified")) break
+      await new Promise((resolve) => setTimeout(resolve, 25))
+    }
+    const frame = setup.captureCharFrame()
+    expect(frame).toContain("Tokens: 73")
+    expect(frame).toContain("Auto-continues: 3")
+    expect(frame).toContain("build verified")
+  } finally {
+    setup.renderer.destroy()
   }
 })
 
