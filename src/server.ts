@@ -3356,7 +3356,9 @@ function goalToolsV2(services: GoalServices): ToolV2Info[] {
     {
       name: "update_goal_plan",
       description: services.locale === "zh-CN" ? "保存目标的整体计划、阶段、任务和验证证据。保持整体目标不变；使用 get_goal 返回的目标 ID 和计划版本。" : "Persist the overall plan, phases, tasks, verification evidence and decisions. Preserve the goal scope; use the goal ID and planRevision from get_goal. Completed work cannot be silently reopened or removed.",
-      input: v2ObjectSchema(planToolArgs),
+      // V2 accepts JSON Schema, not the Zod objects used by the V1 tool API.
+      // Input mode preserves optional evidence and defaulted plan decisions.
+      input: z.toJSONSchema(PlanToolSchema, { io: "input", target: "draft-7" }) as ToolSchema.ValueSchema,
       options: { codemode: false },
       execute: async (args, context) => ({ content: await planFromTool(args, context) }),
     },
