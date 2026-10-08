@@ -671,6 +671,65 @@ test("V2 plan tools publish structured ACP metadata and compaction retains the p
   expect(JSON.stringify(compaction)).toContain("compound")
 })
 
+test("V2 update_goal_plan input is provider-safe JSON Schema", async () => {
+  const mock = makeMockContext()
+  await setupPlugin(mock as never)
+  const input = goalTool(mock, "update_goal_plan").input as unknown
+
+  const zodArtifactKeys = ["def", "checks", "shape", "optional", "catchall", "isFinite", "minValue", "maxValue", "isInt"]
+  const walk = (node: unknown, path: string, visit: (key: string, value: unknown, path: string) => void) => {
+    if (Array.isArray(node)) {
+      node.forEach((child, index) => walk(child, `${path}[${index}]`, visit))
+      return
+    }
+    if (node === null || typeof node !== "object") return
+    for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
+      visit(key, value, `${path}.${key}`)
+      walk(value, `${path}.${key}`, visit)
+    }
+  }
+
+  const invalid: string[] = []
+  walk(input, "input", (key, value, path) => {
+    if (zodArtifactKeys.includes(key)) invalid.push(`zod artifact key "${key}" at ${path}`)
+    if (value === null) invalid.push(`null value for "${key}" at ${path}`)
+  })
+  expect(invalid).toEqual([])
+
+  const root = input as { type?: string; properties?: Record<string, unknown>; required?: string[]; additionalProperties?: boolean }
+  expect(root.type).toBe("object")
+  expect(root.additionalProperties).toBe(false)
+  expect(Object.keys(root.properties ?? {}).sort()).toEqual([
+    "expected_revision",
+    "goal_id",
+    "plan",
+    "reason",
+    "revisit_evidence",
+  ])
+  expect(root.required?.sort()).toEqual(["expected_revision", "goal_id", "plan", "reason"])
+})
+
+test("V2 update_goal_plan registrations do not share a mutable input schema", async () => {
+  const first = makeMockContext({ auto_continue: false })
+  await setupPlugin(first as never)
+  const second = makeMockContext({ auto_continue: false })
+  await setupPlugin(second as never)
+
+  // Simulate a host or test framework that mutates a received tool input.
+  const corrupted = (goalTool(first, "update_goal_plan").input as { properties?: Record<string, unknown> })
+    .properties
+  if (corrupted) for (const key of Object.keys(corrupted)) delete corrupted[key]
+
+  const survivor = goalTool(second, "update_goal_plan").input as { properties?: Record<string, unknown> }
+  expect(Object.keys(survivor.properties ?? {}).sort()).toEqual([
+    "expected_revision",
+    "goal_id",
+    "plan",
+    "reason",
+    "revisit_evidence",
+  ])
+})
+
 test("V2 setup registers /goal, /pause_goal, and /resume_goal via command transform", async () => {
   const mock = makeMockContext({ auto_continue: false })
   const cleanup = await setupPlugin(mock as never)
