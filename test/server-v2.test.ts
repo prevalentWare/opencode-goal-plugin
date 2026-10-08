@@ -363,14 +363,19 @@ test("V2 plan tool publishes JSON Schema with required fields and optional neste
   expect(phase.additionalProperties).toBe(false)
   const tasks = phase.properties.tasks
   expect(tasks).toMatchObject({ type: "array", minItems: 1, maxItems: 128 })
-  expect(tasks.items.required).toEqual(["id", "description", "status"])
-  expect(tasks.items.additionalProperties).toBe(false)
-  expect(tasks.items.properties.status).toEqual({
+  const task = tasks.items
+  expect(task.required).toEqual(["id", "description", "status"])
+  expect(task.additionalProperties).toBe(false)
+  expect(task.properties.status).toEqual({
     type: "string",
     enum: ["pending", "in_progress", "completed", "blocked"],
   })
-  for (const field of [phase.properties.verification, phase.properties.blocker,
-    tasks.items.properties.evidence, tasks.items.properties.blocker]) {
+  for (const field of [
+    phase.properties.verification,
+    phase.properties.blocker,
+    task.properties.evidence,
+    task.properties.blocker,
+  ]) {
     expect(field.anyOf).toEqual([
       { type: "string", minLength: 1, maxLength: 2000 },
       { type: "null" },
