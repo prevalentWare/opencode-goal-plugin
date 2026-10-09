@@ -730,6 +730,53 @@ test("V2 update_goal_plan registrations do not share a mutable input schema", as
   ])
 })
 
+// Nested plan schema assertions ported from #68 (authored by @abeisleem, commits
+// b88c9e2/e44a291) with thanks — they complement the wire-safety checks above by
+// pinning the serialized nested plan structure.
+test("V2 plan tool publishes JSON Schema with required fields and optional nested evidence", async () => {
+  const mock = makeMockContext({ auto_continue: false })
+  await setupPlugin(mock as never)
+  // Inspect the serialized wire schema, not only the outer object wrapper.
+  const input = JSON.parse(JSON.stringify(goalTool(mock, "update_goal_plan").input))
+  expect(input.required).toEqual(["goal_id", "expected_revision", "plan", "reason"])
+  expect(input.additionalProperties).toBe(false)
+  expect(input.properties.goal_id).toMatchObject({ type: "string", minLength: 1 })
+  expect(input.properties.expected_revision).toMatchObject({ type: "integer", minimum: 0 })
+  expect(input.properties.reason).toMatchObject({ type: "string", minLength: 1, maxLength: 2000 })
+  expect(input.properties.revisit_evidence).toMatchObject({ type: "string", minLength: 1, maxLength: 2000 })
+
+  const plan = input.properties.plan
+  expect(plan.required).toEqual(["summary", "completionCriteria", "phases"])
+  expect(plan.additionalProperties).toBe(false)
+  expect(plan.properties.decisions).toMatchObject({ type: "array", default: [], maxItems: 32 })
+  expect(plan.properties.completionCriteria).toMatchObject({ type: "array", minItems: 1, maxItems: 32 })
+  const phases = plan.properties.phases
+  expect(phases).toMatchObject({ type: "array", minItems: 1, maxItems: 64 })
+  const phase = phases.items
+  expect(phase.required).toEqual(["id", "objective", "status", "tasks"])
+  expect(phase.additionalProperties).toBe(false)
+  const tasks = phase.properties.tasks
+  expect(tasks).toMatchObject({ type: "array", minItems: 1, maxItems: 128 })
+  const task = tasks.items
+  expect(task.required).toEqual(["id", "description", "status"])
+  expect(task.additionalProperties).toBe(false)
+  expect(task.properties.status).toEqual({
+    type: "string",
+    enum: ["pending", "in_progress", "completed", "blocked"],
+  })
+  for (const field of [
+    phase.properties.verification,
+    phase.properties.blocker,
+    task.properties.evidence,
+    task.properties.blocker,
+  ]) {
+    expect(field.anyOf).toEqual([
+      { type: "string", minLength: 1, maxLength: 2000 },
+      { type: "null" },
+    ])
+  }
+})
+
 test("V2 setup registers /goal, /pause_goal, and /resume_goal via command transform", async () => {
   const mock = makeMockContext({ auto_continue: false })
   const cleanup = await setupPlugin(mock as never)

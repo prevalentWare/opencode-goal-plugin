@@ -1068,8 +1068,13 @@ const PlanToolSchema = z.object(planToolArgs).strict()
  * `maxLength: null` or `format: null`. Providers that strictly validate tool
  * schemas (for example Mistral mistral-large-4) reject those requests with
  * `Invalid tool schema`, breaking every session that includes the goal tools.
- * Convert once here; runtime argument validation is unaffected because
- * planFromTool still parses through PlanToolSchema.
+ *
+ * The V2 plugin API accepts JSON Schema rather than the zod objects used by
+ * the V1 tool API. `io: "input"` keeps the schema provider-facing: optional
+ * `revisit_evidence` stays out of `required`, and `decisions` keeps its
+ * `default` instead of being pinned as required output. Convert once here;
+ * runtime argument validation is unaffected because planFromTool still parses
+ * through PlanToolSchema.
  */
 const planToolInputSchema = z.toJSONSchema(PlanToolSchema, {
   io: "input",
