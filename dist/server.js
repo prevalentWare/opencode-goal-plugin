@@ -3004,6 +3004,13 @@ var planToolArgs = {
   revisit_evidence: z2.string().trim().min(1).max(2000).optional()
 };
 var PlanToolSchema = z2.object(planToolArgs).strict();
+var planToolInputSchema = z2.toJSONSchema(PlanToolSchema, {
+  io: "input",
+  unrepresentable: "any"
+});
+function planToolInput() {
+  return JSON.parse(JSON.stringify(planToolInputSchema));
+}
 async function planFromTool(args, context) {
   const input = PlanToolSchema.parse(args);
   return JSON.stringify({
@@ -4948,7 +4955,7 @@ function goalToolsV2(services) {
     {
       name: "update_goal_plan",
       description: services.locale === "zh-CN" ? "\u4FDD\u5B58\u76EE\u6807\u7684\u6574\u4F53\u8BA1\u5212\u3001\u9636\u6BB5\u3001\u4EFB\u52A1\u548C\u9A8C\u8BC1\u8BC1\u636E\u3002\u4FDD\u6301\u6574\u4F53\u76EE\u6807\u4E0D\u53D8\uFF1B\u4F7F\u7528 get_goal \u8FD4\u56DE\u7684\u76EE\u6807 ID \u548C\u8BA1\u5212\u7248\u672C\u3002" : "Persist the overall plan, phases, tasks, verification evidence and decisions. Preserve the goal scope; use the goal ID and planRevision from get_goal. Completed work cannot be silently reopened or removed.",
-      input: v2ObjectSchema(planToolArgs),
+      input: planToolInput(),
       options: { codemode: false },
       execute: async (args, context) => ({ content: await planFromTool(args, context) })
     },

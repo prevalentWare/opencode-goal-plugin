@@ -1059,6 +1059,40 @@ const planToolArgs = {
 }
 const PlanToolSchema = z.object(planToolArgs).strict()
 
+/**
+ * JSON Schema for the V2 update_goal_plan tool input.
+ *
+ * Passing the raw zod objects from planToolArgs as the V2 tool `input` leaks
+ * zod internals into the schema hosts send to providers: serialized artifacts
+ * like `def`, `checks`, `shape`, `optional`, and null-valued keywords such as
+ * `maxLength: null` or `format: null`. Providers that strictly validate tool
+ * schemas (for example Mistral mistral-large-4) reject those requests with
+ * `Invalid tool schema`, breaking every session that includes the goal tools.
+ *
+ * The V2 plugin API accepts JSON Schema rather than the zod objects used by
+ * the V1 tool API. `io: "input"` keeps the schema provider-facing: optional
+ * `revisit_evidence` stays out of `required`, and `decisions` keeps its
+ * `default` instead of being pinned as required output. Convert once here;
+ * runtime argument validation is unaffected because planFromTool still parses
+ * through PlanToolSchema.
+ */
+const planToolInputSchema = z.toJSONSchema(PlanToolSchema, {
+  io: "input",
+  unrepresentable: "any",
+}) as ToolSchema.ValueSchema
+
+/**
+ * Deep copy of {@link planToolInputSchema} for each tool registration.
+ *
+ * Registrations share one module instance, so handing out the schema object
+ * itself would let any host (or test framework) that mutates a received tool
+ * input corrupt the schema for every other registration. The schema is pure
+ * JSON, so a JSON round-trip is a sufficient deep copy.
+ */
+function planToolInput(): ToolSchema.ValueSchema {
+  return JSON.parse(JSON.stringify(planToolInputSchema)) as ToolSchema.ValueSchema
+}
+
 async function planFromTool(args: unknown, context: ToolExecContext) {
   const input = PlanToolSchema.parse(args)
   return JSON.stringify(
@@ -3356,7 +3390,7 @@ function goalToolsV2(services: GoalServices): ToolV2Info[] {
     {
       name: "update_goal_plan",
       description: services.locale === "zh-CN" ? "保存目标的整体计划、阶段、任务和验证证据。保持整体目标不变；使用 get_goal 返回的目标 ID 和计划版本。" : "Persist the overall plan, phases, tasks, verification evidence and decisions. Preserve the goal scope; use the goal ID and planRevision from get_goal. Completed work cannot be silently reopened or removed.",
-      input: v2ObjectSchema(planToolArgs),
+      input: planToolInput(),
       options: { codemode: false },
       execute: async (args, context) => ({ content: await planFromTool(args, context) }),
     },

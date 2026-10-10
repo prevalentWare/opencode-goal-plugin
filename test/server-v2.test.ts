@@ -671,6 +671,112 @@ test("V2 plan tools publish structured ACP metadata and compaction retains the p
   expect(JSON.stringify(compaction)).toContain("compound")
 })
 
+test("V2 update_goal_plan input is provider-safe JSON Schema", async () => {
+  const mock = makeMockContext()
+  await setupPlugin(mock as never)
+  const input = goalTool(mock, "update_goal_plan").input as unknown
+
+  const zodArtifactKeys = ["def", "checks", "shape", "optional", "catchall", "isFinite", "minValue", "maxValue", "isInt"]
+  const walk = (node: unknown, path: string, visit: (key: string, value: unknown, path: string) => void) => {
+    if (Array.isArray(node)) {
+      node.forEach((child, index) => walk(child, `${path}[${index}]`, visit))
+      return
+    }
+    if (node === null || typeof node !== "object") return
+    for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
+      visit(key, value, `${path}.${key}`)
+      walk(value, `${path}.${key}`, visit)
+    }
+  }
+
+  const invalid: string[] = []
+  walk(input, "input", (key, value, path) => {
+    if (zodArtifactKeys.includes(key)) invalid.push(`zod artifact key "${key}" at ${path}`)
+    if (value === null) invalid.push(`null value for "${key}" at ${path}`)
+  })
+  expect(invalid).toEqual([])
+
+  const root = input as { type?: string; properties?: Record<string, unknown>; required?: string[]; additionalProperties?: boolean }
+  expect(root.type).toBe("object")
+  expect(root.additionalProperties).toBe(false)
+  expect(Object.keys(root.properties ?? {}).sort()).toEqual([
+    "expected_revision",
+    "goal_id",
+    "plan",
+    "reason",
+    "revisit_evidence",
+  ])
+  expect(root.required?.sort()).toEqual(["expected_revision", "goal_id", "plan", "reason"])
+})
+
+test("V2 update_goal_plan registrations do not share a mutable input schema", async () => {
+  const first = makeMockContext({ auto_continue: false })
+  await setupPlugin(first as never)
+  const second = makeMockContext({ auto_continue: false })
+  await setupPlugin(second as never)
+
+  // Simulate a host or test framework that mutates a received tool input.
+  const corrupted = (goalTool(first, "update_goal_plan").input as { properties?: Record<string, unknown> })
+    .properties
+  if (corrupted) for (const key of Object.keys(corrupted)) delete corrupted[key]
+
+  const survivor = goalTool(second, "update_goal_plan").input as { properties?: Record<string, unknown> }
+  expect(Object.keys(survivor.properties ?? {}).sort()).toEqual([
+    "expected_revision",
+    "goal_id",
+    "plan",
+    "reason",
+    "revisit_evidence",
+  ])
+})
+
+// Nested plan schema assertions ported from #68 (authored by @abeisleem, commits
+// b88c9e2/e44a291) with thanks — they complement the wire-safety checks above by
+// pinning the serialized nested plan structure.
+test("V2 plan tool publishes JSON Schema with required fields and optional nested evidence", async () => {
+  const mock = makeMockContext({ auto_continue: false })
+  await setupPlugin(mock as never)
+  // Inspect the serialized wire schema, not only the outer object wrapper.
+  const input = JSON.parse(JSON.stringify(goalTool(mock, "update_goal_plan").input))
+  expect(input.required).toEqual(["goal_id", "expected_revision", "plan", "reason"])
+  expect(input.additionalProperties).toBe(false)
+  expect(input.properties.goal_id).toMatchObject({ type: "string", minLength: 1 })
+  expect(input.properties.expected_revision).toMatchObject({ type: "integer", minimum: 0 })
+  expect(input.properties.reason).toMatchObject({ type: "string", minLength: 1, maxLength: 2000 })
+  expect(input.properties.revisit_evidence).toMatchObject({ type: "string", minLength: 1, maxLength: 2000 })
+
+  const plan = input.properties.plan
+  expect(plan.required).toEqual(["summary", "completionCriteria", "phases"])
+  expect(plan.additionalProperties).toBe(false)
+  expect(plan.properties.decisions).toMatchObject({ type: "array", default: [], maxItems: 32 })
+  expect(plan.properties.completionCriteria).toMatchObject({ type: "array", minItems: 1, maxItems: 32 })
+  const phases = plan.properties.phases
+  expect(phases).toMatchObject({ type: "array", minItems: 1, maxItems: 64 })
+  const phase = phases.items
+  expect(phase.required).toEqual(["id", "objective", "status", "tasks"])
+  expect(phase.additionalProperties).toBe(false)
+  const tasks = phase.properties.tasks
+  expect(tasks).toMatchObject({ type: "array", minItems: 1, maxItems: 128 })
+  const task = tasks.items
+  expect(task.required).toEqual(["id", "description", "status"])
+  expect(task.additionalProperties).toBe(false)
+  expect(task.properties.status).toEqual({
+    type: "string",
+    enum: ["pending", "in_progress", "completed", "blocked"],
+  })
+  for (const field of [
+    phase.properties.verification,
+    phase.properties.blocker,
+    task.properties.evidence,
+    task.properties.blocker,
+  ]) {
+    expect(field.anyOf).toEqual([
+      { type: "string", minLength: 1, maxLength: 2000 },
+      { type: "null" },
+    ])
+  }
+})
+
 test("V2 setup registers /goal, /pause_goal, and /resume_goal via command transform", async () => {
   const mock = makeMockContext({ auto_continue: false })
   const cleanup = await setupPlugin(mock as never)
