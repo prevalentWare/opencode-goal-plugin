@@ -4865,15 +4865,19 @@ async function setupV2(context) {
       cancelScheduledContinuation(sessionID);
     }
   }));
-  registrations.push(await context.session.hook("context", (sessionContext) => {
-    const reminder = systemReminder(locale);
-    if (sessionContext.system.some((part) => part.type === "text" && part.text.includes(reminder)))
+  const reminder = systemReminder(locale);
+  const ensureSystemReminder = (system) => {
+    if (system.some((part) => part.type === "text" && part.text.includes(reminder)))
       return;
-    sessionContext.system.push({ type: "text", text: reminder });
+    system.push({ type: "text", text: reminder });
+  };
+  registrations.push(await context.session.hook("context", (sessionContext) => {
+    ensureSystemReminder(sessionContext.system);
   }));
   try {
     const hookCompaction = context.session.hook;
     registrations.push(await hookCompaction("compaction", async (event) => {
+      ensureSystemReminder(event.system);
       const goal = await getGoal(event.sessionID);
       if (!goal)
         return;

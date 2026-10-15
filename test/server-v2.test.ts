@@ -1148,9 +1148,13 @@ test("V2 compaction hook preserves the active goal for the summarizer", async ()
   await createGoalViaV2Tool(mock, "Ship the compaction-safe goal feature")
 
   const compactionHook = mock.hooks["compaction"]!
+  const contextHook = mock.hooks["context"]!
   expect(compactionHook).toBeTypeOf("function")
+  const ordinary = { sessionID: "ses_v2", agent: "build", system: [] as Array<{ type: string; text: string }>, messages: [], tools: {} }
+  await contextHook(ordinary)
   const compaction = { sessionID: "ses_v2", agent: "build", system: [] as Array<{ type: string; text: string }>, messages: [], tools: {} }
   await compactionHook(compaction)
+  expect(compaction.system[0]).toEqual(ordinary.system[0])
   expect(compaction.system.some((part) => part.type === "text" && part.text.includes("OpenCode goal mode is tracking this session goal across compaction."))).toBe(true)
   expect(compaction.system.some((part) => part.type === "text" && part.text.includes("Ship the compaction-safe goal feature"))).toBe(true)
 
@@ -1158,10 +1162,12 @@ test("V2 compaction hook preserves the active goal for the summarizer", async ()
   await compactionHook(compaction)
   expect(compaction.system.filter((part) => part.type === "text" && part.text.includes("OpenCode goal mode is tracking"))).toHaveLength(1)
 
-  // Sessions without a goal are left untouched.
+  // Without a goal, compaction uses the same system policy as ordinary requests.
   const foreign = { sessionID: "ses_other", agent: "build", system: [] as Array<{ type: string; text: string }>, messages: [], tools: {} }
   await compactionHook(foreign)
-  expect(foreign.system).toHaveLength(0)
+  expect(foreign.system).toEqual(ordinary.system)
+  await compactionHook(foreign)
+  expect(foreign.system).toEqual(ordinary.system)
 
   mock.stream.end()
   await cleanup()

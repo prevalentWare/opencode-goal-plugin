@@ -3281,11 +3281,15 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
     }),
   )
 
+  const reminder = systemReminder(locale)
+  const ensureSystemReminder = (system: Array<{ type: string; text: string }>) => {
+    if (system.some((part) => part.type === "text" && part.text.includes(reminder))) return
+    system.push({ type: "text", text: reminder })
+  }
+
   registrations.push(
     await context.session.hook("context", (sessionContext) => {
-      const reminder = systemReminder(locale)
-      if (sessionContext.system.some((part) => part.type === "text" && part.text.includes(reminder))) return
-      sessionContext.system.push({ type: "text", text: reminder })
+      ensureSystemReminder(sessionContext.system)
     }),
   )
 
@@ -3302,6 +3306,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
     ) => Promise<{ dispose(): Promise<void> }>
     registrations.push(
       await hookCompaction("compaction", async (event) => {
+        ensureSystemReminder(event.system)
         const goal = await getGoal(event.sessionID)
         if (!goal) return
         if (event.system.some((part) => part.type === "text" && part.text.startsWith(compactionContextPrefix(locale)))) return
