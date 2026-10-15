@@ -3263,6 +3263,7 @@ var server = async ({ client }, options) => {
   const scheduledContinuations = new Map;
   const turnWatchdogs = new Map;
   const busySessions = new Set;
+  const busyRevisions = new Map;
   const nativeRetrySessions = new Set;
   const locallyDeliveredPendingSessions = new Set;
   const toolAttempts = new Map;
@@ -3458,13 +3459,52 @@ var server = async ({ client }, options) => {
       maybeUnref.unref();
     scheduledContinuations.set(sessionID, scheduled);
   }
+  async function rearmBusyContinuation(sessionID, scheduled) {
+    if (scheduled && scheduledContinuations.get(sessionID) !== scheduled)
+      return;
+    const goal = await getGoalInternal(sessionID);
+    if (!taskDeferralGoalContinuable(goal)) {
+      cancelScheduledContinuation(sessionID);
+      return;
+    }
+    scheduleSettledContinuation(sessionID, TASK_BLOCK_RETRY_MS, scheduled != null, scheduled?.purpose ?? "settle");
+  }
+  async function scheduledSessionBusy(sessionID, scheduled) {
+    if (!scheduled)
+      return busySessions.has(sessionID);
+    const session = client.session;
+    if (!session.status)
+      return busySessions.has(sessionID);
+    const busyRevision = busyRevisions.get(sessionID) ?? 0;
+    try {
+      const result = await session.status();
+      if (!isRecord(result) || result.error != null)
+        return true;
+      const statuses = isRecord(result.data) ? result.data : ("data" in result) || ("response" in result) ? null : result;
+      if (!statuses)
+        return true;
+      const status2 = statuses[sessionID];
+      if (isRecord(status2) && (status2.type === "busy" || status2.type === "retry"))
+        return true;
+      if ((status2 == null || isRecord(status2) && status2.type === "idle") && (busyRevisions.get(sessionID) ?? 0) === busyRevision) {
+        busySessions.delete(sessionID);
+      }
+    } catch {
+      return true;
+    }
+    return busySessions.has(sessionID);
+  }
   async function runAutoContinue(sessionID, fromTaskDeferral = false, scheduled) {
     if (disposed)
       return;
-    if (busySessions.has(sessionID))
+    if (busySessions.has(sessionID) && !scheduled) {
+      await rearmBusyContinuation(sessionID);
       return;
-    if (activeContinuations.has(sessionID))
+    }
+    if (activeContinuations.has(sessionID)) {
+      await rearmBusyContinuation(sessionID, scheduled);
       return;
+    }
     const epoch = continuationEpochs.current(sessionID);
     const isCurrent = () => !disposed && epoch === continuationEpochs.current(sessionID);
     activeContinuations.add(sessionID);
@@ -3472,6 +3512,10 @@ var server = async ({ client }, options) => {
     let attemptGoalID;
     let attemptID;
     try {
+      if (await scheduledSessionBusy(sessionID, scheduled)) {
+        await rearmBusyContinuation(sessionID, scheduled);
+        return;
+      }
       const latestAssistant = await fetchLatestAssistant(client, sessionID);
       if (!isCurrent())
         return;
@@ -3492,8 +3536,12 @@ var server = async ({ client }, options) => {
         scheduleSettledContinuation(sessionID, taskStatus.retryAt != null ? taskStatus.retryAt - Date.now() : TASK_BLOCK_RETRY_MS, scheduled != null || taskStatus.retryAt != null);
         return;
       }
-      if (!isCurrent() || busySessions.has(sessionID))
+      if (!isCurrent())
         return;
+      if (busySessions.has(sessionID)) {
+        await rearmBusyContinuation(sessionID, scheduled);
+        return;
+      }
       const observed = await recordAssistantMessage(sessionID, latestAssistant, options ?? {}, true);
       await reconcileLocalMarkerAfterProgress(locallyDeliveredPendingSessions, sessionID, observed.goal);
       const queued = scheduledContinuations.get(sessionID);
@@ -3510,8 +3558,10 @@ var server = async ({ client }, options) => {
           await pauseGoalForPlanMode(sessionID);
         return;
       }
-      if (busySessions.has(sessionID))
+      if (busySessions.has(sessionID)) {
+        await rearmBusyContinuation(sessionID, scheduled);
         return;
+      }
       if (!fromTaskDeferral && taskDeferredSessions.has(sessionID)) {
         scheduleSettledContinuation(sessionID);
         return;
@@ -3549,8 +3599,11 @@ var server = async ({ client }, options) => {
       attemptGoalID = goal.id;
       attemptID = goal.pendingAttempt?.id;
       const beforeDelivery = await getGoalInternal(sessionID);
-      if (!isCurrent() || !continuationStillReserved(goal, beforeDelivery) || busySessions.has(sessionID) || nativeRetrySessions.has(sessionID)) {
+      const busyBeforeDelivery = await scheduledSessionBusy(sessionID, scheduled);
+      if (!isCurrent() || !continuationStillReserved(goal, beforeDelivery) || busyBeforeDelivery || nativeRetrySessions.has(sessionID)) {
         await rollbackContinuationAttempt(sessionID, { goalID: attemptGoalID, attemptID });
+        if (isCurrent() && busyBeforeDelivery)
+          await rearmBusyContinuation(sessionID, scheduled);
         return;
       }
       if (scheduled && scheduledContinuations.get(sessionID) !== scheduled) {
@@ -3871,6 +3924,7 @@ var server = async ({ client }, options) => {
         if (isRecord(status2) && typeof status2.type === "string") {
           if (status2.type === "busy") {
             busySessions.add(sessionID);
+            busyRevisions.set(sessionID, (busyRevisions.get(sessionID) ?? 0) + 1);
             nativeRetrySessions.delete(sessionID);
           }
           if (status2.type === "busy")
@@ -3934,6 +3988,7 @@ var server = async ({ client }, options) => {
         continuationEpochs.invalidate(sessionID);
         explicitResumeRequests.delete(sessionID);
         busySessions.delete(sessionID);
+        busyRevisions.delete(sessionID);
         clearTurnWatchdog(sessionID);
         watchdogRescuedSessions.delete(sessionID);
         locallyDeliveredPendingSessions.delete(sessionID);
@@ -3987,6 +4042,7 @@ async function setupV2(context) {
   const scheduledContinuations = new Map;
   const turnWatchdogs = new Map;
   const busySessions = new Set;
+  const busyRevisions = new Map;
   const nativeRetrySessions = new Set;
   const locallyDeliveredPendingSessions = new Set;
   const watchdogRescuedSessions = new Set;
@@ -4189,25 +4245,59 @@ async function setupV2(context) {
       maybeUnref.unref();
     scheduledContinuations.set(sessionID, scheduled);
   }
+  async function rearmBusyContinuation(sessionID, scheduled) {
+    if (scheduled && scheduledContinuations.get(sessionID) !== scheduled)
+      return;
+    const goal = await getGoalInternal(sessionID);
+    if (!taskDeferralGoalContinuable(goal)) {
+      cancelScheduledContinuation(sessionID);
+      return;
+    }
+    scheduleSettledContinuation(sessionID, TASK_BLOCK_RETRY_MS, scheduled != null, scheduled?.purpose ?? "settle");
+  }
   async function runAutoContinue(sessionID, fromTaskDeferral = false, scheduled) {
     if (disposed)
       return;
     if (stoppedExecutions.has(sessionID))
       return;
-    if (busySessions.has(sessionID))
+    if (busySessions.has(sessionID) && !scheduled) {
+      await rearmBusyContinuation(sessionID);
       return;
-    if (activeContinuationsV2.has(sessionID))
+    }
+    if (activeContinuationsV2.has(sessionID)) {
+      await rearmBusyContinuation(sessionID, scheduled);
       return;
+    }
     const epoch = continuationEpochs.current(sessionID);
     const isCurrent = () => !disposed && epoch === continuationEpochs.current(sessionID);
     await taskRecoveryComplete;
-    if (!isCurrent() || stoppedExecutions.has(sessionID) || busySessions.has(sessionID))
+    if (!isCurrent() || stoppedExecutions.has(sessionID))
       return;
     activeContinuationsV2.add(sessionID);
     let attemptReservedAt = Date.now();
     let attemptGoalID;
     let attemptID;
     try {
+      if (scheduled && typeof context.session.wait === "function") {
+        const busyRevision = busyRevisions.get(sessionID) ?? 0;
+        try {
+          const signal = AbortSignal.any([abortController.signal, AbortSignal.timeout(TASK_BLOCK_RETRY_MS)]);
+          await context.session.wait({ sessionID }, { signal });
+        } catch {
+          if (!isCurrent() || abortController.signal.aborted)
+            return;
+          await rearmBusyContinuation(sessionID, scheduled);
+          return;
+        }
+        if ((busyRevisions.get(sessionID) ?? 0) === busyRevision)
+          busySessions.delete(sessionID);
+      }
+      if (!isCurrent() || stoppedExecutions.has(sessionID))
+        return;
+      if (busySessions.has(sessionID)) {
+        await rearmBusyContinuation(sessionID, scheduled);
+        return;
+      }
       const latestStep = latestStepBySession.get(sessionID);
       if (latestStep?.messageID) {
         taskTracker.observeAssistantMessage(sessionID, { info: { id: latestStep.messageID, role: "assistant" } });
@@ -4226,8 +4316,10 @@ async function setupV2(context) {
         scheduleSettledContinuation(sessionID, taskStatus.retryAt != null ? taskStatus.retryAt - Date.now() : TASK_BLOCK_RETRY_MS, scheduled != null);
         return;
       }
-      if (busySessions.has(sessionID))
+      if (busySessions.has(sessionID)) {
+        await rearmBusyContinuation(sessionID, scheduled);
         return;
+      }
       if (latestStep) {
         const beforeProgress = await getGoalInternal(sessionID);
         const after = await recordAssistantProgress(sessionID, {
@@ -4256,8 +4348,10 @@ async function setupV2(context) {
           await pauseGoalForPlanMode(sessionID);
         return;
       }
-      if (busySessions.has(sessionID))
+      if (busySessions.has(sessionID)) {
+        await rearmBusyContinuation(sessionID, scheduled);
         return;
+      }
       if (!fromTaskDeferral && taskDeferredSessions.has(sessionID)) {
         scheduleSettledContinuation(sessionID);
         return;
@@ -4302,6 +4396,8 @@ async function setupV2(context) {
       const beforeDelivery = await getGoalInternal(sessionID);
       if (!isCurrent() || !continuationStillReserved(goal, beforeDelivery) || busySessions.has(sessionID) || nativeRetrySessions.has(sessionID)) {
         await rollbackContinuationAttempt(sessionID, { goalID: attemptGoalID, attemptID });
+        if (isCurrent() && busySessions.has(sessionID))
+          await rearmBusyContinuation(sessionID, scheduled);
         return;
       }
       if (scheduled && scheduledContinuations.get(sessionID) !== scheduled) {
@@ -4436,6 +4532,7 @@ async function setupV2(context) {
           if (status2.type === "busy") {
             stoppedExecutions.delete(sessionID);
             busySessions.add(sessionID);
+            busyRevisions.set(sessionID, (busyRevisions.get(sessionID) ?? 0) + 1);
             nativeRetrySessions.delete(sessionID);
             armTurnWatchdog(sessionID);
             await markPendingContinuationStarted(sessionID);
@@ -4537,6 +4634,7 @@ async function setupV2(context) {
         stoppedExecutions.delete(sessionID);
         sessionOwnership.delete(sessionID);
         busySessions.delete(sessionID);
+        busyRevisions.delete(sessionID);
         clearTurnWatchdog(sessionID);
         watchdogRescuedSessions.delete(sessionID);
         locallyDeliveredPendingSessions.delete(sessionID);

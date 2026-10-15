@@ -2229,12 +2229,16 @@ test("idle live child session uses bounded deferral when task launch was missed"
 
 test("idle live child bounded retry does not inject while parent session is busy", async () => {
   const calls: unknown[] = []
+  let parentBusy = false
   const hooks = await setupServer(
     {
       client: {
         session: {
           children: async () => ({ data: [{ id: "task_1" }] }),
-          status: async () => ({ data: { task_1: { type: "idle" } } }),
+          status: async () => ({ data: {
+            task_1: { type: "idle" },
+            ...(parentBusy ? { ses_1: { type: "busy" } } : {}),
+          } }),
           promptAsync: async (input: unknown) => {
             calls.push(input)
           },
@@ -2248,12 +2252,14 @@ test("idle live child bounded retry does not inject while parent session is busy
 
   await requireTool(tools.create_goal, "create_goal").execute({ objective: "keep going" }, { sessionID: "ses_1" } as never)
   await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_1" } } as never })
+  parentBusy = true
   await hooks.event!({
     event: { type: "session.status", properties: { sessionID: "ses_1", status: { type: "busy" } } } as never,
   })
   await new Promise((resolve) => setTimeout(resolve, 300))
 
   expect(calls).toHaveLength(0)
+  parentBusy = false
   await hooks.event!({
     event: { type: "session.status", properties: { sessionID: "ses_1", status: { type: "idle" } } } as never,
   })
@@ -3474,6 +3480,78 @@ test("session.error without a pending attempt schedules recovery without a phant
   expect(String(recovered)).toContain('"status": "active"')
   expect(String(recovered)).toContain('"continuationFailures": 0')
   expect(String(recovered)).toContain('"autoTurns": 1')
+})
+
+test("V1 scheduled recovery retries after live busy status clears without an idle event", async () => {
+  const calls: unknown[] = []
+  let liveBusy = true
+  let statusReads = 0
+  const hooks = await setupServer(
+    {
+      client: {
+        session: {
+          status: async () => {
+            statusReads += 1
+            return { data: liveBusy ? { ses_live_busy: { type: "busy" } } : {} }
+          },
+          promptAsync: async (input: unknown) => { calls.push(input) },
+        },
+      },
+    } as never,
+    { auto_continue: true, max_auto_turns: 5, min_continue_interval_seconds: 0 },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+  const sessionID = "ses_live_busy"
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "resume when idle" }, { sessionID } as never)
+  await hooks.event!({
+    event: {
+      type: "session.error",
+      properties: { sessionID, error: { name: "AI_APICallError", message: "Cannot connect to API" } },
+    } as never,
+  })
+  await hooks.event!({
+    event: { type: "session.status", properties: { sessionID, status: { type: "busy" } } } as never,
+  })
+  await waitForLong(() => statusReads > 0)
+  expect(calls).toHaveLength(0)
+  liveBusy = false
+  await waitForLong(() => calls.length === 1, 3000)
+  expect((await getGoal(sessionID))?.autoTurns).toBe(1)
+  await hooks.dispose?.()
+})
+
+test("V1 scheduled recovery treats an API error response as unknown busy state", async () => {
+  const calls: unknown[] = []
+  let statusReads = 0
+  const hooks = await setupServer(
+    {
+      client: {
+        session: {
+          status: async () => {
+            statusReads += 1
+            return { error: { message: "status unavailable" }, data: undefined }
+          },
+          promptAsync: async (input: unknown) => { calls.push(input) },
+        },
+      },
+    } as never,
+    { auto_continue: true, min_continue_interval_seconds: 0 },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+  const sessionID = "ses_status_error"
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "wait for status" }, { sessionID } as never)
+  await hooks.event!({
+    event: {
+      type: "session.error",
+      properties: { sessionID, error: { name: "AI_APICallError", message: "Cannot connect to API" } },
+    } as never,
+  })
+  await waitForLong(() => statusReads > 0)
+  expect(calls).toHaveLength(0)
+  expect((await getGoal(sessionID))?.autoTurns).toBe(0)
+  await hooks.dispose?.()
 })
 
 test("restart resolves a persisted started pending attempt at the next idle", async () => {

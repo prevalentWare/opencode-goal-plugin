@@ -115,6 +115,7 @@ type MockContext = {
     } & MockPrompt) => Promise<unknown>
     context: (input: { sessionID: string }) => Promise<unknown[]>
     get: (input: { sessionID: string }) => Promise<{ data?: { location?: { directory: string; workspaceID?: string | null } } }>
+    wait: (input: { sessionID: string }, options?: { signal?: AbortSignal }) => Promise<void>
   }
   event: {
     subscribe: (options?: { signal?: AbortSignal }) => AsyncIterable<unknown>
@@ -187,6 +188,7 @@ function makeMockContext(
         sessionGetCalls.push(input.sessionID)
         return { data: sessionInfos[input.sessionID] }
       },
+      wait: async () => {},
     },
     event: {
       subscribe: () => stream,
@@ -1694,8 +1696,44 @@ test("V2 fast execution success schedules the next continuation after the minimu
   mock.stream.push({ type: "session.text.ended", created: Date.now(), data: { sessionID: "ses_v2", assistantMessageID: "msg_fast", text: "A new milestone was verified successfully." } })
   mock.stream.push({ type: "session.step.ended", created: Date.now(), data: { sessionID: "ses_v2", assistantMessageID: "msg_fast", tokens: { output: 100 } } })
   await mock.stream.push({ type: "session.execution.succeeded", created: Date.now(), data: { sessionID: "ses_v2" } })
-  await waitFor(() => mock.promptCalls.length === 2)
+  let releaseWait = () => {}
+  let waiting = false
+  const idleBarrier = new Promise<void>((resolve) => { releaseWait = resolve })
+  mock.session.wait = async () => { waiting = true; await idleBarrier }
+  await mock.stream.push({ type: "session.execution.started", created: Date.now(), data: { sessionID: "ses_v2" } })
+  await waitFor(() => waiting, 2500)
+  expect(mock.promptCalls).toHaveLength(1)
+  await mock.stream.push({ type: "session.execution.succeeded", created: Date.now(), data: { sessionID: "ses_v2" } })
+  releaseWait()
+  mock.session.wait = async () => {}
+  await waitFor(() => mock.promptCalls.length === 2, 3000)
   expect((await getGoal("ses_v2"))!.lastContinuationAt! - first).toBeGreaterThanOrEqual(1)
+  mock.stream.end()
+  await cleanup()
+})
+
+test("V2 timed continuation waits for a live run boundary even when busy events are missing", async () => {
+  const mock = makeMockContext({ min_continue_interval_seconds: 1 })
+  const cleanup = await setupPlugin(mock as never)
+  await createGoalViaV2Tool(mock, "wait for the host run boundary")
+  await mock.stream.push({ type: "session.execution.succeeded", created: Date.now(), data: { sessionID: "ses_v2" } })
+  expect(mock.promptCalls).toHaveLength(1)
+  mock.stream.push({ type: "session.execution.started", created: Date.now(), data: { sessionID: "ses_v2" } })
+  mock.stream.push({ type: "session.step.started", created: Date.now(), data: { sessionID: "ses_v2", assistantMessageID: "msg_streaming", agent: "build" } })
+  mock.stream.push({ type: "session.text.ended", created: Date.now(), data: { sessionID: "ses_v2", assistantMessageID: "msg_streaming", text: "A verified milestone in the same run." } })
+  mock.stream.push({ type: "session.step.ended", created: Date.now(), data: { sessionID: "ses_v2", assistantMessageID: "msg_streaming", tokens: { output: 100 } } })
+  await mock.stream.push({ type: "session.execution.succeeded", created: Date.now(), data: { sessionID: "ses_v2" } })
+
+  let releaseWait = () => {}
+  let waiting = false
+  const idleBarrier = new Promise<void>((resolve) => { releaseWait = resolve })
+  mock.session.wait = async () => { waiting = true; await idleBarrier }
+  // No busy event is delivered for the next execution; only the host's live
+  // wait barrier knows that another assistant step is still running.
+  await waitFor(() => waiting, 2500)
+  expect(mock.promptCalls).toHaveLength(1)
+  releaseWait()
+  await waitFor(() => mock.promptCalls.length === 2)
   mock.stream.end()
   await cleanup()
 })
@@ -2004,6 +2042,54 @@ test("V2 execution failure schedules bounded recovery without a phantom failure"
   expect(goal?.autoTurns).toBe(1)
   expect(goal?.status).toBe("active")
 
+  mock.stream.end()
+  await cleanup()
+})
+
+test("V2 timed-out idle check retries and clears an older busy marker at the live boundary", async () => {
+  const mock = makeMockContext({ auto_continue: true, min_continue_interval_seconds: 0 })
+  let waitCalls = 0
+  mock.session.wait = async (_input, options) => {
+    waitCalls += 1
+    if (waitCalls === 1) {
+      await new Promise<void>((_resolve, reject) => {
+        options?.signal?.addEventListener("abort", () => reject(new Error("wait timeout")), { once: true })
+      })
+    }
+  }
+  const cleanup = await setupPlugin(mock as never)
+  await createGoalViaV2Tool(mock, "recover after the host settles")
+  await mock.stream.push({
+    type: "session.execution.failed",
+    created: Date.now(),
+    data: { sessionID: "ses_v2", error: { message: "network connection failed" } },
+  })
+  await mock.stream.push({
+    type: "session.execution.started",
+    created: Date.now(),
+    data: { sessionID: "ses_v2" },
+  })
+  await waitFor(() => waitCalls === 1)
+  expect(mock.promptCalls).toHaveLength(0)
+  // The second live wait resolves after the host settles, without an idle
+  // event reaching this plugin instance to clear its older busy marker.
+  await waitFor(() => mock.promptCalls.length === 1, 3000)
+  expect(waitCalls).toBe(2)
+  mock.stream.end()
+  await cleanup()
+})
+
+test("V2 recovery remains available on hosts without a session wait method", async () => {
+  const mock = makeMockContext({ auto_continue: true, min_continue_interval_seconds: 0 })
+  mock.session.wait = undefined as never
+  const cleanup = await setupPlugin(mock as never)
+  await createGoalViaV2Tool(mock, "recover on an older host")
+  await mock.stream.push({
+    type: "session.execution.failed",
+    created: Date.now(),
+    data: { sessionID: "ses_v2", error: { message: "network connection failed" } },
+  })
+  await waitFor(() => mock.promptCalls.length === 1)
   mock.stream.end()
   await cleanup()
 })
