@@ -12,7 +12,7 @@ Links:
 
 - npm package: [`@prevalentware/opencode-goal-plugin`](https://www.npmjs.com/package/@prevalentware/opencode-goal-plugin)
 - GitHub repository: [`prevalentWare/opencode-goal-plugin`](https://github.com/prevalentWare/opencode-goal-plugin)
-- OpenCode plugin command: `opencode plugin @prevalentware/opencode-goal-plugin`
+- OpenCode 1 global install: `opencode plugin -g @prevalentware/opencode-goal-plugin`
 
 The OpenCode Goal Plugin adds:
 
@@ -49,19 +49,23 @@ Do not mix the configuration formats. OpenCode 1 uses `plugin` and `tui.json`; O
 
 ### OpenCode 1 Stable
 
-Install for the current project:
-
-```bash
-opencode plugin @prevalentware/opencode-goal-plugin
-```
-
-Install globally:
+For goal mode across your projects, install globally:
 
 ```bash
 opencode plugin -g @prevalentware/opencode-goal-plugin
 ```
 
-OpenCode detects both package entrypoints and writes the plugin into the server and TUI config targets.
+The global install registers the plugin in your user configuration and avoids creating a project-local `.opencode/`
+directory for its dependencies.
+
+If you want the plugin only in the current project, install it from that project's directory instead:
+
+```bash
+opencode plugin @prevalentware/opencode-goal-plugin
+```
+
+The project install can create `.opencode/` with plugin dependencies in your workspace. OpenCode detects both package
+entrypoints and writes the plugin into the corresponding server and TUI config targets.
 
 For manual installation, add the package to both V1 config files.
 
