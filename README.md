@@ -334,7 +334,21 @@ Registered `/goal <objective>` and `/resume_goal` commands use the host's public
 
 ### Persistent plans and ACP
 
-For multi-phase goals, `update_goal_plan` saves the overall completion criteria, phases, tasks, decisions, verification evidence, and a bounded revision history. Read `get_goal` first and send `goal_id`, `expected_revision`, `plan`, and a `reason`. The returned `planProgress` identifies the current task, next phase, and completed work. Concurrent or delayed updates to a replaced or edited goal are rejected.
+For multi-phase goals, `update_goal_plan` saves overall criteria, phases, tasks, decisions, verification evidence,
+and a bounded revision history. Create a plan with `goal_id`, `expected_revision`, the full `plan`, and a `reason`.
+For routine edits, send `plan_ops` instead of `plan`: `set_phase` changes status, verification, or blocker;
+`set_task` changes status, evidence, or blocker; `append_decision` records a decision. Operations in one call are
+validated and committed together. Use the current `planRevision` as `expected_revision`; concurrent or delayed
+updates to a replaced or edited goal are rejected.
+
+`get_goal` accepts `view: "summary"` for a small status, revision, and progress response; omit it or use `"full"`
+to retrieve the complete plan. `update_goal_plan` accepts `response_mode: "summary"` and defaults to a summary
+for `plan_ops`; full-plan calls retain the complete response by default. The continuation prompt includes the goal
+ID, revision, completion criteria, progress, and current work. `get_goal` and compaction retain the full plan.
+Summary views also include up to three blocked tasks in the current phase, their blockers, and the total blocked count.
+Completion criteria cannot change; blocked work needs a blocker, completed tasks need evidence, and completed
+phases need verification. Changing planned scope or reopening verified work requires concrete `revisit_evidence`;
+validation errors include field paths and report all detected violations in one response.
 
 Marking a task completed requires evidence; completing a phase requires all its tasks and phase verification. Start the next phase only after verifying the current phase. Completed work cannot be removed, and reopening it requires `revisit_evidence`. Removing or changing pending scope also requires concrete `revisit_evidence`, recorded with the revision. Overall completion criteria stay fixed until the user explicitly changes the goal's objective with `/goal edit <objective>` or replaces the goal. A goal with an unfinished plan cannot be marked complete. Explicit objective edits clear the old plan and increment its revision. Existing state files migrate automatically; plan data survives compaction and is retained in goal history.
 

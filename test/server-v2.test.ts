@@ -673,6 +673,48 @@ test("V2 plan tools publish structured ACP metadata and compaction retains the p
   expect(JSON.stringify(compaction)).toContain("compound")
 })
 
+test("V2 compact plan edits and reads avoid echoing the whole plan", async () => {
+  const mock = makeMockContext({ auto_continue: false })
+  await setupPlugin(mock as never)
+  await createGoalViaV2Tool(mock, "Deliver twelve phases")
+  const goal = (await getGoal("ses_v2"))!
+  const plan = {
+    summary: "Deliver twelve phases",
+    completionCriteria: ["All phases verified"],
+    phases: Array.from({ length: 12 }, (_, index) => ({
+      id: `phase-${index}`,
+      objective: `Phase ${index}: ${"long description ".repeat(15)}`,
+      status: index === 0 ? "in_progress" : "pending",
+      tasks: Array.from({ length: 4 }, (_, taskIndex) => ({
+        id: `task-${index}-${taskIndex}`,
+        description: `Task ${taskIndex}: ${"detailed work ".repeat(15)}`,
+        status: index === 0 && taskIndex === 0 ? "in_progress" : "pending",
+      })),
+    })),
+  }
+  await goalTool(mock, "update_goal_plan").execute({
+    goal_id: goal.id, expected_revision: 0, reason: "Plan all work", plan,
+  }, toolContext())
+  const compact = await goalTool(mock, "update_goal_plan").execute({
+    goal_id: goal.id, expected_revision: 1, reason: "First task verified",
+    plan_ops: [{ op: "set_task", task_id: "task-0-0", status: "completed", evidence: "Tests pass" }],
+  }, toolContext())
+  const compactText = contentOf(compact)
+  expect(compactText.length).toBeLessThan(JSON.stringify(plan).length / 3)
+  expect(compactText).toContain('"planRevision": 2')
+  expect(compactText).not.toContain("task-11-3")
+  const summary = await goalTool(mock, "get_goal").execute({ view: "summary" }, toolContext())
+  expect(JSON.stringify(summary)).not.toContain("task-11-3")
+  const full = await goalTool(mock, "get_goal").execute({ view: "full" }, toolContext())
+  expect(JSON.stringify(full)).toContain("task-11-3")
+  const blocked = await goalTool(mock, "update_goal_plan").execute({
+    goal_id: goal.id, expected_revision: 2, reason: "API is down",
+    plan_ops: [{ op: "set_task", task_id: "task-0-1", status: "blocked", blocker: "API down" }],
+  }, toolContext())
+  expect(contentOf(blocked)).toContain('"blockedTaskCount": 1')
+  expect(contentOf(blocked)).toContain('"blocker": "API down"')
+})
+
 test("V2 update_goal_plan input is provider-safe JSON Schema", async () => {
   const mock = makeMockContext()
   await setupPlugin(mock as never)
@@ -705,10 +747,31 @@ test("V2 update_goal_plan input is provider-safe JSON Schema", async () => {
     "expected_revision",
     "goal_id",
     "plan",
+    "plan_ops",
     "reason",
+    "response_mode",
     "revisit_evidence",
   ])
-  expect(root.required?.sort()).toEqual(["expected_revision", "goal_id", "plan", "reason"])
+  expect(root.required?.sort()).toEqual(["expected_revision", "goal_id", "reason"])
+  const ops = root.properties?.plan_ops as {
+    type?: string
+    minItems?: number
+    maxItems?: number
+    items?: {
+      anyOf?: Array<{
+        required?: string[]
+        additionalProperties?: boolean
+        properties?: { op?: { const?: string } }
+      }>
+    }
+  }
+  expect(ops).toMatchObject({ type: "array", minItems: 1, maxItems: 32 })
+  expect(ops.items?.anyOf?.map((branch) => [branch.properties?.op?.const, branch.required])).toEqual([
+    ["set_phase", ["op", "phase_id"]],
+    ["set_task", ["op", "task_id"]],
+    ["append_decision", ["op", "decision"]],
+  ])
+  expect(ops.items?.anyOf?.every((branch) => branch.additionalProperties === false)).toBe(true)
 })
 
 test("V2 update_goal_plan registrations do not share a mutable input schema", async () => {
@@ -727,7 +790,9 @@ test("V2 update_goal_plan registrations do not share a mutable input schema", as
     "expected_revision",
     "goal_id",
     "plan",
+    "plan_ops",
     "reason",
+    "response_mode",
     "revisit_evidence",
   ])
 })
@@ -740,7 +805,7 @@ test("V2 plan tool publishes JSON Schema with required fields and optional neste
   await setupPlugin(mock as never)
   // Inspect the serialized wire schema, not only the outer object wrapper.
   const input = JSON.parse(JSON.stringify(goalTool(mock, "update_goal_plan").input))
-  expect(input.required).toEqual(["goal_id", "expected_revision", "plan", "reason"])
+  expect(input.required).toEqual(["goal_id", "expected_revision", "reason"])
   expect(input.additionalProperties).toBe(false)
   expect(input.properties.goal_id).toMatchObject({ type: "string", minLength: 1 })
   expect(input.properties.expected_revision).toMatchObject({ type: "integer", minimum: 0 })

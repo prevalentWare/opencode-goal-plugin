@@ -185,6 +185,148 @@ test("pending phase and task scope cannot disappear without recorded revisit evi
   expect(revised.plan?.changes.at(-1)?.revisitEvidence).toContain("acceptance runs")
 })
 
+test("one plan revision reports shape and scope violations together with field paths", async () => {
+  const goal = await createGoal("session", "Keep the full engine scope")
+  await updateGoalPlan("session", { goalID: goal.id, expectedRevision: 0, plan: initialPlan(), reason: "Full scope" })
+  const invalid = initialPlan()
+  invalid.phases[0]!.objective = "Parser only"
+  invalid.phases[0]!.tasks[0]!.description = "Rewrite the parser"
+  invalid.phases[1]!.status = "blocked"
+  const rejected = updateGoalPlan("session", {
+    goalID: goal.id, expectedRevision: 1, plan: invalid, reason: "Block execution",
+  })
+  await expect(rejected).rejects.toThrow("phases[execution].blocker: blocked phases require a blocker")
+  await expect(rejected).rejects.toThrow("phases[parser].objective")
+  await expect(rejected).rejects.toThrow("tasks[compound].description")
+  expect((await getGoal("session"))?.planRevision).toBe(1)
+})
+
+test("bounded plan operations update a large plan atomically without resending it", async () => {
+  const goal = await createGoal("session", "Keep the full engine scope")
+  const plan = initialPlan()
+  plan.phases.push(...Array.from({ length: 10 }, (_, index) => ({
+    id: `later-${index}`,
+    objective: `Later work ${index}`,
+    status: "pending" as const,
+    tasks: Array.from({ length: 4 }, (_, taskIndex) => ({
+      id: `later-${index}-${taskIndex}`,
+      description: `Task ${taskIndex} in phase ${index}`,
+      status: "pending" as const,
+    })),
+  })))
+  await updateGoalPlan("session", { goalID: goal.id, expectedRevision: 0, plan, reason: "Full scope" })
+  const ops = [
+    { op: "set_task" as const, task_id: "compound", status: "completed" as const, evidence: "Tests pass" },
+    { op: "set_phase" as const, phase_id: "parser", status: "completed" as const, verification: "Parser verified" },
+    { op: "set_phase" as const, phase_id: "execution", status: "in_progress" as const },
+    { op: "set_task" as const, task_id: "planner", status: "in_progress" as const },
+  ]
+  const updated = await updateGoalPlan("session", {
+    goalID: goal.id, expectedRevision: 1, planOps: ops, reason: "Parser complete; start planner",
+  })
+  expect(updated.planProgress).toMatchObject({ currentPhaseID: "execution", currentTaskID: "planner" })
+  expect(updated.plan?.phases).toHaveLength(12)
+  expect(updated.planRevision).toBe(2)
+  await expect(updateGoalPlan("session", {
+    goalID: goal.id, expectedRevision: 1, planOps: ops, reason: "Stale replay",
+  })).rejects.toThrow("revision changed")
+  await expect(updateGoalPlan("session", {
+    goalID: goal.id, expectedRevision: 2,
+    planOps: [{ op: "set_task", task_id: "unknown", status: "completed", evidence: "No task" }],
+    reason: "Unknown task",
+  })).rejects.toThrow("plan_ops[0].task_id (unknown): unknown task ID")
+  expect((await getGoal("session"))?.planRevision).toBe(2)
+})
+
+test("reopening work clears old proof and unblocking clears obsolete blocker text", async () => {
+  const goal = await createGoal("session", "Verify parser work")
+  const plan = initialPlan()
+  plan.phases[0]!.tasks[0]!.status = "completed"
+  plan.phases[0]!.tasks[0]!.evidence = "Original tests pass"
+  plan.phases[0]!.status = "completed"
+  plan.phases[0]!.verification = "Original parser suite passes"
+  await updateGoalPlan("session", { goalID: goal.id, expectedRevision: 0, plan, reason: "Original proof" })
+  const reopened = await updateGoalPlan("session", {
+    goalID: goal.id, expectedRevision: 1, reason: "Regression found",
+    revisitEvidence: "A new regression invalidates the previous proof",
+    planOps: [
+      { op: "set_phase", phase_id: "parser", status: "in_progress" },
+      { op: "set_task", task_id: "compound", status: "in_progress" },
+    ],
+  })
+  expect(reopened.plan?.phases[0]?.verification).toBeNull()
+  expect(reopened.plan?.phases[0]?.tasks[0]?.evidence).toBeNull()
+  await expect(updateGoalPlan("session", {
+    goalID: goal.id, expectedRevision: 2, reason: "Claim completion without fresh proof",
+    planOps: [{ op: "set_task", task_id: "compound", status: "completed" }],
+  })).rejects.toThrow("phases[parser].tasks[compound].evidence")
+  expect((await getGoal("session"))?.planRevision).toBe(2)
+
+  const blocked = await updateGoalPlan("session", {
+    goalID: goal.id, expectedRevision: 2, reason: "Waiting on API",
+    planOps: [{ op: "set_task", task_id: "compound", status: "blocked", blocker: "API down" }],
+  })
+  expect(goalPlanEntries(blocked.plan!)[0]?.content).toContain("Blocked: API down")
+  const resolved = await updateGoalPlan("session", {
+    goalID: goal.id, expectedRevision: 3, reason: "API recovered",
+    planOps: [{ op: "set_task", task_id: "compound", status: "completed", evidence: "Fresh tests pass" }],
+  })
+  expect(resolved.plan?.phases[0]?.tasks[0]?.blocker).toBeNull()
+  expect(goalPlanEntries(resolved.plan!)[0]?.content).not.toContain("Blocked: API down")
+})
+
+test("full-plan reopening discards stale proof and nonblocked blocker text", async () => {
+  const goal = await createGoal("session", "Verify parser work")
+  const completed = initialPlan()
+  completed.phases[0]!.status = "completed"
+  completed.phases[0]!.verification = "Old phase proof"
+  completed.phases[0]!.tasks[0]!.status = "completed"
+  completed.phases[0]!.tasks[0]!.evidence = "Old task proof"
+  await updateGoalPlan("session", {
+    goalID: goal.id, expectedRevision: 0, plan: completed, reason: "Original completion",
+  })
+  const reopened = structuredClone(completed)
+  reopened.phases[0]!.status = "in_progress"
+  reopened.phases[0]!.blocker = "Old outage"
+  reopened.phases[0]!.tasks[0]!.status = "in_progress"
+  reopened.phases[0]!.tasks[0]!.blocker = "Old outage"
+  const update = await updateGoalPlan("session", {
+    goalID: goal.id, expectedRevision: 1, plan: reopened, reason: "Regression found",
+    revisitEvidence: "New regression invalidated the original proof",
+  })
+  expect(update.plan?.phases[0]?.verification).toBeNull()
+  expect(update.plan?.phases[0]?.tasks[0]?.evidence).toBeNull()
+  expect(update.plan?.phases[0]?.blocker).toBeNull()
+  expect(update.plan?.phases[0]?.tasks[0]?.blocker).toBeNull()
+  const missingProof = structuredClone({
+    summary: update.plan!.summary,
+    completionCriteria: update.plan!.completionCriteria,
+    phases: update.plan!.phases,
+    decisions: update.plan!.decisions,
+  })
+  missingProof.phases[0]!.tasks[0]!.status = "completed"
+  await expect(updateGoalPlan("session", {
+    goalID: goal.id, expectedRevision: 2, plan: missingProof, reason: "Claim old proof",
+  })).rejects.toThrow("phases[parser].tasks[compound].evidence")
+})
+
+test("plan operation errors and resulting plan violations are reported together by ID", async () => {
+  const goal = await createGoal("session", "Keep the full engine scope")
+  await updateGoalPlan("session", { goalID: goal.id, expectedRevision: 0, plan: initialPlan(), reason: "Full scope" })
+  const rejected = updateGoalPlan("session", {
+    goalID: goal.id, expectedRevision: 1, reason: "Try several edits",
+    planOps: [
+      { op: "set_task", task_id: "typo-a", status: "completed", evidence: "No task" },
+      { op: "set_phase", phase_id: "execution", status: "blocked" },
+      { op: "set_task", task_id: "typo-b", status: "blocked", blocker: "No task" },
+    ],
+  })
+  await expect(rejected).rejects.toThrow("plan_ops[0].task_id (typo-a): unknown task ID")
+  await expect(rejected).rejects.toThrow("phases[execution].blocker: blocked phases require a blocker")
+  await expect(rejected).rejects.toThrow("plan_ops[2].task_id (typo-b): unknown task ID")
+  expect((await getGoal("session"))?.planRevision).toBe(1)
+})
+
 test("a planned objective can only clear its plan with an explicit grant for that goal and exact objective", async () => {
   const goal = await createGoal("session", "Keep the full engine scope")
   await updateGoalPlan("session", { goalID: goal.id, expectedRevision: 0, plan: initialPlan(), reason: "Full scope" })

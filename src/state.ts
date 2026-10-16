@@ -5,7 +5,15 @@ import { dirname } from "node:path"
 import { Data, Effect, Schema } from "effect-goal-state"
 import { atomicWriteFile } from "./atomic-write"
 import { statePath } from "./state-path"
-import { GoalPlanSchema, goalPlanProgress, reviseGoalPlan, type GoalPlan, type GoalPlanInput } from "./goal-plan"
+import {
+  applyGoalPlanOps,
+  GoalPlanSchema,
+  goalPlanProgress,
+  reviseGoalPlan,
+  type GoalPlan,
+  type GoalPlanInput,
+  type GoalPlanOp,
+} from "./goal-plan"
 
 export { statePath } from "./state-path"
 
@@ -1145,10 +1153,9 @@ export async function updateGoalPlan(
   input: {
     goalID: string
     expectedRevision: number
-    plan: GoalPlanInput
     reason: string
     revisitEvidence?: string
-  },
+  } & ({ plan: GoalPlanInput; planOps?: never } | { plan?: never; planOps: GoalPlanOp[] }),
 ) {
   return mutate((state) => {
     const goal = state.goals[sessionID]
@@ -1157,14 +1164,18 @@ export async function updateGoalPlan(
     if (isClosed(goal.status)) throw new Error("cannot update a closed goal's plan")
     if (goal.planRevision !== input.expectedRevision)
       throw new Error("goal plan revision changed; read get_goal before updating it")
+    const applied = input.plan
+      ? { plan: input.plan, errors: [] }
+      : applyGoalPlanOps(goal.plan, input.planOps)
     goal.plan = reviseGoalPlan(
       goal.plan,
-      input.plan,
+      applied.plan,
       input.expectedRevision,
       input.reason,
       nowSeconds(),
       input.revisitEvidence,
       goal.planRevision,
+      applied.errors,
     )
     goal.planRevision = goal.plan.revision
     goal.updatedAt = nowSeconds()

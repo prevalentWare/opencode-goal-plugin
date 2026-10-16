@@ -4,7 +4,7 @@ import type { Info as ToolV2Info } from "@opencode/plugin/promise/tool"
 import type { Tool as ToolSchema } from "@opencode/schema/tool"
 import type { SessionMessageInfo } from "@opencode/client"
 import { z } from "zod"
-import { GoalPlanInputSchema, goalPlanEntries } from "./goal-plan"
+import { GoalPlanDraftSchema, GoalPlanOpsSchema, goalPlanEntries } from "./goal-plan"
 import type { GoalSnapshot, InternalGoalSnapshot, PendingAttempt } from "./state"
 import {
   accountUsage,
@@ -1051,11 +1051,25 @@ function mergeSystemReminder(output: { system: string[] }, reminder: string) {
 }
 
 const planToolArgs = {
-  goal_id: z.string().min(1),
-  expected_revision: z.number().int().nonnegative(),
-  plan: GoalPlanInputSchema,
-  reason: z.string().trim().min(1).max(2000),
-  revisit_evidence: z.string().trim().min(1).max(2000).optional(),
+  goal_id: z.string().min(1).describe("Goal ID from get_goal; required for optimistic concurrency."),
+  expected_revision: z.number().int().nonnegative().describe("Current planRevision from get_goal."),
+  plan: GoalPlanDraftSchema.optional().describe([
+    "Full plan for creation or wholesale revision. Use plan_ops for routine changes.",
+    "Completion criteria are immutable; blocked phases need a blocker, completed tasks need evidence,",
+    "and completed phases need verification. Preserve completed task IDs and descriptions.",
+  ].join(" ")),
+  plan_ops: GoalPlanOpsSchema.optional().describe([
+    "Atomic edits to an existing plan. Supply either plan or plan_ops, never both.",
+    "Set status and its required blocker/evidence/verification together.",
+  ].join(" ")),
+  reason: z.string().trim().min(1).max(2000).describe("Why this revision is needed."),
+  revisit_evidence: z.string().trim().min(1).max(2000).optional().describe(
+    "Concrete evidence required to remove or change planned scope or reopen verified work;" +
+    " never use it to bless an accidental edit.",
+  ),
+  response_mode: z.enum(["summary", "full"]).optional().describe(
+    "Summary omits the full plan and history. Full preserves the previous tool response.",
+  ),
 }
 const PlanToolSchema = z.object(planToolArgs).strict()
 
@@ -1080,6 +1094,27 @@ const planToolInputSchema = z.toJSONSchema(PlanToolSchema, {
   io: "input",
   unrepresentable: "any",
 }) as ToolSchema.ValueSchema
+const goalViewSchema = z.enum(["summary", "full"]).optional().describe(
+  "Use summary for status/revision checks; full includes the complete plan and history.",
+)
+
+function planToolDescription(locale: GoalLocale) {
+  return locale === "zh-CN"
+    ? [
+        "保存目标计划。初次创建用完整 plan；日常状态更新用 plan_ops，",
+        "并可用 response_mode=summary 减少输出。",
+        "使用 get_goal 中的目标 ID 与 planRevision。完成标准不可更改；",
+        "阻塞需原因，完成任务需证据，完成阶段需验证。",
+        "改变计划范围或重开已验证工作需具体 revisit_evidence。",
+      ].join("")
+    : [
+        "Persist the goal plan. Create with full plan; use plan_ops for routine edits",
+        "and response_mode=summary to reduce output. Use goal ID and planRevision from get_goal.",
+        "Completion criteria are immutable; blocked work needs a blocker, completed tasks need evidence,",
+        "and completed phases need verification. Scope changes or reopening verified work",
+        "require concrete revisit_evidence.",
+      ].join(" ")
+}
 
 /**
  * Deep copy of {@link planToolInputSchema} for each tool registration.
@@ -1095,19 +1130,50 @@ function planToolInput(): ToolSchema.ValueSchema {
 
 async function planFromTool(args: unknown, context: ToolExecContext) {
   const input = PlanToolSchema.parse(args)
+  if ((input.plan === undefined) === (input.plan_ops === undefined))
+    throw new Error("supply exactly one of plan or plan_ops")
+  const update = {
+    goalID: input.goal_id,
+    expectedRevision: input.expected_revision,
+    reason: input.reason,
+    revisitEvidence: input.revisit_evidence,
+  }
+  const goal = await updateGoalPlan(context.sessionID, input.plan
+    ? { ...update, plan: input.plan }
+    : { ...update, planOps: input.plan_ops! })
   return JSON.stringify(
-    {
-      goal: await updateGoalPlan(context.sessionID, {
-        goalID: input.goal_id,
-        expectedRevision: input.expected_revision,
-        plan: input.plan,
-        reason: input.reason,
-        revisitEvidence: input.revisit_evidence,
-      }),
-    },
+    { goal: input.response_mode === "summary" || (input.response_mode === undefined && input.plan_ops)
+      ? summarizeGoal(goal)
+      : goal },
     null,
     2,
   )
+}
+
+function summarizeGoal(goal: GoalSnapshot | null) {
+  if (!goal) return null
+  const phase = goal.plan?.phases.find((item) => item.id === goal.planProgress?.currentPhaseID)
+  const currentTask = phase?.tasks.find((item) => item.id === goal.planProgress?.currentTaskID)
+  const nextTask = phase?.tasks.find((item) => item.id === goal.planProgress?.nextTaskID)
+  const blockedTasks = phase?.tasks.filter((item) => item.status === "blocked") ?? []
+  const taskSummary = (task: typeof currentTask) => task
+    ? { id: task.id, description: task.description, status: task.status, blocker: task.blocker ?? null }
+    : null
+  return {
+    id: goal.id,
+    objective: goal.objective,
+    status: goal.status,
+    planRevision: goal.planRevision,
+    planProgress: goal.planProgress,
+    currentPhase: phase
+      ? { id: phase.id, objective: phase.objective, status: phase.status, blocker: phase.blocker ?? null }
+      : null,
+    currentTask: taskSummary(currentTask),
+    nextTask: taskSummary(nextTask),
+    blockedTasks: blockedTasks.slice(0, 3).map(taskSummary),
+    blockedTaskCount: blockedTasks.length,
+    blocker: goal.blocker,
+  }
 }
 
 function acpPlanMetadata(goal: GoalSnapshot | null) {
@@ -1151,8 +1217,14 @@ const GOAL_PLAN_TOOLS = new Set([
   "clear_goal",
 ])
 
-function getGoalToolResult(goal: GoalSnapshot | null, messages: GoalMessages = messagesFor("en")) {
-  const result: { goal: GoalSnapshot | null; goal_mode_notice?: string } = { goal }
+function getGoalToolResult(
+  goal: GoalSnapshot | null,
+  messages: GoalMessages = messagesFor("en"),
+  view: "summary" | "full" = "full",
+) {
+  const result: { goal: GoalSnapshot | ReturnType<typeof summarizeGoal>; goal_mode_notice?: string } = {
+    goal: view === "summary" ? summarizeGoal(goal) : goal,
+  }
   if (goal?.status === "budgetLimited" || goal?.status === "usageLimited") {
     result.goal_mode_notice = messages.notices.limitedGoal
   }
@@ -1951,9 +2023,9 @@ const server: Plugin = async ({ client }, options?: Options) => {
       get_goal: {
         description:
           messages.tools.getGoal,
-        args: {},
-        async execute(_args, context) {
-          return getGoalToolResult(await getGoal(context.sessionID), messages)
+        args: { view: goalViewSchema },
+        async execute(args, context) {
+          return getGoalToolResult(await getGoal(context.sessionID), messages, goalViewSchema.parse(args.view))
         },
       },
       get_goal_history: {
@@ -2025,7 +2097,7 @@ const server: Plugin = async ({ client }, options?: Options) => {
         },
       },
       update_goal_plan: {
-        description: locale === "zh-CN" ? "保存目标的整体计划、阶段、任务和验证证据。保持整体目标不变；使用 get_goal 返回的目标 ID 和计划版本。" : "Persist the overall plan, phases, tasks, verification evidence and decisions. Preserve the goal scope; use the goal ID and planRevision from get_goal. Completed work cannot be silently reopened or removed.",
+        description: planToolDescription(locale),
         args: planToolArgs,
         execute: planFromTool,
       },
@@ -3505,7 +3577,7 @@ function goalToolsV2(services: GoalServices): ToolV2Info[] {
   return [
     {
       name: "update_goal_plan",
-      description: services.locale === "zh-CN" ? "保存目标的整体计划、阶段、任务和验证证据。保持整体目标不变；使用 get_goal 返回的目标 ID 和计划版本。" : "Persist the overall plan, phases, tasks, verification evidence and decisions. Preserve the goal scope; use the goal ID and planRevision from get_goal. Completed work cannot be silently reopened or removed.",
+      description: planToolDescription(services.locale),
       input: planToolInput(),
       options: { codemode: false },
       execute: async (args, context) => ({ content: await planFromTool(args, context) }),
@@ -3514,10 +3586,16 @@ function goalToolsV2(services: GoalServices): ToolV2Info[] {
       name: "get_goal",
       description:
         messages.tools.getGoal,
-      input: v2ObjectSchema({}),
+      input: v2ObjectSchema({
+        view: {
+          type: "string",
+          enum: ["summary", "full"],
+          description: "Use summary for status/revision checks; full includes the complete plan and history.",
+        },
+      }),
       options: { codemode: false },
-      execute: async (_args, toolContext) => ({
-        content: await getGoalToolResult(await getGoal(toolContext.sessionID), messages),
+      execute: async (args, toolContext) => ({
+        content: await getGoalToolResult(await getGoal(toolContext.sessionID), messages, goalViewSchema.parse(args?.view)),
       }),
     },
     {
