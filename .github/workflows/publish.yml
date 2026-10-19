@@ -18,7 +18,7 @@ jobs:
     name: Typecheck
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
       - run: bun install --frozen-lockfile
       - run: bun run typecheck
@@ -27,7 +27,7 @@ jobs:
     name: Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
       - run: bun install --frozen-lockfile
       - run: bun run lint
@@ -36,21 +36,52 @@ jobs:
     name: Unit Tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
       - run: bun install --frozen-lockfile
       - run: bun run test
 
+  tui-compatibility:
+    name: TUI Compatibility (${{ matrix.peer }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        peer: [minimum, host]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+      - run: bun install --frozen-lockfile
+      - name: Install matching TUI pair
+        env:
+          TUI_PEER: ${{ matrix.peer }}
+        run: |
+          if [ "$TUI_PEER" = host ]; then
+            version=$(node -p 'require("./node_modules/@opencode/theme/package.json").dependencies["@opentui/core"]')
+          else
+            version=0.5.8
+          fi
+          bun add --dev --exact "@opentui/core@$version" "@opentui/solid@$version"
+      - run: bun test test/tui.test.ts test/tui-v2.test.ts
+        env:
+          OPENCODE_TEST_HOST_THEME: ${{ matrix.peer == 'host' && '1' || '0' }}
+
   v2-smoke:
     name: V2 Lifecycle Smoke
     runs-on: ubuntu-latest
+    outputs:
+      cli_version: ${{ steps.opencode.outputs.version }}
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
       - run: bun install --frozen-lockfile
       - run: bun run build
       - name: Install OpenCode V2
-        run: npm install -g @opencode/cli@beta
+        id: opencode
+        run: |
+          version=$(node -p 'require("./package.json").devDependencies["@opencode/plugin"]')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          npm install -g "@opencode/cli@$version"
       - run: bun run smoke:v2
         env:
           OPENCODE_SMOKE_TIMEOUT_MS: "120000"
@@ -62,16 +93,18 @@ jobs:
       - typecheck
       - lint
       - unit-tests
+      - tui-compatibility
       - v2-smoke
     permissions:
       contents: write
       id-token: write
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
       - run: bun install --frozen-lockfile
       - run: bun run ci:version
@@ -81,11 +114,13 @@ jobs:
           VERSION=$(node -p "require('./package.json').version")
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
       - run: bun run build
+      - run: bun run pack:dry-run
       - run: npm publish --ignore-scripts
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.version.outputs.version }}
+          OPENCODE_VERSION: ${{ needs.v2-smoke.outputs.cli_version }}
         run: |
           cat > release-notes.md <<EOF
           Published npm version: @prevalentware/opencode-goal-plugin@${VERSION}
@@ -94,7 +129,8 @@ jobs:
           - Typecheck passed.
           - Lint passed.
           - Unit tests passed.
-          - V2 lifecycle smoke passed against @opencode/cli@beta.
+          - V2 lifecycle smoke passed against @opencode/cli@${OPENCODE_VERSION}.
+          - Minimum and host OpenTUI compatibility passed.
           - Package published to npm.
           EOF
 

@@ -56,11 +56,14 @@ const model = Bun.serve({
 })
 
 await mkdir(join(root, "config/opencode"), { recursive: true })
+const localPluginPath = join(root, "plugin")
 if (!registryPackage) {
-  await mkdir(join(root, "config/opencode/plugins"))
-  await writeFile(join(root, "config/opencode/plugins/goal.ts"), `export { default } from ${JSON.stringify(pathToFileURL(join(packagePath, "dist/server.js")).href)}\n`)
+  await mkdir(localPluginPath)
+  await writeFile(join(localPluginPath, "server.ts"),
+    `export { default } from ${JSON.stringify(pathToFileURL(join(packagePath, "dist/server.js")).href)}\n`)
 }
 await writeFile(join(root, "config/opencode/opencode.json"), JSON.stringify({
+  ...(!registryPackage ? { plugins: [localPluginPath] } : {}),
   model: "fixture/fixture",
   snapshots: false,
   providers: {
@@ -88,6 +91,10 @@ const env = {
   FIXTURE_API_KEY: crypto.randomUUID(),
 }
 const binary = process.env.OPENCODE_V2_BIN ?? "opencode2"
+const versionResult = Bun.spawnSync([binary, "--version"], { env, stdout: "pipe", stderr: "pipe" })
+assert.equal(versionResult.exitCode, 0, "Cannot read the isolated OpenCode binary version")
+const hostVersion = new TextDecoder().decode(versionResult.stdout).trim()
+const commandField = hostVersion.includes("0.0.0-beta-") ? "command" : "name"
 if (registryPackage) {
   const install = Bun.spawn([binary, "plugin", "add", packagePath], { cwd: project, env, stdout: "pipe", stderr: "pipe" })
   const [stdout, stderr, code] = await Promise.all([new Response(install.stdout).text(), new Response(install.stderr).text(), install.exited])
@@ -138,16 +145,25 @@ try {
   // instance must not duplicate continuation delivery for the first location.
   const otherProject = join(root, "other-project")
   await mkdir(otherProject)
-  await api(`/api/plugin/await-activation?location%5Bdirectory%5D=${encodeURIComponent(otherProject)}`, {})
-  await api(`/api/plugin/await-activation?location%5Bdirectory%5D=${encodeURIComponent(project)}`, {})
-  const plugins = await api(`/api/plugin?location%5Bdirectory%5D=${encodeURIComponent(project)}`) as { data: Array<{ id?: string; state?: { status: string; error?: string } }> }
-  await writeFile(join(root, "plugins.json"), JSON.stringify(plugins))
+  for (const directory of [otherProject, project]) {
+    // Reading commands boots location services on stable and preview hosts.
+    await api(`/api/command?location%5Bdirectory%5D=${encodeURIComponent(directory)}`)
+    const artifact = directory === project ? "plugins.json" : "other-plugins.json"
+    await waitFor(`plugin-active (${artifact})`, async () => {
+      const plugins = await api(`/api/plugin?location%5Bdirectory%5D=${encodeURIComponent(directory)}`) as {
+        data: Array<{ id?: string; state?: { status: string; error?: string } }>
+      }
+      await writeFile(join(root, artifact), JSON.stringify(plugins))
+      return plugins.data.some((plugin) => plugin.id === "local.goal-mode.server" && plugin.state?.status === "active")
+    }, () => `plugin inventory=${join(root, artifact)}`)
+  }
   await writeFile(join(root, "config.json"), JSON.stringify(await api(`/api/config?location%5Bdirectory%5D=${encodeURIComponent(project)}`)))
-  assert(plugins.data.some((plugin) => plugin.id === "local.goal-mode.server" && plugin.state?.status === "active"), `Goal plugin did not activate; inspect ${root}/plugins.json`)
   const commands = await api(`/api/command?location%5Bdirectory%5D=${encodeURIComponent(project)}`) as { data: Array<{ name: string }> }
   assert(commands.data.some((command) => command.name === "goal"))
+  // Stable V2 reads `name`; 0.0.0 beta hosts still read `command`.
   await api(`/api/session/${sessionID}/command`, {
-    command: "goal", text: "Create a goal for the fixture milestone. Keep it active until the automatic continuation arrives.",
+    [commandField]: "goal",
+    text: "Create a goal for the fixture milestone. Keep it active until the automatic continuation arrives.",
   })
   let state: { goals: Record<string, { status: string; autoTurns: number }> } | undefined
   // Last-observed values for each final condition, so a timeout can report
@@ -189,7 +205,7 @@ try {
     agent: "build",
   }) as { data: { id: string } }
   await api(`/api/session/${arraysSession.data.id}/command`, {
-    command: "goal",
+    [commandField]: "goal",
     text: "Create a goal for the arrays-present command smoke.",
     files: [],
     agents: [],
@@ -202,6 +218,7 @@ try {
   const summary = {
     result: "PASS",
     packagePath,
+    hostVersion,
     sessionID,
     modelCalls,
     continuationCalls,
