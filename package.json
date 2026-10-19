@@ -69,7 +69,7 @@
     "@eslint/js": "^10.0.1",
     "@opencode/client": "0.0.0-beta-19425",
     "@opencode/plugin": "0.0.0-beta-19425",
-    "@opencode/schema": "0.0.0-beta-19425",
+    "@opencode/schema": "2.0.30",
     "@opencode/theme": "0.0.0-beta-19425",
     "@opentui/core": "0.5.9",
     "@opentui/solid": "0.5.9",
