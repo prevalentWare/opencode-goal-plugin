@@ -67,7 +67,7 @@
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
-    "@opencode/client": "0.0.0-beta-19425",
+    "@opencode/client": "2.0.30",
     "@opencode/plugin": "0.0.0-beta-19425",
     "@opencode/schema": "0.0.0-beta-19425",
     "@opencode/theme": "0.0.0-beta-19425",
