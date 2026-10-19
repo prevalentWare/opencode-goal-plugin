@@ -3,7 +3,8 @@ import { mkdtempSync, rmSync, unlinkSync } from "node:fs"
 import { rename, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { DEFAULT_THEME, resolveThemeDocument, type ResolvedTheme } from "@opencode/theme/tui"
+import type { ResolvedTheme } from "@opencode/theme/tui"
+import { RGBA } from "@opentui/core"
 import { testRender } from "@opentui/solid"
 import { createSignal } from "solid-js"
 import { createStore, type Store } from "solid-js/store"
@@ -22,6 +23,7 @@ type GoalSnapshot = Parameters<typeof liveTimeUsedSeconds>[0]
 const previousStatePath = process.env.OPENCODE_GOAL_STATE_PATH
 const isolatedStateDir = mkdtempSync(join(tmpdir(), "goal-tui-v2-"))
 const isolatedStatePath = join(isolatedStateDir, "goals.json")
+let hostTheme: ResolvedTheme | undefined
 
 async function writeGoalState(value: unknown) {
   const temporary = `${isolatedStatePath}.tmp`
@@ -29,8 +31,12 @@ async function writeGoalState(value: unknown) {
   await rename(temporary, isolatedStatePath)
 }
 
-beforeAll(() => {
+beforeAll(async () => {
   process.env.OPENCODE_GOAL_STATE_PATH = isolatedStatePath
+  if (process.env.OPENCODE_TEST_HOST_THEME === "1") {
+    const { resolvedHostTheme } = await import("./fixtures/host-theme")
+    hostTheme = resolvedHostTheme()
+  }
 })
 
 beforeEach(() => {
@@ -145,7 +151,11 @@ type MockContext = {
     }
   }
   attention: unknown
-  theme: ResolvedTheme
+  theme: {
+    text: Pick<ResolvedTheme["text"], "base" | "muted"> & {
+      feedback: Pick<ResolvedTheme["text"]["feedback"], "success">
+    }
+  }
   markdown: unknown
   keymap: {
     layer: (input: () => MockKeymapLayer) => void
@@ -225,7 +235,15 @@ function makeMockContext(overrides: Partial<MockContext> = {}): {
       },
     },
     attention: undefined,
-    theme: resolveThemeDocument(DEFAULT_THEME, "dark"),
+    // The host compatibility job uses its real resolved theme. The minimum
+    // and forward-compatibility runs share their renderer's native RGBA copy.
+    theme: hostTheme ?? {
+      text: {
+        base: RGBA.fromHex("#e0e0e0"),
+        muted: RGBA.fromHex("#808080"),
+        feedback: { success: { base: RGBA.fromHex("#00ff00"), muted: RGBA.fromHex("#008800") } },
+      },
+    },
     markdown: undefined,
     keymap: {
       layer(input) {
@@ -465,6 +483,9 @@ test("V2 sidebar renders the parsed goal from session messages", async () => {
     expect(frame).toContain("Status: paused")
     expect(frame).toContain("ship the v2 milestone")
     expect(frame).toContain("Tokens: 0")
+    const spans = setup.captureSpans().lines.flatMap((line) => line.spans)
+    expect(spans.find((span) => span.text.includes("Goal"))?.fg.equals(mock.theme.text.base)).toBe(true)
+    expect(spans.find((span) => span.text.includes("ship the v2 milestone"))?.fg.equals(mock.theme.text.muted)).toBe(true)
     setup.renderer.destroy()
     destroyed = true
   } finally {
@@ -603,6 +624,8 @@ test("V2 sidebar shows a completion badge for complete goals", async () => {
   try {
     await setup.renderOnce()
     expect(setup.captureCharFrame()).toContain("Goal achieved")
+    const spans = setup.captureSpans().lines.flatMap((line) => line.spans)
+    expect(spans.find((span) => span.text.includes("Goal achieved"))?.fg.equals(mock.theme.text.feedback.success.base)).toBe(true)
     setup.renderer.destroy()
     destroyed = true
   } finally {

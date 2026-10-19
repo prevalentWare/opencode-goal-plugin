@@ -139,10 +139,10 @@ export function registerSlotV2(context: TuiPluginV2.Context, name: string, rende
 
 /**
  * Reads a theme color by trying each candidate path in order, descending into a
- * `default` leaf when the resolved node is a color group.
+ * `base` or `default` leaf when the resolved node is a color group.
  *
- * Current previews expose a nested theme (`text.default`, `text.subdued`,
- * `text.feedback.success`), while earlier previews and the V1 TUI expose flat
+ * Stable V2 uses `text.base` and `text.muted`; previews use `text.default` and
+ * `text.subdued`, while earlier previews and the V1 TUI expose flat
  * keys (`text`, `textMuted`, `primary`). Passing a color *group* as `fg`
  * renders nothing useful, so resolve to a leaf before handing it to OpenTUI.
  */
@@ -156,8 +156,9 @@ export function themeColorV2(theme: unknown, ...paths: readonly (readonly string
       }
       cursor = (cursor as Record<string, unknown>)[key]
     }
-    if (cursor !== null && typeof cursor === "object" && "default" in (cursor as Record<string, unknown>)) {
-      cursor = (cursor as Record<string, unknown>).default
+    if (cursor !== null && typeof cursor === "object") {
+      if ("base" in cursor) cursor = cursor.base
+      else if ("default" in cursor) cursor = cursor.default
     }
     if (cursor !== undefined && cursor !== null) return cursor
   }
@@ -166,9 +167,9 @@ export function themeColorV2(theme: unknown, ...paths: readonly (readonly string
 
 function goalColorsV2(theme: unknown) {
   return {
-    text: themeColorV2(theme, ["text", "default"], ["text"]),
-    muted: themeColorV2(theme, ["text", "subdued"], ["textMuted"]),
-    achieved: themeColorV2(theme, ["text", "feedback", "success"], ["primary"], ["text", "default"], ["text"]),
+    text: themeColorV2(theme, ["text", "base"], ["text", "default"], ["text"]),
+    muted: themeColorV2(theme, ["text", "muted"], ["text", "subdued"], ["textMuted"]),
+    achieved: themeColorV2(theme, ["text", "feedback", "success"], ["primary"], ["text", "base"], ["text", "default"], ["text"]),
   }
 }
 

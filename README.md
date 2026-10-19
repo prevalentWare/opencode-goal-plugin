@@ -43,7 +43,7 @@ Choose the instructions that match the CLI you run:
 | OpenCode version | How to identify it | Instructions |
 | --- | --- | --- |
 | OpenCode 1 stable | You run `opencode` and `opencode --version` prints `1.x` | [OpenCode 1](#opencode-1-stable) |
-| OpenCode 2 beta | You run `opencode2` | [OpenCode 2](#opencode-2-beta) |
+| OpenCode 2 | You run `opencode2` | [OpenCode 2](#opencode-2) |
 
 Do not mix the configuration formats. OpenCode 1 uses `plugin` and `tui.json`; OpenCode 2 uses `plugins` and the global `cli.json`.
 
@@ -85,9 +85,11 @@ For manual installation, add the package to both V1 config files.
 }
 ```
 
-### OpenCode 2 Beta
+### OpenCode 2
 
-Use this section only when running `opencode2`. Plugin releases from the `feat/v2-adaptation` line support OpenCode 2 beta `0.0.0-beta-19425` (the current `@opencode/cli@beta` / `@opencode/plugin@beta` contract) while remaining compatible with OpenCode 1.
+Use this section when running `opencode2`. The development API packages are kept aligned, and CI checks
+the CLI release pinned by `@opencode/plugin` in `devDependencies` plus the current `@opencode/cli@beta` channel.
+Publishing requires the pinned release smoke test. OpenCode 1 remains supported.
 
 Add the package to both V2 plugin lists:
 
@@ -109,7 +111,7 @@ Add the package to both V2 plugin lists:
 
 OpenCode 2 does not read the V1 `tui.json` file. The server entrypoint comes from `opencode.json`, while the sidebar and palette integration come from `~/.config/opencode/cli.json`.
 
-OpenCode 2 plugin APIs are still beta. This package pins its V2 development contract to the beta version above; later previews may require a compatible plugin update. V2 currently supports the goal command, tools, persistent state, usage accounting, idle continuation, Plan-mode safety, TUI sidebar/palette integration, goal compaction context, and transcript-based task recovery. Goal compaction context is injected through the V2 `session.compaction` hook on hosts that provide it (newer than beta-19425); on older betas the registration degrades to a no-op. After a plugin or server restart, V2 rebuilds Task-subagent deferral state by replaying each non-closed goal session's persisted transcript, because the V2 plugin context exposes no live child-session query; children that leave no finalized tool entry in the transcript are only observed through live events.
+Later OpenCode releases may require a compatible plugin update. V2 currently supports the goal command, tools, persistent state, usage accounting, idle continuation, Plan-mode safety, TUI sidebar/palette integration, goal compaction context, and transcript-based task recovery. Goal compaction context is injected through the V2 `session.compaction` hook on hosts that provide it (newer than beta-19425); on older betas the registration degrades to a no-op. After a plugin or server restart, V2 rebuilds Task-subagent deferral state by replaying each non-closed goal session's persisted transcript, because the V2 plugin context exposes no live child-session query; children that leave no finalized tool entry in the transcript are only observed through live events.
 
 ## Options
 
