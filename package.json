@@ -71,7 +71,7 @@
     "@opencode/plugin": "0.0.0-beta-19425",
     "@opencode/schema": "0.0.0-beta-19425",
     "@opencode/theme": "0.0.0-beta-19425",
-    "@opentui/core": "0.5.9",
+    "@opentui/core": "0.6.6",
     "@opentui/solid": "0.5.9",
     "@types/bun": "^1.3.13",
     "@types/semver": "^7.8.0",
