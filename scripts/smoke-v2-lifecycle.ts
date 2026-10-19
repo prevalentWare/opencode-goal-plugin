@@ -85,7 +85,7 @@ const env = {
   OPENCODE_DB: join(root, "opencode.db"),
   OPENCODE_GOAL_STATE_PATH: join(root, "goals.json"),
   OPENCODE_PASSWORD: crypto.randomUUID(),
-  FIXTURE_API_KEY: "local-fixture-only",
+  FIXTURE_API_KEY: crypto.randomUUID(),
 }
 const binary = process.env.OPENCODE_V2_BIN ?? "opencode2"
 if (registryPackage) {
