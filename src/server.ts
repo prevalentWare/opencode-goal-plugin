@@ -1,4 +1,4 @@
-import type { Config, Plugin } from "@opencode-ai/plugin"
+import type { Config, Hooks, Plugin } from "@opencode-ai/plugin"
 import type * as PluginV2 from "@opencode/plugin"
 import type { Info as ToolV2Info } from "@opencode/plugin/promise/tool"
 import type { Tool as ToolSchema } from "@opencode/schema/tool"
@@ -36,10 +36,12 @@ import {
   updateGoalObjective,
   updateGoalPlan,
   validateEvidence,
+  waitForPendingMutations,
   validateObjective,
 } from "./state"
 import type { GoalLocale, GoalMessages } from "./i18n"
 import { formatGoalHistoryPresentation, messagesFor, resolveLocale } from "./i18n"
+import { describeError, reportPluginError } from "./diagnostics"
 import { compactionContext, compactionContextPrefix, continuationPrompt, limitPrompt, systemReminder } from "./prompts"
 
 type Options = {
@@ -1738,6 +1740,11 @@ const server: Plugin = async ({ client }, options?: Options) => {
         }
         if (scheduledContinuations.get(sessionID) !== scheduled || nativeRetrySessions.has(sessionID)) return
         await runAutoContinue(sessionID, true, scheduled)
+      } catch (error) {
+        // A timer callback that rejects becomes an unhandled rejection, which
+        // the host reports as a crash. The failure is reported and the schedule
+        // is cleaned up instead.
+        v2ErrorLog("Scheduled continuation failed", error)
       } finally {
         if (scheduledContinuations.get(sessionID) === scheduled) scheduledContinuations.delete(sessionID)
       }
@@ -2000,7 +2007,10 @@ const server: Plugin = async ({ client }, options?: Options) => {
     }
   }
 
-  return {
+  // Every hook the V1 API exposes runs on the host's critical paths, and each
+  // of them reads and writes the goal state. They are guarded together so a
+  // state failure in one of them cannot reject the hook the host is waiting on.
+  return guardHooks({
     async dispose() {
       disposed = true
       stopStateRecoveryReporting()
@@ -2014,6 +2024,10 @@ const server: Plugin = async ({ client }, options?: Options) => {
       toolAttempts.clear()
       explicitResumeRequests.clear()
     objectiveEdits.clear()
+      // Let the state writes that are already in flight finish. A host that
+      // reloads the plugin tears the state directory down with it, and a write
+      // that is still running would fail and lose the change it carried.
+      await waitForPendingMutations()
     },
     async config(config) {
       if (!registerCommand) return
@@ -2161,12 +2175,19 @@ const server: Plugin = async ({ client }, options?: Options) => {
       },
     },
     async "tool.execute.before"(input) {
-      taskTracker.noteTaskCall(input as { tool?: unknown; sessionID?: unknown; callID?: unknown })
-      const sessionID = typeof input?.sessionID === "string" ? input.sessionID : undefined
-      const callID = typeof input?.callID === "string" ? input.callID : undefined
-      if (sessionID && callID) {
-        const goal = await getGoalInternal(sessionID)
-        toolAttempts.set(toolAttemptKey(sessionID, callID), goal?.pendingAttempt?.id ?? null)
+      try {
+        taskTracker.noteTaskCall(input as { tool?: unknown; sessionID?: unknown; callID?: unknown })
+        const sessionID = typeof input?.sessionID === "string" ? input.sessionID : undefined
+        const callID = typeof input?.callID === "string" ? input.callID : undefined
+        if (sessionID && callID) {
+          const goal = await getGoalInternal(sessionID)
+          toolAttempts.set(toolAttemptKey(sessionID, callID), goal?.pendingAttempt?.id ?? null)
+        }
+      } catch (error) {
+        // A tool hook runs on every tool call. A state failure inside it must
+        // not reject the hook, or the host reports the user's own tool call as
+        // failed.
+        v2ErrorLog("Failed to run the tool.execute.before hook", error)
       }
     },
     async "command.execute.before"(input, output) {
@@ -2192,38 +2213,45 @@ const server: Plugin = async ({ client }, options?: Options) => {
       clearTurnWatchdog(input.sessionID)
     },
     async "tool.execute.after"(input, output) {
-      taskTracker.noteTaskOutput(
-        input as { tool?: unknown; sessionID?: unknown; callID?: unknown },
-        output as { output?: unknown },
-      )
-      const sessionID = typeof input?.sessionID === "string" ? input.sessionID : undefined
-      const callID = typeof input?.callID === "string" ? input.callID : undefined
-      const attemptKey = sessionID && callID ? toolAttemptKey(sessionID, callID) : undefined
-      const expectedAttemptID = attemptKey ? toolAttempts.get(attemptKey) : undefined
-      if (attemptKey) toolAttempts.delete(attemptKey)
-      if (!sessionID) return
-      if (GOAL_PLAN_TOOLS.has(input.tool)) {
-        const goal = await getGoal(sessionID)
-        if (goal || input.tool === "clear_goal") output.metadata = { ...output.metadata, ...acpPlanMetadata(goal) }
-      }
-      if (typeof input?.tool === "string" && NON_PROGRESS_TOOLS.has(input.tool.toLowerCase())) return
-      const toolResult = output as { output?: unknown; error?: unknown }
-      // A successful tool output is real progress: it resolves any pending
-      // continuation and clears the prompt-failure counter. Failed tool
-      // outputs leave the failure counter and pending window untouched.
-      if (toolOutputFailed(toolResult)) return
-      const text = typeof toolResult.output === "string" ? toolResult.output : undefined
-      if (!text) return
-      const before = await getGoalInternal(sessionID)
-      const scheduled = scheduledContinuations.get(sessionID)
-      const hasFailureEpisode = Boolean(
-        before && (before.continuationFailures > 0 || before.pendingAttempt != null),
-      )
-      if (!before || (!hasFailureEpisode && scheduled?.purpose !== "recovery")) return
-      const progressed = await recordToolProgress(sessionID, text, expectedAttemptID)
-      if (progressed?.continuationFailures === 0 && progressed.pendingAttempt == null) {
-        locallyDeliveredPendingSessions.delete(sessionID)
-        cancelScheduledContinuation(sessionID)
+      try {
+        taskTracker.noteTaskOutput(
+          input as { tool?: unknown; sessionID?: unknown; callID?: unknown },
+          output as { output?: unknown },
+        )
+        const sessionID = typeof input?.sessionID === "string" ? input.sessionID : undefined
+        const callID = typeof input?.callID === "string" ? input.callID : undefined
+        const attemptKey = sessionID && callID ? toolAttemptKey(sessionID, callID) : undefined
+        const expectedAttemptID = attemptKey ? toolAttempts.get(attemptKey) : undefined
+        if (attemptKey) toolAttempts.delete(attemptKey)
+        if (!sessionID) return
+        if (GOAL_PLAN_TOOLS.has(input.tool)) {
+          const goal = await getGoal(sessionID)
+          if (goal || input.tool === "clear_goal") output.metadata = { ...output.metadata, ...acpPlanMetadata(goal) }
+        }
+        if (typeof input?.tool === "string" && NON_PROGRESS_TOOLS.has(input.tool.toLowerCase())) return
+        const toolResult = output as { output?: unknown; error?: unknown }
+        // A successful tool output is real progress: it resolves any pending
+        // continuation and clears the prompt-failure counter. Failed tool
+        // outputs leave the failure counter and pending window untouched.
+        if (toolOutputFailed(toolResult)) return
+        const text = typeof toolResult.output === "string" ? toolResult.output : undefined
+        if (!text) return
+        const before = await getGoalInternal(sessionID)
+        const scheduled = scheduledContinuations.get(sessionID)
+        const hasFailureEpisode = Boolean(
+          before && (before.continuationFailures > 0 || before.pendingAttempt != null),
+        )
+        if (!before || (!hasFailureEpisode && scheduled?.purpose !== "recovery")) return
+        const progressed = await recordToolProgress(sessionID, text, expectedAttemptID)
+        if (progressed?.continuationFailures === 0 && progressed.pendingAttempt == null) {
+          locallyDeliveredPendingSessions.delete(sessionID)
+          cancelScheduledContinuation(sessionID)
+        }
+      } catch (error) {
+        // A tool hook runs on every tool call. A state failure inside it must
+        // not reject the hook, or the host reports the user's own tool call as
+        // failed.
+        v2ErrorLog("Failed to run the tool.execute.after hook", error)
       }
     },
     async "chat.message"(input, output) {
@@ -2265,142 +2293,206 @@ const server: Plugin = async ({ client }, options?: Options) => {
       if (goal?.status === "active") output.enabled = false
     },
     async event({ event }) {
-      const sessionID = sessionIDFromEvent(event as never)
-      const eventType = (event as { type?: string }).type
-      if (sessionID && isUserAbortEvent(event as never)) {
-        explicitResumeRequests.delete(sessionID)
-        goalServices.stopAutonomy?.(sessionID)
-        busySessions.delete(sessionID)
-        nativeRetrySessions.delete(sessionID)
-        watchdogRescuedSessions.delete(sessionID)
-        clearToolAttemptsForSession(toolAttempts, sessionID)
-        taskTracker.observeSessionStatus(sessionID, "idle")
-        await cancelActiveGoal(sessionID)
-        return
-      }
-      if (eventType === "session.created") {
-        taskTracker.observeSessionCreated(event as { properties?: Record<string, unknown> })
-      }
-      if (sessionID && eventType === "session.status") {
-        const status = (event as { properties?: Record<string, unknown> }).properties?.status
-        if (isRecord(status) && typeof status.type === "string") {
-          if (status.type === "busy") {
-            busySessions.add(sessionID)
-            busyRevisions.set(sessionID, (busyRevisions.get(sessionID) ?? 0) + 1)
-            nativeRetrySessions.delete(sessionID)
-          }
-          if (status.type === "busy") armTurnWatchdog(sessionID)
-          if (status.type === "busy") await markPendingContinuationStarted(sessionID)
-          if (status.type === "idle") {
-            explicitResumeRequests.delete(sessionID)
-            busySessions.delete(sessionID)
-            nativeRetrySessions.delete(sessionID)
-            clearTurnWatchdog(sessionID)
-            watchdogRescuedSessions.delete(sessionID)
-          }
-          if (status.type === "retry") {
-            nativeRetrySessions.add(sessionID)
-            clearTurnWatchdog(sessionID)
-            cancelScheduledContinuation(sessionID)
-          }
-          taskTracker.observeSessionStatus(sessionID, status.type)
+      try {
+        const sessionID = sessionIDFromEvent(event as never)
+        const eventType = (event as { type?: string }).type
+        if (sessionID && isUserAbortEvent(event as never)) {
+          explicitResumeRequests.delete(sessionID)
+          goalServices.stopAutonomy?.(sessionID)
+          busySessions.delete(sessionID)
+          nativeRetrySessions.delete(sessionID)
+          watchdogRescuedSessions.delete(sessionID)
+          clearToolAttemptsForSession(toolAttempts, sessionID)
+          taskTracker.observeSessionStatus(sessionID, "idle")
+          await cancelActiveGoal(sessionID)
+          return
         }
-      }
-      if (sessionID && eventType === "session.idle") {
-        explicitResumeRequests.delete(sessionID)
-        busySessions.delete(sessionID)
-        nativeRetrySessions.delete(sessionID)
-        clearTurnWatchdog(sessionID)
-        watchdogRescuedSessions.delete(sessionID)
-        taskTracker.observeSessionStatus(sessionID, "idle")
-      }
-      if (sessionID && eventType === "session.error") {
-        explicitResumeRequests.delete(sessionID)
-        const inNativeRetry = nativeRetrySessions.has(sessionID)
-        busySessions.delete(sessionID)
-        clearTurnWatchdog(sessionID)
-        // A native provider retry episode is already recovering, so a transport
-        // error inside it must not schedule plugin recovery. A retry status can
-        // arrive before the error, so check the marker before clearing it; the
-        // episode ends (and the marker is removed) on the next busy or idle.
-        if (inNativeRetry) return
-        nativeRetrySessions.delete(sessionID)
-        watchdogRescuedSessions.delete(sessionID)
-        const props = (event as { properties?: Record<string, unknown> }).properties ?? {}
-        const errorMessage = transportErrorMessageFromEvent(props)
-        if (errorMessage && isTransportError(errorMessage)) {
-          const goal = await getGoalInternal(sessionID)
-          if (goal?.status === "active") {
-            const attempt = pendingAttemptOf(goal)
-            if (attempt != null) {
-              // The pending attempt failed at the transport level: count one
-              // failure and retry at the remaining min interval.
-              const afterFailure = await recordContinuationResult(sessionID, "failure", maxPromptFailures, {
-                requirePending: true,
-              })
-              if (afterFailure) locallyDeliveredPendingSessions.delete(sessionID)
-              if (autoContinue && afterFailure?.status === "active") {
+        if (eventType === "session.created") {
+          taskTracker.observeSessionCreated(event as { properties?: Record<string, unknown> })
+        }
+        if (sessionID && eventType === "session.status") {
+          const status = (event as { properties?: Record<string, unknown> }).properties?.status
+          if (isRecord(status) && typeof status.type === "string") {
+            if (status.type === "busy") {
+              busySessions.add(sessionID)
+              busyRevisions.set(sessionID, (busyRevisions.get(sessionID) ?? 0) + 1)
+              nativeRetrySessions.delete(sessionID)
+            }
+            if (status.type === "busy") armTurnWatchdog(sessionID)
+            if (status.type === "busy") await markPendingContinuationStarted(sessionID)
+            if (status.type === "idle") {
+              explicitResumeRequests.delete(sessionID)
+              busySessions.delete(sessionID)
+              nativeRetrySessions.delete(sessionID)
+              clearTurnWatchdog(sessionID)
+              watchdogRescuedSessions.delete(sessionID)
+            }
+            if (status.type === "retry") {
+              nativeRetrySessions.add(sessionID)
+              clearTurnWatchdog(sessionID)
+              cancelScheduledContinuation(sessionID)
+            }
+            taskTracker.observeSessionStatus(sessionID, status.type)
+          }
+        }
+        if (sessionID && eventType === "session.idle") {
+          explicitResumeRequests.delete(sessionID)
+          busySessions.delete(sessionID)
+          nativeRetrySessions.delete(sessionID)
+          clearTurnWatchdog(sessionID)
+          watchdogRescuedSessions.delete(sessionID)
+          taskTracker.observeSessionStatus(sessionID, "idle")
+        }
+        if (sessionID && eventType === "session.error") {
+          explicitResumeRequests.delete(sessionID)
+          const inNativeRetry = nativeRetrySessions.has(sessionID)
+          busySessions.delete(sessionID)
+          clearTurnWatchdog(sessionID)
+          // A native provider retry episode is already recovering, so a transport
+          // error inside it must not schedule plugin recovery. A retry status can
+          // arrive before the error, so check the marker before clearing it; the
+          // episode ends (and the marker is removed) on the next busy or idle.
+          if (inNativeRetry) return
+          nativeRetrySessions.delete(sessionID)
+          watchdogRescuedSessions.delete(sessionID)
+          const props = (event as { properties?: Record<string, unknown> }).properties ?? {}
+          const errorMessage = transportErrorMessageFromEvent(props)
+          if (errorMessage && isTransportError(errorMessage)) {
+            const goal = await getGoalInternal(sessionID)
+            if (goal?.status === "active") {
+              const attempt = pendingAttemptOf(goal)
+              if (attempt != null) {
+                // The pending attempt failed at the transport level: count one
+                // failure and retry at the remaining min interval. The attempt id
+                // is required: a fast execution can reserve a newer attempt
+                // between the read and this write, and an unconditional failure
+                // would clear that newer attempt and count a phantom failure
+                // toward the pause ceiling.
+                const afterFailure = await recordContinuationResult(sessionID, "failure", maxPromptFailures, {
+                  requirePending: true,
+                  expectedGoalID: goal.id,
+                  expectedAttemptID: attempt.id,
+                })
+                if (afterFailure) locallyDeliveredPendingSessions.delete(sessionID)
+                if (autoContinue && afterFailure?.status === "active") {
+                  scheduleSettledContinuation(
+                    sessionID,
+                    continuationRetryDelayMs(minInterval, attempt.reservedAt),
+                    true,
+                    "retry",
+                  )
+                }
+              } else if (autoContinue) {
+                // No pending attempt: start the first bounded automatic recovery
+                // without charging a phantom failure. Duplicate transport events
+                // dedupe through the scheduled-continuation timer.
                 scheduleSettledContinuation(
                   sessionID,
-                  continuationRetryDelayMs(minInterval, attempt.reservedAt),
-                  true,
-                  "retry",
+                  continuationDelayFromSnapshot(minInterval, goal.lastContinuationAt),
+                  false,
+                  "recovery",
                 )
               }
-            } else if (autoContinue) {
-              // No pending attempt: start the first bounded automatic recovery
-              // without charging a phantom failure. Duplicate transport events
-              // dedupe through the scheduled-continuation timer.
-              scheduleSettledContinuation(
-                sessionID,
-                continuationDelayFromSnapshot(minInterval, goal.lastContinuationAt),
-                false,
-                "recovery",
-              )
             }
           }
         }
-      }
-      if (sessionID && eventType === "session.deleted") {
-        continuationEpochs.invalidate(sessionID)
-        explicitResumeRequests.delete(sessionID)
-        busySessions.delete(sessionID)
-        busyRevisions.delete(sessionID)
-        clearTurnWatchdog(sessionID)
-        watchdogRescuedSessions.delete(sessionID)
-        locallyDeliveredPendingSessions.delete(sessionID)
-        nativeRetrySessions.delete(sessionID)
-        cancelScheduledContinuation(sessionID)
-        taskDeferredSessions.delete(sessionID)
-        clearToolAttemptsForSession(toolAttempts, sessionID)
-        taskTracker.observeSessionDeleted(sessionID)
-      }
-      if (sessionID && (event as { type?: string }).type === "message.updated") {
-        const props = (event as { properties?: Record<string, unknown> }).properties ?? {}
-        const message = [props.info, props.message].find((value) => value && typeof value === "object") as
-          | { info?: unknown; role?: unknown; id?: unknown; time?: unknown; parts?: unknown[] }
-          | undefined
-        taskTracker.observeAssistantMessage(sessionID, message)
-        const observed = await recordAssistantMessage(sessionID, message, options ?? {})
-        await reconcileLocalMarkerAfterProgress(locallyDeliveredPendingSessions, sessionID, observed.goal)
-        const scheduled = scheduledContinuations.get(sessionID)
-        if (observed.progressed && scheduled?.purpose !== "settle") cancelScheduledContinuation(sessionID)
-      }
+        if (sessionID && eventType === "session.deleted") {
+          continuationEpochs.invalidate(sessionID)
+          explicitResumeRequests.delete(sessionID)
+          busySessions.delete(sessionID)
+          busyRevisions.delete(sessionID)
+          clearTurnWatchdog(sessionID)
+          watchdogRescuedSessions.delete(sessionID)
+          locallyDeliveredPendingSessions.delete(sessionID)
+          nativeRetrySessions.delete(sessionID)
+          cancelScheduledContinuation(sessionID)
+          taskDeferredSessions.delete(sessionID)
+          clearToolAttemptsForSession(toolAttempts, sessionID)
+          taskTracker.observeSessionDeleted(sessionID)
+        }
+        if (sessionID && (event as { type?: string }).type === "message.updated") {
+          const props = (event as { properties?: Record<string, unknown> }).properties ?? {}
+          const message = [props.info, props.message].find((value) => value && typeof value === "object") as
+            | { info?: unknown; role?: unknown; id?: unknown; time?: unknown; parts?: unknown[] }
+            | undefined
+          taskTracker.observeAssistantMessage(sessionID, message)
+          const observed = await recordAssistantMessage(sessionID, message, options ?? {})
+          await reconcileLocalMarkerAfterProgress(locallyDeliveredPendingSessions, sessionID, observed.goal)
+          const scheduled = scheduledContinuations.get(sessionID)
+          if (observed.progressed && scheduled?.purpose !== "settle") cancelScheduledContinuation(sessionID)
+        }
 
-      if (!isIdleEvent(event as never)) return
-      if (!sessionID) return
-      if (!autoContinue && (await getGoalInternal(sessionID))?.pendingAttempt == null) return
-      await runAutoContinue(sessionID)
+        if (!isIdleEvent(event as never)) return
+        if (!sessionID) return
+        if (!autoContinue && (await getGoalInternal(sessionID))?.pendingAttempt == null) return
+        await runAutoContinue(sessionID)
+      } catch (error) {
+        // One event that fails must not take the plugin's event handling with it.
+        // The host keeps calling the hook, and a rejected hook breaks the dispatch.
+        v2ErrorLog("Failed to handle a V1 event", error)
+      }
     },
+  })
+}
+
+/**
+ * Guard a host hook callback.
+ *
+ * A hook runs on the host's critical paths - every tool call, every prompt,
+ * every message, every compaction - and the hook reads and writes the goal
+ * state. A state failure inside it must not reject the hook, or the host
+ * reports the user's own command or message as failed. The goal bookkeeping is
+ * not worth failing the command the user ran.
+ */
+function guardHook<TArgs extends unknown[], TResult>(
+  what: string,
+  callback: (...args: TArgs) => Promise<TResult>,
+): (...args: TArgs) => Promise<TResult> {
+  return async (...args: TArgs) => {
+    try {
+      return await callback(...args)
+    } catch (error) {
+      v2ErrorLog(`Failed to run ${what}`, error)
+      return undefined as TResult
+    }
   }
+}
+
+/**
+ * Guard every hook the V1 API exposes, so a failure in one of them cannot
+ * reject the hook the host is waiting on.
+ */
+function guardHooks<T extends Hooks>(hooks: T): T {
+  const guarded: Record<string, unknown> = {}
+  for (const [name, value] of Object.entries(hooks)) {
+    guarded[name] =
+      typeof value === "function"
+        ? async (...args: unknown[]) => {
+            try {
+              return await (value as (...a: unknown[]) => unknown)(...args)
+            } catch (error) {
+              v2ErrorLog(`Failed to run the ${name} hook`, error)
+              return undefined
+            }
+          }
+        : value
+  }
+  return guarded as T
 }
 
 function v2ErrorLog(message: string, error: unknown) {
   try {
-    console.error(`[opencode-goal-plugin] ${message}:`, error instanceof Error ? error.message : String(error))
+    // The error is described through its cause chain: an Effect failure
+    // reports "An error has occurred" on its own, and the reason lives in the
+    // cause.
+    console.error(`[opencode-goal-plugin] ${message}:`, describeError(error))
   } catch {
     // Logging must never break plugin control flow.
   }
+  // The V2 plugin API has no logger and plugin console output never reaches
+  // the OpenCode log, so the failure is also written to the plugin's own
+  // diagnostics log where a monitor can see it.
+  reportPluginError(message, error)
 }
 
 async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugin.Cleanup> {
@@ -2478,6 +2570,17 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
     },
   }
   const registrations: Array<{ dispose(): Promise<void> }> = []
+  // A plugin that fails to register takes the whole location with it:
+  // OpenCode reports "Location plugins did not finish activating" and every
+  // command that needs that location fails. Each registration is therefore
+  // isolated, so a failure in one degrades the plugin instead of removing it.
+  async function registerSafely(what: string, register: () => Promise<{ dispose(): Promise<void> }>) {
+    try {
+      registrations.push(await register())
+    } catch (error) {
+      v2ErrorLog(`Failed to register ${what}`, error)
+    }
+  }
   let disposed = false
   let eventConsumerStopped = false
 
@@ -2613,6 +2716,11 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
         }
         if (scheduledContinuations.get(sessionID) !== scheduled || nativeRetrySessions.has(sessionID)) return
         await runAutoContinue(sessionID, true, scheduled)
+      } catch (error) {
+        // A timer callback that rejects becomes an unhandled rejection, which
+        // the host reports as a crash. The failure is reported and the schedule
+        // is cleaned up instead.
+        v2ErrorLog("Scheduled continuation failed", error)
       } finally {
         if (scheduledContinuations.get(sessionID) === scheduled) scheduledContinuations.delete(sessionID)
       }
@@ -2785,9 +2893,12 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       if (!goal) {
         // A fast execution can settle before the minimum interval expires.
         // There may be no further idle event, so retain a timed wake-up rather
-        // than dropping the only continuation signal.
+        // than dropping the only continuation signal. The wake-up is retained
+        // even when an attempt is still outstanding: that attempt is resolved
+        // when the wake-up runs, and dropping the signal here would strand the
+        // goal until an unrelated event arrived.
         const waiting = await getGoalInternal(sessionID)
-        if (waiting?.status === "active" && waiting.pendingAttempt == null && waiting.lastContinuationAt != null && minInterval > 0) {
+        if (waiting?.status === "active" && waiting.lastContinuationAt != null && minInterval > 0) {
           scheduleSettledContinuation(
             sessionID,
             continuationDelayFromSnapshot(minInterval, waiting.lastContinuationAt),
@@ -3074,8 +3185,14 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
           if (goal?.status === "active") {
             const attempt = pendingAttemptOf(goal)
             if (attempt != null) {
+              // The attempt id is required: a fast execution can reserve a
+              // newer attempt between the read and this write, and an
+              // unconditional failure would clear that newer attempt and count
+              // a phantom failure toward the pause ceiling.
               const afterFailure = await recordContinuationResult(sessionID, "failure", maxPromptFailures, {
                 requirePending: true,
+                expectedGoalID: goal.id,
+                expectedAttemptID: attempt.id,
               })
               if (afterFailure) locallyDeliveredPendingSessions.delete(sessionID)
               if (autoContinue && afterFailure?.status === "active") {
@@ -3243,9 +3360,15 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
   }
 
   if (registerCommand) {
-    const existingCommands = new Set((await context.command.list()).data.map((command) => command.name))
-    registrations.push(
-      await context.command.transform((draft) => {
+    // Listing the existing commands is a read, but a host that cannot answer
+    // it must not stop the plugin from registering.
+    let existingCommands = new Set<string>()
+    try {
+      existingCommands = new Set((await context.command.list()).data.map((command) => command.name))
+    } catch (error) {
+      v2ErrorLog("Failed to list the existing commands", error)
+    }
+    await registerSafely("the goal command", () => context.command.transform((draft) => {
         const claimedCommands = new Set(existingCommands)
         for (const command of goalCommandDefinitions(commandName, locale)) {
           if (claimedCommands.has(command.name)) continue
@@ -3355,8 +3478,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
     // Keep the auto-turn reset behind an explicit user resume request. The
     // status tool remains model-callable, but it cannot renew the safety limit
     // unless this prompt-admission boundary grants one single-use reset.
-    registrations.push(
-      await context.session.hook("prompt", async (input) => {
+    await registerSafely("the prompt hook", () => context.session.hook("prompt", guardHook("the prompt hook", async (input) => {
         // Prompt hooks only fire in the session's owning location.
         if (typeof input.sessionID === "string") markSessionOwnership(input.sessionID, true)
         explicitResumeRequests.delete(input.sessionID)
@@ -3382,7 +3504,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
         if (isExplicitResumePrompt(input.prompt.text, commandName, locale, messages)) {
           explicitResumeRequests.add(input.sessionID)
         }
-      }),
+      })),
     )
   }
 
@@ -3393,7 +3515,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       name: "interrupt",
       callback: (event: { sessionID: string }) => Promise<void>,
     ) => Promise<{ dispose(): Promise<void> }>
-    registrations.push(await hookInterrupt("interrupt", async ({ sessionID }) => {
+    await registerSafely("the interrupt hook", () => hookInterrupt("interrupt", async ({ sessionID }) => {
       markSessionOwnership(sessionID, true)
       goalServices.stopAutonomy?.(sessionID)
       try {
@@ -3406,14 +3528,12 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
     // Host predates the explicit session interruption hook.
   }
 
-  registrations.push(
-    await context.tool.transform((draft) => {
+  await registerSafely("the goal tools", () => context.tool.transform((draft) => {
       for (const tool of goalToolsV2(goalServices)) draft.add(tool)
     }),
   )
 
-  registrations.push(
-    await context.tool.hook("execute.before", async (input) => {
+  await registerSafely("the execute.before hook", () => context.tool.hook("execute.before", guardHook("the execute.before hook", async (input) => {
       taskTracker.noteTaskCall({ tool: input.tool, sessionID: input.sessionID, callID: input.id })
       const sessionID = typeof input.sessionID === "string" ? input.sessionID : undefined
       // Tool execution only happens in the session's owning location.
@@ -3423,11 +3543,10 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
         const goal = await getGoalInternal(sessionID)
         toolAttempts.set(toolAttemptKey(sessionID, callID), goal?.pendingAttempt?.id ?? null)
       }
-    }),
+    })),
   )
 
-  registrations.push(
-    await context.tool.hook("execute.after", async (input) => {
+  await registerSafely("the execute.after hook", () => context.tool.hook("execute.after", guardHook("the execute.after hook", async (input) => {
       const sessionID = typeof input.sessionID === "string" ? input.sessionID : undefined
       const callID = typeof input.id === "string" ? input.id : undefined
       const attemptKey = sessionID && callID ? toolAttemptKey(sessionID, callID) : undefined
@@ -3461,7 +3580,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
         locallyDeliveredPendingSessions.delete(sessionID)
         cancelScheduledContinuation(sessionID)
       }
-    }),
+    })),
   )
 
   const reminder = systemReminder(locale)
@@ -3470,8 +3589,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
     system.push({ type: "text", text: reminder })
   }
 
-  registrations.push(
-    await context.session.hook("context", (sessionContext) => {
+  await registerSafely("the context hook", () => context.session.hook("context", (sessionContext) => {
       ensureSystemReminder(sessionContext.system)
     }),
   )
@@ -3487,14 +3605,13 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       name: "compaction",
       callback: (event: V2CompactionHookEvent) => Promise<void>,
     ) => Promise<{ dispose(): Promise<void> }>
-    registrations.push(
-      await hookCompaction("compaction", async (event) => {
+    await registerSafely("the compaction hook", () => hookCompaction("compaction", guardHook("the compaction hook", async (event) => {
         ensureSystemReminder(event.system)
         const goal = await getGoal(event.sessionID)
         if (!goal) return
         if (event.system.some((part) => part.type === "text" && part.text.startsWith(compactionContextPrefix(locale)))) return
         event.system.push({ type: "text", text: compactionContext(goal, locale) })
-      }),
+      })),
     )
   } catch {
     // Host predates the session compaction hook.
@@ -3540,7 +3657,18 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
         const { done, value } = await iterator.next()
         if (done) break
         const event = decodeV2Event(value)
-        if (event) await handleV2Event(event)
+        if (!event) continue
+        // One event that fails must not take the consumer down with it. The
+        // handler writes the goal state, and a failed write - a transient
+        // Windows lock, a state file that cannot be decoded - would otherwise
+        // end the loop, and the plugin would never see another event: the
+        // goal would stop continuing and the sidebar would stop updating,
+        // with nothing beyond the first failure to show for it.
+        try {
+          await handleV2Event(event)
+        } catch (error) {
+          v2ErrorLog("Failed to handle a V2 event", error)
+        }
       }
     } catch (error) {
       if (!abortController.signal.aborted) v2ErrorLog("V2 event consumer stopped", error)
@@ -3569,6 +3697,10 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
     // unload on a stream that does not close promptly.
     const termination = Promise.allSettled([consumer, eventIterator?.return?.()])
     await Promise.race([termination, new Promise((resolve) => setTimeout(resolve, 2_000))])
+    // Let the state writes that are already in flight finish. A host that
+    // reloads the plugin tears the state directory down with it, and a write
+    // that is still running would fail and lose the change it carried.
+    await waitForPendingMutations()
   }
 }
 

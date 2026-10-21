@@ -108,10 +108,21 @@ const child = Bun.spawn([binary, "serve", "--hostname", "127.0.0.1", "--port", "
   cwd: project, env, stdout: "pipe", stderr: "pipe",
 })
 let output = ""
-const consume = async (stream: ReadableStream<Uint8Array>) => {
-  for await (const chunk of stream) output += new TextDecoder().decode(chunk)
+// The readers of the server output are kept so that the cleanup can release
+// them. The server spawns processes of its own, and those inherit the pipes:
+// the pipes therefore stay open after the server is gone, and an open pipe
+// keeps the runtime alive, so the run never ends even though the test
+// finished. A stream that is read with `for await` is locked and cannot be
+// cancelled, so the readers are taken explicitly.
+const serverReaders = [child.stdout.getReader(), child.stderr.getReader()]
+const consume = async (reader: (typeof serverReaders)[number]) => {
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    output += new TextDecoder().decode(value)
+  }
 }
-const readers = Promise.all([consume(child.stdout), consume(child.stderr)])
+const readers = Promise.all(serverReaders.map(consume))
 const deadline = Date.now() + Number(process.env.OPENCODE_SMOKE_TIMEOUT_MS ?? 30000)
 let lastStage: string | undefined
 const waitFor = async (stage: string, check: () => boolean | Promise<boolean>, diagnose?: () => string) => {
@@ -126,6 +137,24 @@ const waitFor = async (stage: string, check: () => boolean | Promise<boolean>, d
   throw new Error(`Smoke timeout at stage "${stage}"; ${observed}; logs=${root}/server.log`)
 }
 let passed = false
+
+/**
+ * Stop the server and everything it started.
+ *
+ * The command that is spawned is a shim that starts the real server, and the
+ * server starts processes of its own. Killing the shim alone leaves those
+ * running for the rest of the machine's life, so the whole tree is stopped
+ * instead.
+ */
+function stopServerTree(child: { pid: number; kill: (signal?: number | NodeJS.Signals) => void }) {
+  if (process.platform === "win32") {
+    // taskkill walks the tree, so the shim, the server and the processes the
+    // server started are stopped together.
+    Bun.spawnSync(["taskkill", "/PID", String(child.pid), "/T", "/F"], { stdout: "ignore", stderr: "ignore" })
+    return
+  }
+  child.kill("SIGKILL")
+}
 try {
   await waitFor("server-ready", () => /http:\/\/127\.0\.0\.1:\d+/.test(output))
   const base = output.match(/http:\/\/127\.0\.0\.1:\d+/)![0]
@@ -229,11 +258,34 @@ try {
   console.log(JSON.stringify(summary, null, 2))
   passed = true
 } finally {
-  child.kill()
-  await child.exited
-  await readers
+  // The server does not always stop when it is asked to: on Windows it
+  // ignores the terminate signal, the child never exits, and a wait for it
+  // hangs the run forever with the result of the test still unreported. Every
+  // wait here is therefore bounded, and the diagnostics that explain a
+  // failure are written before the server is stopped.
+  // The tree is stopped before anything else: a kill of the shim alone
+  // orphans the server it started, and the tree can no longer be walked once
+  // the shim is gone.
+  stopServerTree(child)
+  const stopped = await Promise.race([child.exited.then(() => true), Bun.sleep(3_000).then(() => false)])
+  if (!stopped) {
+    // The server ignored the terminate signal, so it is stopped the hard way
+    // instead of being left behind for the rest of the machine's life.
+    child.kill("SIGKILL")
+    await Promise.race([child.exited, Bun.sleep(2_000)])
+  }
+  // The pipes are released explicitly: the processes the server spawned hold
+  // them open, and an open pipe keeps the runtime alive after the test is
+  // done.
+  for (const reader of serverReaders) {
+    try {
+      await reader.cancel()
+    } catch {
+      // A reader that is already closed needs no release.
+    }
+  }
+  await Promise.race([readers, Bun.sleep(2_000)])
   await writeFile(join(root, "server.log"), output)
-  model.stop(true)
   // On failure, preserve diagnostics before the temp root disappears: a bare
   // timeout cannot say which final condition was stuck, and CI uploads the
   // copied directory as an artifact via OPENCODE_SMOKE_ARTIFACTS_DIR.
@@ -258,4 +310,5 @@ try {
       console.error(`Failed to preserve smoke artifacts: ${error instanceof Error ? error.message : String(error)}`)
     }
   }
+  model.stop(true)
 }

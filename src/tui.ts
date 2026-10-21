@@ -702,11 +702,19 @@ async function showSummaryV2(
       : []),
   ]
   api.ui.dialog.set({ size: "large" })
-  const selected = await api.ui.dialog.select({
-    title: messages.tui.title,
-    placeholder: formatGoal(goal, messages, locale),
-    options,
-  })
+  let selected: string | undefined
+  try {
+    selected = await api.ui.dialog.select({
+      title: messages.tui.title,
+      placeholder: formatGoal(goal, messages, locale),
+      options,
+    })
+  } catch (error) {
+    // The command runs detached, so a rejection here would be an unhandled
+    // rejection in the host's TUI process.
+    toastV2(api, messages, error instanceof Error ? error.message : String(error), "error")
+    return
+  }
   const prompt = selected === "refresh" ? refreshGoalPrompt(messages)
     : selected === "history" ? historyGoalPrompt(messages)
     : selected === "pause" ? pauseGoalPrompt(messages)
