@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, beforeEach, expect, test } from "bun:test"
 import { mkdtempSync, rmSync, unlinkSync } from "node:fs"
-import { rename, writeFile } from "node:fs/promises"
+import { writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import type { ResolvedTheme } from "@opencode/theme/tui"
@@ -17,6 +17,7 @@ import plugin, {
   setupTuiV2,
   themeColorV2,
 } from "../src/tui.ts"
+import { atomicWriteFile } from "../src/atomic-write"
 
 type GoalSnapshot = Parameters<typeof liveTimeUsedSeconds>[0]
 
@@ -26,9 +27,11 @@ const isolatedStatePath = join(isolatedStateDir, "goals.json")
 let hostTheme: ResolvedTheme | undefined
 
 async function writeGoalState(value: unknown) {
-  const temporary = `${isolatedStatePath}.tmp`
-  await writeFile(temporary, JSON.stringify(value))
-  await rename(temporary, isolatedStatePath)
+  // Use the production atomic writer: replacing an existing file with a
+  // rename fails with EPERM on Windows while another reader (the sidebar
+  // poller below) still holds the target open, and the writer retries that
+  // transient lock instead of failing the test.
+  await atomicWriteFile(isolatedStatePath, JSON.stringify(value))
 }
 
 beforeAll(async () => {
@@ -759,6 +762,43 @@ test("V2 palette command toasts a warning when no session is open", async () => 
     expect(toasts[0]?.variant).toBe("warning")
     expect(selectCalls).toHaveLength(0)
     expect(promptCalls).toHaveLength(0)
+
+    setup.renderer.destroy()
+    destroyed = true
+  } finally {
+    if (!destroyed) setup.renderer.destroy()
+    cleanup()
+  }
+})
+
+test("V2 palette command toasts the failure when the dialog cannot be shown", async () => {
+  // The command runs detached, so a rejection from the dialog would be an
+  // unhandled rejection in the host's TUI process.
+  const { mock, slots, layers, setMessages, setRoute, toasts } = makeMockContext()
+  mock.ui.dialog.select = async () => {
+    throw new Error("the dialog could not be opened")
+  }
+  const cleanup = setupTuiV2(mock as never)
+  const app = slots.get("app")
+  expect(app).toBeTypeOf("function")
+
+  setMessages([
+    assistantMessage("paused", [
+      goalTool("update_goal_status", JSON.stringify({ goal: goal({ status: "paused", objective: "resume me" }) })),
+    ]),
+  ])
+  setRoute({ type: "session", sessionID: "ses_v2" })
+
+  const setup = await testRender(() => app?.({ sessionID: "" }) as never, { width: 80, height: 20 })
+  let destroyed = false
+  try {
+    await setup.renderOnce()
+    const command = layers[0]?.()?.commands?.find((candidate) => candidate.id === "goal.show")
+    expect(command).toBeDefined()
+    command?.run()
+
+    await waitFor(() => toasts.length === 1)
+    expect(toasts[0]?.message).toContain("the dialog could not be opened")
 
     setup.renderer.destroy()
     destroyed = true
