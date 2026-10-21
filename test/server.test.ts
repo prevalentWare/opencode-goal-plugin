@@ -1338,7 +1338,12 @@ test("zero-filled state recovery reports the quarantine through app logging", as
       extra: { stateFile: file },
     },
   })
-  expect(JSON.stringify(logs[0])).toContain(`${file}.corrupt-`)
+  // Assert against the parsed payload instead of a serialized copy: JSON
+  // escaping doubles the path separators on Windows, so a substring match on
+  // the serialized string could never match a raw path there.
+  const quarantineFile = (logs[0] as { body?: { extra?: { quarantineFile?: string } } }).body?.extra?.quarantineFile
+  expect(typeof quarantineFile).toBe("string")
+  expect((quarantineFile as string).startsWith(`${file}.corrupt-`)).toBe(true)
 })
 
 test("state recovery reporting is scoped to the configured state path", async () => {
@@ -4355,4 +4360,94 @@ test("V1 only a sanitized explicit goal edit authorizes clearing a saved plan", 
   await hooks["command.execute.before"]?.({command:"goal",sessionID:"ses_edit",arguments:args},{parts:[{type:"text",text:config.command!.goal!.template.replaceAll("$ARGUMENTS",args)}]} as never)
   await requireTool(hooks.tool?.update_goal_objective,"update_goal_objective").execute({objective:"New user scope &amp; &lt;checks&gt;"},context)
   expect(await getGoal("ses_edit")).toMatchObject({objective:"New user scope & <checks>",plan:null,planRevision:2})
+})
+
+test("V1 a failing event does not reject the hook", async () => {
+  // The host keeps calling the event hook, so one event that fails must not
+  // break the dispatch: the failure is reported and the next event is still
+  // handled.
+  const calls: unknown[] = []
+  const client = { session: { promptAsync: async (input: unknown) => { calls.push(input) } } }
+  const hooks = await setupServer({ client } as never, { auto_continue: true, max_auto_turns: 5 })
+  const stateFile = process.env.OPENCODE_GOAL_STATE_PATH!
+  await requireTool(hooks.tool?.create_goal, "create_goal").execute(
+    { objective: "survive a failing event" },
+    { sessionID: "ses_1" } as never,
+  )
+  const original = await readFile(stateFile, "utf8")
+
+  // A state file that cannot be decoded makes the handler's state write fail.
+  await writeFile(stateFile, "{ not json", "utf8")
+  // The hook must not reject.
+  await hooks.event!({
+    event: {
+      type: "message.updated",
+      properties: {
+        info: {
+          id: "m1",
+          sessionID: "ses_1",
+          role: "assistant",
+          time: { completed: Date.now() },
+          parts: [{ type: "text", text: "hello" }],
+        },
+      },
+    } as never,
+  })
+
+  // A later event is still handled.
+  await writeFile(stateFile, original, "utf8")
+  await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_1" } } } as never)
+  await waitFor(() => calls.length >= 1, 3000)
+  expect(calls.length).toBeGreaterThanOrEqual(1)
+})
+
+test("V1 a failing tool hook does not fail the tool call", async () => {
+  // A tool hook runs on every tool call and reads the goal state. A state
+  // failure inside it must not reject the hook, or the host reports the user's
+  // own command as failed.
+  const client = { session: { promptAsync: async () => {} } }
+  const hooks = await setupServer({ client } as never, { auto_continue: false })
+  const stateFile = process.env.OPENCODE_GOAL_STATE_PATH!
+  await writeFile(stateFile, "{ not json", "utf8")
+
+  const before = hooks["tool.execute.before"]
+  const after = hooks["tool.execute.after"]
+  expect(before).toBeDefined()
+  expect(after).toBeDefined()
+  const output = { title: "bash", output: "done", metadata: {} }
+  await before!({ tool: "bash", sessionID: "ses_1", callID: "call_1", args: {} } as never, output as never)
+  await after!({ tool: "bash", sessionID: "ses_1", callID: "call_1", args: {} } as never, output as never)
+})
+
+test("V1 a failing message hook does not reject the hook", async () => {
+  // The message hook runs on every message and writes the goal state. A state
+  // failure inside it must not reject the hook, or the host reports the
+  // user's own message as failed.
+  const client = { session: { promptAsync: async () => {} } }
+  const hooks = await setupServer({ client } as never, { auto_continue: false })
+  const stateFile = process.env.OPENCODE_GOAL_STATE_PATH!
+  await writeFile(stateFile, "{ not json", "utf8")
+
+  const chat = hooks["chat.message"]
+  expect(chat).toBeDefined()
+  await chat!({ sessionID: "ses_1", agent: "build" } as never, { message: { id: "m1", parts: [] } } as never)
+})
+
+test("V1 dispose waits for the in-flight goal state writes", async () => {
+  // A host that reloads the plugin tears the state directory down with it, so
+  // a write that is still running would fail and lose the change it carried.
+  const client = { session: { promptAsync: async () => {} } }
+  const hooks = await setupServer({ client } as never, { auto_continue: false })
+  await createGoal("ses_1", "keep writing", null)
+
+  let settled = 0
+  const writes = Array.from({ length: 50 }, (_, index) =>
+    setGoalStatus("ses_1", index % 2 === 0 ? "active" : "paused", null).then(() => {
+      settled += 1
+    }),
+  )
+  await hooks.dispose?.()
+  // Every queued write has finished by the time dispose returns.
+  expect(settled).toBe(50)
+  await Promise.all(writes)
 })
