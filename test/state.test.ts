@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, expect, setSystemTime, spyOn, test } from "bun:test"
+import { readFileSync } from "node:fs"
 import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
@@ -29,6 +30,7 @@ import {
   updateGoalObjective,
   validateEvidence,
   validateObjective,
+  waitForPendingMutations,
 } from "../src/state"
 
 let dir = ""
@@ -41,6 +43,34 @@ beforeEach(async () => {
 afterEach(async () => {
   delete process.env.OPENCODE_GOAL_STATE_PATH
   await rm(dir, { recursive: true, force: true })
+})
+
+test("state writes stay atomic: the file is always complete JSON and no temp file is left behind", async () => {
+  const file = process.env.OPENCODE_GOAL_STATE_PATH!
+  await createGoal("ses_1", "atomic state", null)
+  await accountUsage("ses_1", 10)
+
+  // The state file is replaced through a same-directory temp file and a
+  // rename, so a concurrent reader never observes a partially written
+  // document: the file on disk is always the old or the new valid version.
+  expect(() => JSON.parse(readFileSync(file, "utf8"))).not.toThrow()
+  expect(JSON.parse(readFileSync(file, "utf8")).goals.ses_1.objective).toBe("atomic state")
+  // The writer cleans up after itself: no orphaned temp file survives.
+  expect((await readdir(dir)).filter((name) => name.endsWith(".tmp"))).toEqual([])
+})
+
+test("an orphaned temp file from a crashed writer does not corrupt the recovered state", async () => {
+  const file = process.env.OPENCODE_GOAL_STATE_PATH!
+  await createGoal("ses_1", "survive a crashed writer", null)
+
+  // A writer killed between creating the temp file and renaming it leaves the
+  // temp file behind. That leftover must never be mistaken for the state.
+  await writeFile(`${file}.11111111-2222-3333-4444-555555555555.tmp`, "{}", "utf8")
+  await accountUsage("ses_1", 5)
+
+  const goal = await getGoal("ses_1")
+  expect(goal?.objective).toBe("survive a crashed writer")
+  expect(goal?.tokensUsed).toBe(5)
 })
 
 test("creates, reads, pauses, resumes, completes, and clears a goal", async () => {
@@ -1090,4 +1120,104 @@ test("delayed prior-turn assistant output cannot clear a newer pending attempt",
     completedAt: reservedAt + 10_000,
   })
   expect((await getGoalInternal("ses_1"))?.pendingAttempt).toBeNull()
+})
+
+test("a late continuation result does not clear a newer pending attempt", async () => {
+  // A fast execution can reserve a new attempt while the previous
+  // continuation's prompt is still in flight. The late result belongs to the
+  // previous attempt, so it must not clear the newer pending attempt: doing
+  // so strands the goal with no pending continuation and no queued wake-up.
+  await createGoal("ses_1", "continue", null)
+  const reserved = await reserveContinuation("ses_1", 10, 0)
+  const attemptID = reserved?.pendingAttempt?.id
+  expect(attemptID).toBeString()
+
+  // A result for an attempt that is no longer pending is ignored.
+  const stale = await recordContinuationResult("ses_1", "success", 3, {
+    expectedAttemptID: "an-attempt-that-is-no-longer-pending",
+  })
+  expect(stale).toBeNull()
+  expect((await getGoalInternal("ses_1"))?.pendingAttempt?.id).toBe(attemptID)
+
+  // The matching result still commits the attempt it belongs to.
+  const delivered = await recordContinuationResult("ses_1", "success", 3, {
+    expectedAttemptID: attemptID,
+  })
+  expect(delivered?.pendingAttempt?.delivered).toBe(true)
+})
+
+test("a late continuation failure does not clear a newer pending attempt", async () => {
+  // A transport failure reported for a previous attempt must not clear the
+  // attempt that is pending now, and must not count a phantom failure toward
+  // the ceiling that pauses the goal.
+  await createGoal("ses_1", "continue", null)
+  const reserved = await reserveContinuation("ses_1", 10, 0)
+  const attemptID = reserved?.pendingAttempt?.id
+  expect(attemptID).toBeString()
+
+  const stale = await recordContinuationResult("ses_1", "failure", 3, {
+    requirePending: true,
+    expectedAttemptID: "an-attempt-that-is-no-longer-pending",
+  })
+  expect(stale).toBeNull()
+  expect((await getGoalInternal("ses_1"))?.pendingAttempt?.id).toBe(attemptID)
+  expect((await getGoal("ses_1"))?.continuationFailures).toBe(0)
+  expect((await getGoal("ses_1"))?.status).toBe("active")
+})
+
+test("the minimum continuation interval is measured from the millisecond anchor", async () => {
+  // The interval gate compares whole-second timestamps, so a follow-up
+  // continuation can slip through as soon as the wall clock crosses into the
+  // next second, even when the real elapsed time is far below the configured
+  // minimum. A fast execution must wait for the whole interval.
+  const base = 1_700_000_000_000
+  await createGoal("ses_1", "continue", null)
+
+  // Reserve 900ms into a whole second.
+  setSystemTime(new Date(base + 900))
+  const first = await reserveContinuation("ses_1", 10, 1)
+  expect(first).not.toBeNull()
+  expect(first?.lastContinuationAt).toBe(Math.floor((base + 900) / 1000))
+
+  // 200ms later the wall clock is in the next second, but only 200ms of the
+  // one second minimum has elapsed.
+  setSystemTime(new Date(base + 1_100))
+  const second = await reserveContinuation("ses_1", 10, 1)
+  expect(second).toBeNull()
+
+  // Once the full minimum has elapsed the continuation is allowed again.
+  setSystemTime(new Date(base + 1_950))
+  const third = await reserveContinuation("ses_1", 10, 1)
+  expect(third).not.toBeNull()
+})
+
+test("rolling back a continuation restores the minimum interval anchor", async () => {
+  // A rolled-back attempt must not leave the goal waiting out an interval it
+  // never really used: the anchor is restored with the attempt, so a follow-up
+  // continuation is allowed again.
+  const base = 1_700_000_000_000
+  await createGoal("ses_1", "continue", null)
+
+  setSystemTime(new Date(base + 900))
+  const reserved = await reserveContinuation("ses_1", 10, 1)
+  expect(reserved).not.toBeNull()
+
+  const rolled = await rollbackContinuationAttempt("ses_1", { attemptID: reserved?.pendingAttempt?.id })
+  expect(rolled).toBe(true)
+  expect((await getGoalInternal("ses_1"))?.pendingAttempt).toBeNull()
+  expect((await getGoal("ses_1"))?.autoTurns).toBe(0)
+
+  setSystemTime(new Date(base + 1_100))
+  expect(await reserveContinuation("ses_1", 10, 1)).not.toBeNull()
+})
+
+test("waiting for pending mutations waits for the queued writes", async () => {
+  // A host that reloads the plugin tears the state directory down with it. A
+  // write that is still in flight then fails and the change it carried is
+  // lost, so the plugin has to let the queued writes finish before it goes.
+  await createGoal("ses_1", "first", null)
+  const pending = setGoalStatus("ses_1", "paused", null)
+  await waitForPendingMutations()
+  expect((await getGoal("ses_1"))?.status).toBe("paused")
+  await pending
 })

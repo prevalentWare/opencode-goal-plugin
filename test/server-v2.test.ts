@@ -209,6 +209,29 @@ async function waitFor(predicate: () => boolean | Promise<boolean>, deadlineMs =
   expect(await predicate()).toBe(true)
 }
 
+// The plugin anchors a continuation to a whole-second timestamp, so a
+// configured minimum interval of N seconds may legitimately hold the
+// continuation for up to N + 1 seconds before it reaches the host run
+// boundary. A deadline that only covers N leaves no room for timer drift, and
+// the continuation tests failed intermittently on a loaded machine. The
+// deadline below covers the full window plus scheduling slack.
+const CONTINUATION_BOUNDARY_DEADLINE_MS = 5_000
+
+// Bun's default per-test timeout is 5 seconds. The continuation tests wait
+// for a minimum continuation interval and for the host run boundary, so their
+// legitimate timeline can exceed that default even when every assertion
+// holds. The timeout below covers the waits above without shortening them.
+const CONTINUATION_TEST_TIMEOUT_MS = 30_000
+
+async function waitForLong(predicate: () => boolean | Promise<boolean>, deadlineMs = 3000) {
+  const deadline = Date.now() + deadlineMs
+  while (Date.now() < deadline) {
+    if (await predicate()) return
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+  expect(await predicate()).toBe(true)
+}
+
 // A task-block re-arm is a TASK_BLOCK_RETRY_MS timer and nothing else: the V2 poll touches
 // no mock surface, so counting the timers is the only way to tell a stopped loop from a
 // running one. Swapping the global back in a finally keeps a failed assertion from leaking
@@ -1766,16 +1789,16 @@ test("V2 fast execution success schedules the next continuation after the minimu
   const idleBarrier = new Promise<void>((resolve) => { releaseWait = resolve })
   mock.session.wait = async () => { waiting = true; await idleBarrier }
   await mock.stream.push({ type: "session.execution.started", created: Date.now(), data: { sessionID: "ses_v2" } })
-  await waitFor(() => waiting, 2500)
+  await waitForLong(() => waiting, CONTINUATION_BOUNDARY_DEADLINE_MS)
   expect(mock.promptCalls).toHaveLength(1)
   await mock.stream.push({ type: "session.execution.succeeded", created: Date.now(), data: { sessionID: "ses_v2" } })
   releaseWait()
   mock.session.wait = async () => {}
-  await waitFor(() => mock.promptCalls.length === 2, 3000)
+  await waitForLong(() => mock.promptCalls.length === 2, CONTINUATION_BOUNDARY_DEADLINE_MS)
   expect((await getGoal("ses_v2"))!.lastContinuationAt! - first).toBeGreaterThanOrEqual(1)
   mock.stream.end()
   await cleanup()
-})
+}, CONTINUATION_TEST_TIMEOUT_MS)
 
 test("V2 timed continuation waits for a live run boundary even when busy events are missing", async () => {
   const mock = makeMockContext({ min_continue_interval_seconds: 1 })
@@ -1795,13 +1818,13 @@ test("V2 timed continuation waits for a live run boundary even when busy events 
   mock.session.wait = async () => { waiting = true; await idleBarrier }
   // No busy event is delivered for the next execution; only the host's live
   // wait barrier knows that another assistant step is still running.
-  await waitFor(() => waiting, 2500)
+  await waitForLong(() => waiting, CONTINUATION_BOUNDARY_DEADLINE_MS)
   expect(mock.promptCalls).toHaveLength(1)
   releaseWait()
-  await waitFor(() => mock.promptCalls.length === 2)
+  await waitForLong(() => mock.promptCalls.length === 2, CONTINUATION_BOUNDARY_DEADLINE_MS)
   mock.stream.end()
   await cleanup()
-})
+}, CONTINUATION_TEST_TIMEOUT_MS)
 
 test("V2 idle event triggers auto-continue via ctx.session.prompt", async () => {
   const mock = makeMockContext({ auto_continue: true, min_continue_interval_seconds: 0, max_auto_turns: 5 })
@@ -2509,7 +2532,12 @@ test("V2 watchdog rescues a busy active goal without consuming auto-turn budgets
 })
 
 test("V2 create_goal keeps the current busy-turn watchdog armed", async () => {
-  const mock = makeMockContext({ auto_continue: false, max_turn_time: 0.03 })
+  // The busy event arms the turn watchdog, and the goal is created while that
+  // window is already running. The window has to be wide enough for the goal
+  // to be written before the watchdog fires, or the rescue finds no goal and
+  // the test measures the speed of a state write rather than the behaviour it
+  // is about.
+  const mock = makeMockContext({ auto_continue: false, max_turn_time: 0.3 })
   const cleanup = await setupPlugin(mock as never)
 
   await mock.stream.push({
@@ -2893,4 +2921,160 @@ test("V2 a command transport abort preserves the active goal for reconnection", 
   controller.abort()
   await command
   expect((await getGoal("ses_v2"))?.status).toBe("active")
+})
+
+test("V2 a failing registration does not remove the plugin", async () => {
+  // A plugin that fails to register takes the whole location with it:
+  // OpenCode reports "Location plugins did not finish activating" and every
+  // command that needs the location fails. A single failing registration must
+  // degrade the plugin, not remove it.
+  const mock = makeMockContext({ auto_continue: false })
+  const failing = new Error("host refused the command list")
+  const context = {
+    ...mock,
+    command: {
+      ...mock.command,
+      list: async () => {
+        throw failing
+      },
+    },
+  }
+  // The setup completes instead of rejecting, and the registrations that do
+  // not depend on the failing read still happen.
+  const cleanup = await setupPlugin(context as never)
+
+  const registered = mock.tools.map((tool) => tool.name)
+  expect(registered).toContain("get_goal")
+  expect(registered).toContain("create_goal")
+  const commands = mock.commands.map((command) => command.name)
+  expect(commands).toContain("goal")
+
+  mock.stream.end()
+  await cleanup()
+})
+
+test("V2 a failing event does not stop the event consumer", async () => {
+  // The event handler writes the goal state. A failed write would otherwise
+  // end the consumer loop, and the plugin would never see another event: the
+  // goal would stop continuing and the sidebar would stop updating.
+  const mock = makeMockContext(
+    { auto_continue: false },
+    [],
+    {},
+    { directory: "/own" },
+    { ses_v2: { location: { directory: "/own" } } },
+  )
+  const cleanup = await setupPlugin(mock as never)
+  await createGoalViaV2Tool(mock, "keep the consumer alive")
+
+  const stateFile = process.env.OPENCODE_GOAL_STATE_PATH
+  if (!stateFile) throw new Error("expected a state path")
+  await writeFile(stateFile, "{ not json", "utf8")
+  await mock.stream.push({
+    type: "session.usage.updated",
+    created: 1,
+    data: { sessionID: "ses_v2", tokens: { input: 1, output: 1 } },
+  })
+
+  // A later event must still be processed.
+  await writeFile(stateFile, JSON.stringify({ version: 3, goals: {}, archives: {} }), "utf8")
+  await mock.stream.push({
+    type: "session.usage.updated",
+    created: 2,
+    data: { sessionID: "ses_after", tokens: { input: 1, output: 1 } },
+  })
+  await waitFor(() => mock.sessionGetCalls.includes("ses_after"))
+
+  mock.stream.end()
+  await cleanup()
+})
+
+test("V2 a scheduled continuation that fails is reported instead of rejecting", async () => {
+  // The scheduled continuation runs in a timer callback. A callback that
+  // rejects becomes an unhandled rejection, which the host reports as a
+  // crash, so the failure has to be caught and reported instead.
+  const rejections: unknown[] = []
+  const onUnhandled = (reason: unknown) => rejections.push(reason)
+  process.on("unhandledRejection", onUnhandled)
+  const mock = makeMockContext({ min_continue_interval_seconds: 3, max_prompt_failures: 5 })
+  mock.session.prompt = async () => {
+    throw new Error("network connection failed")
+  }
+  const cleanup = await setupPlugin(mock as never)
+  try {
+    await createGoalViaV2Tool(mock, "report a failed scheduled continuation")
+    mock.stream.push({ type: "session.execution.started", created: 1, data: { sessionID: "ses_v2" } })
+    mock.stream.push({
+      type: "session.execution.failed",
+      created: 2,
+      data: { sessionID: "ses_v2", error: { message: "network connection failed" } },
+    })
+    // The failure is recorded and the retry is scheduled.
+    await waitFor(async () => (await getGoal("ses_v2"))?.continuationFailures === 1)
+    // The retry reads the goal state. A state file that cannot be decoded makes
+    // the timer fail.
+    await writeFile(process.env.OPENCODE_GOAL_STATE_PATH!, "{ not json", "utf8")
+    await waitFor(async () => (await readFile(join(dir, "goal-plugin.log"), "utf8").catch(() => "")).includes("Scheduled continuation failed"), 8000)
+    expect(rejections).toHaveLength(0)
+  } finally {
+    process.off("unhandledRejection", onUnhandled)
+    mock.stream.end()
+    await cleanup()
+  }
+})
+
+test("V2 a failing tool hook does not fail the tool call", async () => {
+  // A tool hook runs on every tool call and reads the goal state. A state
+  // failure inside it must not reject the hook, or the host reports the
+  // user's own command as failed.
+  const mock = makeMockContext({ auto_continue: false })
+  const cleanup = await setupPlugin(mock as never)
+  const stateFile = process.env.OPENCODE_GOAL_STATE_PATH!
+  await writeFile(stateFile, "{ not json", "utf8")
+
+  const before = mock.hooks["execute.before"]
+  const after = mock.hooks["execute.after"]
+  expect(before).toBeDefined()
+  expect(after).toBeDefined()
+  await before!({ tool: "bash", sessionID: "ses_v2", id: "call_1" } as never)
+  await after!({ tool: "bash", sessionID: "ses_v2", id: "call_1", status: "completed", result: { output: "done" } } as never)
+
+  mock.stream.end()
+  await cleanup()
+})
+
+test("V2 a failing session hook does not reject the hook", async () => {
+  // The prompt and compaction hooks run on the host's critical paths and read
+  // the goal state. A state failure inside one of them must not reject the
+  // hook, or the host reports the user's own prompt as failed.
+  const mock = makeMockContext({ auto_continue: false })
+  const cleanup = await setupPlugin(mock as never)
+  const stateFile = process.env.OPENCODE_GOAL_STATE_PATH!
+  await writeFile(stateFile, "{ not json", "utf8")
+
+  const compaction = mock.hooks["compaction"]
+  expect(compaction).toBeDefined()
+  await compaction!({ sessionID: "ses_v2", system: [] } as never)
+
+  mock.stream.end()
+  await cleanup()
+})
+
+test("V2 cleanup waits for the in-flight goal state writes", async () => {
+  // A host that reloads the plugin tears the state directory down with it, so
+  // a write that is still running would fail and lose the change it carried.
+  const mock = makeMockContext({ auto_continue: false })
+  const cleanup = await setupPlugin(mock as never)
+  await createGoalViaV2Tool(mock, "keep writing")
+
+  let settled = 0
+  const writes = Array.from({ length: 50 }, (_, index) =>
+    setGoalStatus("ses_v2", index % 2 === 0 ? "active" : "paused", null).then(() => {
+      settled += 1
+    }),
+  )
+  await cleanup()
+  // Every queued write has finished by the time the cleanup returns.
+  expect(settled).toBe(50)
+  await Promise.all(writes)
 })
