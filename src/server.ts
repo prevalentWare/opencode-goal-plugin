@@ -40,6 +40,7 @@ import {
 } from "./state"
 import type { GoalLocale, GoalMessages } from "./i18n"
 import { formatGoalHistoryPresentation, messagesFor, resolveLocale } from "./i18n"
+import { reportPluginError } from "./diagnostics"
 import { compactionContext, compactionContextPrefix, continuationPrompt, limitPrompt, systemReminder } from "./prompts"
 
 type Options = {
@@ -2334,9 +2335,15 @@ const server: Plugin = async ({ client }, options?: Options) => {
             const attempt = pendingAttemptOf(goal)
             if (attempt != null) {
               // The pending attempt failed at the transport level: count one
-              // failure and retry at the remaining min interval.
+              // failure and retry at the remaining min interval. The attempt id
+              // is required: a fast execution can reserve a newer attempt
+              // between the read and this write, and an unconditional failure
+              // would clear that newer attempt and count a phantom failure
+              // toward the pause ceiling.
               const afterFailure = await recordContinuationResult(sessionID, "failure", maxPromptFailures, {
                 requirePending: true,
+                expectedGoalID: goal.id,
+                expectedAttemptID: attempt.id,
               })
               if (afterFailure) locallyDeliveredPendingSessions.delete(sessionID)
               if (autoContinue && afterFailure?.status === "active") {
@@ -2401,6 +2408,10 @@ function v2ErrorLog(message: string, error: unknown) {
   } catch {
     // Logging must never break plugin control flow.
   }
+  // The V2 plugin API has no logger and plugin console output does not reach
+  // the OpenCode log, so the failure is also written to the plugin's own
+  // diagnostics log where a monitor can see it.
+  reportPluginError(message, error)
 }
 
 async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugin.Cleanup> {
@@ -2785,9 +2796,12 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       if (!goal) {
         // A fast execution can settle before the minimum interval expires.
         // There may be no further idle event, so retain a timed wake-up rather
-        // than dropping the only continuation signal.
+        // than dropping the only continuation signal. The wake-up is retained
+        // even when an attempt is still outstanding: that attempt is resolved
+        // when the wake-up runs, and dropping the signal here would strand the
+        // goal until an unrelated event arrived.
         const waiting = await getGoalInternal(sessionID)
-        if (waiting?.status === "active" && waiting.pendingAttempt == null && waiting.lastContinuationAt != null && minInterval > 0) {
+        if (waiting?.status === "active" && waiting.lastContinuationAt != null && minInterval > 0) {
           scheduleSettledContinuation(
             sessionID,
             continuationDelayFromSnapshot(minInterval, waiting.lastContinuationAt),
@@ -3074,8 +3088,14 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
           if (goal?.status === "active") {
             const attempt = pendingAttemptOf(goal)
             if (attempt != null) {
+              // The attempt id is required: a fast execution can reserve a
+              // newer attempt between the read and this write, and an
+              // unconditional failure would clear that newer attempt and count
+              // a phantom failure toward the pause ceiling.
               const afterFailure = await recordContinuationResult(sessionID, "failure", maxPromptFailures, {
                 requirePending: true,
+                expectedGoalID: goal.id,
+                expectedAttemptID: attempt.id,
               })
               if (afterFailure) locallyDeliveredPendingSessions.delete(sessionID)
               if (autoContinue && afterFailure?.status === "active") {
