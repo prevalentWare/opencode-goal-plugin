@@ -89,6 +89,8 @@ export type PendingAttempt = {
   armNoProgress: boolean
   /** lastContinuationAt value to restore if this unconsumed attempt is rolled back. */
   previousLastContinuationAt: number | null
+  /** lastContinuationAtMs value to restore if this unconsumed attempt is rolled back. */
+  previousLastContinuationAtMs: number | null
 }
 
 export type Goal = {
@@ -110,6 +112,13 @@ export type Goal = {
   lastAccountedAt: number | null
   autoTurns: number
   lastContinuationAt: number | null
+  /**
+   * Millisecond anchor of the last continuation. The public
+   * lastContinuationAt is a whole second, which is too coarse to measure the
+   * minimum continuation interval: comparing whole seconds lets a follow-up
+   * continuation start as soon as the wall clock crosses into the next second.
+   */
+  lastContinuationAtMs: number | null
   continuationFailures: number
   pendingAttempt: PendingAttempt | null
   lastStatus: string | null
@@ -225,6 +234,7 @@ const PendingAttemptSchema = Schema.Struct({
   committed: Schema.Boolean,
   armNoProgress: Schema.Boolean,
   previousLastContinuationAt: Schema.NullOr(Schema.Number),
+  previousLastContinuationAtMs: Schema.optionalWith(NullableNumber, { default: () => null }),
 })
 const UsageTrackerSchema = Schema.Struct({
   baseline: Schema.optionalWith(Schema.Unknown, { default: () => null }),
@@ -253,6 +263,7 @@ const GoalSchema = Schema.Struct({
   lastAccountedAt: NullableNumber,
   autoTurns: Schema.Number,
   lastContinuationAt: NullableNumber,
+  lastContinuationAtMs: Schema.optionalWith(NullableNumber, { default: () => null }),
   continuationFailures: Schema.optionalWith(Schema.Number, { default: () => 0 }),
   pendingAttempt: Schema.optionalWith(Schema.NullOr(PendingAttemptSchema), { default: () => null }),
   lastStatus: Schema.optionalWith(NullableString, { default: () => null }),
@@ -310,7 +321,7 @@ const PersistedStateSchema = Schema.Union(LegacyStateSchema, StateSchema)
 // getGoalInternal / the internal snapshot type instead.
 export type GoalSnapshot = Omit<
   Goal,
-  "lastAccountedAt" | "autoTurns" | "lastContinuationAt" | "pendingAttempt" | "usageTrackers"
+  "lastAccountedAt" | "autoTurns" | "lastContinuationAt" | "lastContinuationAtMs" | "pendingAttempt" | "usageTrackers"
 > & {
   remainingTokens: number | null
   sampledAt: number
@@ -646,6 +657,10 @@ function normalizeGoal(goal: Goal) {
     typeof goal.lastContinuationAt === "number" && Number.isFinite(goal.lastContinuationAt)
       ? Math.floor(goal.lastContinuationAt >= 1_000_000_000_000 ? goal.lastContinuationAt / 1000 : goal.lastContinuationAt)
       : null
+  goal.lastContinuationAtMs =
+    typeof goal.lastContinuationAtMs === "number" && Number.isFinite(goal.lastContinuationAtMs)
+      ? Math.floor(goal.lastContinuationAtMs)
+      : null
   goal.pendingAttempt = normalizePendingAttempt(goal.pendingAttempt)
   goal.continuationBaselineMessageID ??= ""
   goal.continuationBaselineSummary ??= ""
@@ -696,6 +711,10 @@ function normalizePendingAttempt(attempt: PendingAttempt | null | undefined): Pe
     previousLastContinuationAt:
       typeof attempt.previousLastContinuationAt === "number" && Number.isFinite(attempt.previousLastContinuationAt)
         ? attempt.previousLastContinuationAt
+        : null,
+    previousLastContinuationAtMs:
+      typeof attempt.previousLastContinuationAtMs === "number" && Number.isFinite(attempt.previousLastContinuationAtMs)
+        ? attempt.previousLastContinuationAtMs
         : null,
   }
 }
@@ -886,6 +905,7 @@ function createGoalRecord(
     lastAccountedAt: paused ? null : now,
     autoTurns: 0,
     lastContinuationAt: null,
+    lastContinuationAtMs: null,
     continuationFailures: 0,
     pendingAttempt: null,
     lastStatus: paused ? "Goal recorded from Plan mode; execution paused until resumed from Build mode." : "Goal set.",
@@ -1412,10 +1432,18 @@ export async function reserveContinuation(sessionID: string, maxAutoTurns: numbe
     const now = nowSeconds()
     accountWallClock(goal, now)
     if (maybeStopForUsageLimit(goal, maxAutoTurns, now)) return reserveWrapup(goal)
-    if (goal.lastContinuationAt && now - goal.lastContinuationAt < minIntervalSeconds) return null
+    // The minimum interval is measured from the millisecond anchor of the last
+    // continuation. The persisted lastContinuationAt is a whole second, so
+    // comparing whole seconds lets a follow-up continuation start as soon as
+    // the wall clock crosses into the next second, even when far less than the
+    // configured minimum has actually elapsed.
+    const anchor = goal.lastContinuationAtMs ?? (goal.lastContinuationAt != null ? goal.lastContinuationAt * 1000 : null)
+    if (anchor != null && Date.now() - anchor < minIntervalSeconds * 1000) return null
     goal.autoTurns += 1
     const previousLastContinuationAt = goal.lastContinuationAt
+    const previousLastContinuationAtMs = goal.lastContinuationAtMs
     goal.lastContinuationAt = now
+    goal.lastContinuationAtMs = Date.now()
     // The baseline is captured at reservation time, but the no-progress
     // evaluation is only armed once recordContinuationResult confirms the
     // continuation prompt was actually delivered.
@@ -1429,6 +1457,7 @@ export async function reserveContinuation(sessionID: string, maxAutoTurns: numbe
       committed: true,
       armNoProgress: true,
       previousLastContinuationAt,
+      previousLastContinuationAtMs,
     }
     goal.awaitingContinuationProgress = false
     goal.lastStatus = `Auto-continue ${goal.autoTurns} reserved.`
@@ -1461,6 +1490,7 @@ export async function rollbackContinuationAttempt(
     }
     goal.autoTurns = Math.max(0, goal.autoTurns - 1)
     goal.lastContinuationAt = attempt.previousLastContinuationAt
+    goal.lastContinuationAtMs = attempt.previousLastContinuationAtMs
     goal.pendingAttempt = null
     goal.awaitingContinuationProgress = false
     goal.lastStatus = "Auto-continue attempt canceled before delivery."
@@ -1515,8 +1545,9 @@ export async function recordContinuationResult(
             committed: false,
             armNoProgress: options?.armNoProgress !== false,
             previousLastContinuationAt: goal.lastContinuationAt,
+            previousLastContinuationAtMs: goal.lastContinuationAtMs,
           }
-          if (goal.pendingAttempt.armNoProgress) goal.awaitingContinuationProgress = true
+          if (goal.pendingAttempt?.armNoProgress) goal.awaitingContinuationProgress = true
         }
         goal.lastStatus = "Auto-continue prompt sent."
       }

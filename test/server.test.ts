@@ -1338,7 +1338,12 @@ test("zero-filled state recovery reports the quarantine through app logging", as
       extra: { stateFile: file },
     },
   })
-  expect(JSON.stringify(logs[0])).toContain(`${file}.corrupt-`)
+  // Assert against the parsed payload instead of a serialized copy: JSON
+  // escaping doubles the path separators on Windows, so a substring match on
+  // the serialized string could never match a raw path there.
+  const quarantineFile = (logs[0] as { body?: { extra?: { quarantineFile?: string } } }).body?.extra?.quarantineFile
+  expect(typeof quarantineFile).toBe("string")
+  expect((quarantineFile as string).startsWith(`${file}.corrupt-`)).toBe(true)
 })
 
 test("state recovery reporting is scoped to the configured state path", async () => {
