@@ -3,12 +3,15 @@ import { mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promise
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import {
+  OPEN_ATTEMPTS,
   RENAME_ATTEMPTS,
   RENAME_RETRY_DELAY_MS,
+  RENAME_RETRY_MAX_DELAY_MS,
   atomicWriteFile,
   defaultAtomicWriteOps,
   defaultDirOpenOps,
   defaultSleep,
+  renameRetryDelayMs,
   syncDirectory,
 } from "../src/atomic-write"
 import type { AtomicWriteOps, DirHandleOps, DirOpenOps, FileHandleOps } from "../src/atomic-write"
@@ -544,21 +547,68 @@ test("rename retry exhaustion fails, preserves the old file, and cleans the temp
     "write",
     "sync",
     "close",
-    "rename",
-    "sleep",
-    "rename",
-    "sleep",
-    "rename",
+    ...Array.from({ length: RENAME_ATTEMPTS }, () => "rename").flatMap((op, index) =>
+      index === RENAME_ATTEMPTS - 1 ? [op] : [op, "sleep"],
+    ),
     "unlink",
   ])
-  // Backoff grows per attempt: 20ms then 40ms.
-  expect(allArgsFor("sleep").map((args) => args[0])).toEqual([
-    RENAME_RETRY_DELAY_MS,
-    RENAME_RETRY_DELAY_MS * 2,
-  ])
+  // Backoff doubles per attempt and then stays capped.
+  const delays = allArgsFor("sleep").map((args) => args[0] as number)
+  expect(delays).toHaveLength(RENAME_ATTEMPTS - 1)
+  expect(delays[0]).toBe(RENAME_RETRY_DELAY_MS)
+  expect(delays[1]).toBe(RENAME_RETRY_DELAY_MS * 2)
+  expect(Math.max(...delays)).toBeLessThanOrEqual(RENAME_RETRY_MAX_DELAY_MS)
+  expect(delays.every((delay) => delay <= RENAME_RETRY_MAX_DELAY_MS)).toBe(true)
   // The old file survived and the temp file was cleaned up.
   expect(await readFile(file, "utf8")).toBe("old state")
   expect(await leftoverTmpFiles()).toEqual([])
+})
+
+test("rename survives a Windows lock that outlives the old three-attempt budget", async () => {
+  // Regression: the previous budget gave up after three attempts (60ms of
+  // waiting) while Windows was still holding the target, so a transient
+  // antivirus/indexer lock surfaced as an EPERM state-write failure.
+  const failures = 4
+  let remaining = failures
+  const { ops, allArgsFor } = makeRecordingOps({
+    ops: {
+      platform: "win32",
+      rename: async (from, to) => {
+        if (remaining > 0) {
+          remaining -= 1
+          throw errno("EPERM", "EPERM: target temporarily locked")
+        }
+        return defaultAtomicWriteOps.rename(from, to)
+      },
+    },
+  })
+
+  await atomicWriteFile(file, DATA, ops)
+
+  expect(allArgsFor("rename")).toHaveLength(failures + 1)
+  expect(await readFile(file, "utf8")).toBe(DATA)
+  expect(await leftoverTmpFiles()).toEqual([])
+})
+
+test("the rename retry backoff stays inside a bounded total wait", async () => {
+  // A target that stays locked must not block the caller forever: the whole
+  // retry budget is capped well below any host-level request timeout.
+  const { ops, allArgsFor } = makeRecordingOps({
+    ops: {
+      platform: "win32",
+      rename: async () => {
+        throw errno("EBUSY", "EBUSY: target busy")
+      },
+    },
+  })
+
+  await expect(atomicWriteFile(file, DATA, ops)).rejects.toThrow("EBUSY: target busy")
+
+  const delays = allArgsFor("sleep").map((args) => args[0] as number)
+  const total = delays.reduce((sum, delay) => sum + delay, 0)
+  expect(total).toBeGreaterThanOrEqual(RENAME_RETRY_DELAY_MS)
+  expect(total).toBeLessThanOrEqual(RENAME_RETRY_MAX_DELAY_MS * (RENAME_ATTEMPTS - 1))
+  expect(delays).toEqual(delays.map((_, index) => renameRetryDelayMs(index + 1)))
 })
 
 test("a non-transient rename error is never retried", async () => {
@@ -577,4 +627,40 @@ test("a non-transient rename error is never retried", async () => {
   expect(opsCalled()).toEqual(["open", "write", "sync", "close", "rename", "unlink"])
   expect(await readFile(file, "utf8")).toBe("old state")
   expect(await leftoverTmpFiles()).toEqual([])
+})
+
+test("a transient exclusive create of the temp file is retried", async () => {
+  // Creating the temp file can fail the same way the rename does: on Windows a
+  // directory that another process is modifying can make an exclusive create
+  // fail with EPERM. A failed write loses a goal update, so the create is
+  // retried with a bounded budget.
+  let attempts = 0
+  const { ops } = makeRecordingOps({
+    ops: {
+      platform: "win32",
+      async open(path, flags, mode) {
+        attempts += 1
+        if (attempts === 1) throw errno("EPERM", "operation not permitted")
+        return defaultAtomicWriteOps.open(path, flags, mode)
+      },
+    },
+  })
+  await atomicWriteFile(file, "payload", ops)
+  expect(attempts).toBe(2)
+  expect(await readFile(file, "utf8")).toBe("payload")
+})
+
+test("a persistent exclusive create failure is not retried forever", async () => {
+  let attempts = 0
+  const { ops } = makeRecordingOps({
+    ops: {
+      platform: "win32",
+      async open() {
+        attempts += 1
+        throw errno("EPERM", "operation not permitted")
+      },
+    },
+  })
+  await expect(atomicWriteFile(file, "payload", ops)).rejects.toThrow()
+  expect(attempts).toBe(OPEN_ATTEMPTS)
 })

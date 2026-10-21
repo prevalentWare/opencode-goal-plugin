@@ -1,9 +1,12 @@
 import { randomUUID } from "node:crypto"
 import { readFileSync } from "node:fs"
-import { mkdir, readFile } from "node:fs/promises"
+import { mkdir } from "node:fs/promises"
 import { dirname } from "node:path"
 import { Data, Effect, Schema } from "effect-goal-state"
 import { atomicWriteFile } from "./atomic-write"
+import { reportPluginError } from "./diagnostics"
+import { acquireStateLock, stateLockPath } from "./state-lock"
+import { readStateFile } from "./state-read"
 import { statePath } from "./state-path"
 import {
   applyGoalPlanOps,
@@ -89,6 +92,8 @@ export type PendingAttempt = {
   armNoProgress: boolean
   /** lastContinuationAt value to restore if this unconsumed attempt is rolled back. */
   previousLastContinuationAt: number | null
+  /** lastContinuationAtMs value to restore if this unconsumed attempt is rolled back. */
+  previousLastContinuationAtMs: number | null
 }
 
 export type Goal = {
@@ -110,6 +115,13 @@ export type Goal = {
   lastAccountedAt: number | null
   autoTurns: number
   lastContinuationAt: number | null
+  /**
+   * Millisecond anchor of the last continuation. The public
+   * lastContinuationAt is a whole second, which is too coarse to measure the
+   * minimum continuation interval: comparing whole seconds lets a follow-up
+   * continuation start as soon as the wall clock crosses into the next second.
+   */
+  lastContinuationAtMs: number | null
   continuationFailures: number
   pendingAttempt: PendingAttempt | null
   lastStatus: string | null
@@ -225,6 +237,7 @@ const PendingAttemptSchema = Schema.Struct({
   committed: Schema.Boolean,
   armNoProgress: Schema.Boolean,
   previousLastContinuationAt: Schema.NullOr(Schema.Number),
+  previousLastContinuationAtMs: Schema.optionalWith(NullableNumber, { default: () => null }),
 })
 const UsageTrackerSchema = Schema.Struct({
   baseline: Schema.optionalWith(Schema.Unknown, { default: () => null }),
@@ -253,6 +266,7 @@ const GoalSchema = Schema.Struct({
   lastAccountedAt: NullableNumber,
   autoTurns: Schema.Number,
   lastContinuationAt: NullableNumber,
+  lastContinuationAtMs: Schema.optionalWith(NullableNumber, { default: () => null }),
   continuationFailures: Schema.optionalWith(Schema.Number, { default: () => 0 }),
   pendingAttempt: Schema.optionalWith(Schema.NullOr(PendingAttemptSchema), { default: () => null }),
   lastStatus: Schema.optionalWith(NullableString, { default: () => null }),
@@ -310,7 +324,7 @@ const PersistedStateSchema = Schema.Union(LegacyStateSchema, StateSchema)
 // getGoalInternal / the internal snapshot type instead.
 export type GoalSnapshot = Omit<
   Goal,
-  "lastAccountedAt" | "autoTurns" | "lastContinuationAt" | "pendingAttempt" | "usageTrackers"
+  "lastAccountedAt" | "autoTurns" | "lastContinuationAt" | "lastContinuationAtMs" | "pendingAttempt" | "usageTrackers"
 > & {
   remainingTokens: number | null
   sampledAt: number
@@ -391,6 +405,7 @@ function notifyStateRecovery(notice: StateRecoveryNotice) {
         } catch {
           // Reporting must never block state recovery.
         }
+        reportPluginError(`Failed to report quarantined state at ${notice.quarantineFile}`, error)
       })
   }
 }
@@ -426,21 +441,40 @@ function decodeState(value: unknown) {
 
 function readStateResultEffect(file = statePath()) {
   return Effect.tryPromise({
-    try: () => readFile(file, "utf8"),
+    try: () => readStateFile(file),
     catch: (cause) => new StateReadError({ cause }),
   }).pipe(
     Effect.flatMap((raw) =>
       Effect.try({
         try: () => parseStateText(raw, file),
         catch: (cause) => new StateDecodeError({ cause }),
-      }),
-    ),
-    Effect.flatMap(({ value, recoveryContent }) =>
-      decodeState(value).pipe(Effect.map((state) => ({ state, recoveryContent }))),
+      }).pipe(
+        Effect.flatMap(({ value, recoveryContent }) =>
+          decodeState(value).pipe(Effect.map((state) => ({ state, recoveryContent, raw }))),
+        ),
+      ),
     ),
     Effect.catchAll((error) =>
       error._tag === "StateReadError" && isMissingStateFile(error.cause)
-        ? Effect.succeed({ state: emptyState(), recoveryContent: null })
+        ? Effect.succeed({ state: emptyState(), recoveryContent: null, raw: null })
+        : Effect.fail(error),
+    ),
+  )
+}
+
+/**
+ * The current raw content of the state file, or null when it does not exist.
+ * A mutation compares this with the content it read to detect a write from
+ * another plugin instance.
+ */
+function readRawStateEffect(file = statePath()) {
+  return Effect.tryPromise({
+    try: () => readStateFile(file),
+    catch: (cause) => new StateReadError({ cause }),
+  }).pipe(
+    Effect.catchAll((error) =>
+      error._tag === "StateReadError" && isMissingStateFile(error.cause)
+        ? Effect.succeed(null)
         : Effect.fail(error),
     ),
   )
@@ -466,7 +500,7 @@ function quarantineStateEffect(file: string, content: string) {
 function verifyRecoverySourceEffect(file: string, expectedContent: string, quarantineFile: string) {
   return Effect.promise(async () => {
     try {
-      return (await readFile(file, "utf8")) === expectedContent
+      return (await readStateFile(file)) === expectedContent
     } catch (error) {
       if (!isMissingStateFile(error)) {
         try {
@@ -477,6 +511,7 @@ function verifyRecoverySourceEffect(file: string, expectedContent: string, quara
         } catch {
           // Diagnostics must never block state recovery.
         }
+        reportPluginError(`Could not re-read ${file} after preserving it at ${quarantineFile}`, error)
       }
       return true
     }
@@ -520,6 +555,12 @@ function readStateSync(): State {
 
 let mutationQueue: Promise<void> = Promise.resolve()
 
+/**
+ * How often a mutation is re-applied to a newer state when another plugin
+ * instance writes the shared state file while the mutation is running.
+ */
+const MAX_MUTATION_ATTEMPTS = 8
+
 function enqueueMutation<T>(operation: () => Promise<T>) {
   const current = mutationQueue.then(operation, operation)
   mutationQueue = current.then(
@@ -530,63 +571,88 @@ function enqueueMutation<T>(operation: () => Promise<T>) {
 }
 
 async function mutate<T>(fn: (state: State) => T | Promise<T>) {
-  return enqueueMutation(() => {
+  return enqueueMutation(async () => {
     const file = statePath()
-    return Effect.runPromise(
-      Effect.gen(function* () {
-        const { state, recoveryContent } = yield* readStateResultEffect(file)
-        const result = yield* Effect.tryPromise({
-          try: () => Promise.resolve(fn(state)),
-          catch: (cause) => (cause instanceof Error ? cause : new Error(String(cause))),
-        })
-        if (recoveryContent != null) {
-          const quarantine = yield* quarantineStateEffect(file, recoveryContent)
-          if (quarantine.error != null) {
-            const notice: StateRecoveryNotice = {
-              stateFile: file,
-              quarantineFile: quarantine.quarantineFile,
-              outcome: "quarantineFailed",
-              error: quarantine.error,
-            }
-            try {
-              console.error(
-                `[opencode-goal-plugin] Could not quarantine corrupt state at ${file}; continuing recovery:`,
-                quarantine.error,
-              )
-            } catch {
-              // Diagnostics must never block state recovery.
-            }
-            notifyStateRecovery(notice)
-          } else {
-            const unchanged = yield* verifyRecoverySourceEffect(file, recoveryContent, quarantine.quarantineFile)
-            if (!unchanged) {
-              const message = "goal state changed while recovery was being quarantined; refusing to overwrite it"
-              notifyStateRecovery({
-                stateFile: file,
-                quarantineFile: quarantine.quarantineFile,
-                outcome: "sourceChanged",
-                error: message,
-              })
-              return yield* Effect.fail(new StateWriteError({ cause: new Error(message) }))
-            }
-            try {
-              console.warn(
-                `[opencode-goal-plugin] Preserved corrupt state from ${file} at ${quarantine.quarantineFile}; continuing recovery.`,
-              )
-            } catch {
-              // Diagnostics must never block state recovery.
-            }
-            notifyStateRecovery({
-              stateFile: file,
-              quarantineFile: quarantine.quarantineFile,
-              outcome: "quarantined",
+    // The state file is shared by every plugin instance, and the queue above
+    // only serialises mutations inside this process. The lock keeps a second
+    // instance from writing the file while this one is changing it, and the
+    // re-read below catches the case where the lock could not be taken.
+    const lock = await acquireStateLock(stateLockPath(file))
+    try {
+      return await Effect.runPromise(
+        Effect.gen(function* () {
+          let lastState: State | null = null
+          let lastResult: T | undefined
+          for (let attempt = 0; attempt < MAX_MUTATION_ATTEMPTS; attempt++) {
+            const { state, recoveryContent, raw } = yield* readStateResultEffect(file)
+            const result = yield* Effect.tryPromise({
+              try: () => Promise.resolve(fn(state)),
+              catch: (cause) => (cause instanceof Error ? cause : new Error(String(cause))),
             })
+            lastState = state
+            lastResult = result
+            if (recoveryContent != null) {
+              const quarantine = yield* quarantineStateEffect(file, recoveryContent)
+              if (quarantine.error != null) {
+                const notice: StateRecoveryNotice = {
+                  stateFile: file,
+                  quarantineFile: quarantine.quarantineFile,
+                  outcome: "quarantineFailed",
+                  error: quarantine.error,
+                }
+                try {
+                  console.error(
+                    `[opencode-goal-plugin] Could not quarantine corrupt state at ${file}; continuing recovery:`,
+                    quarantine.error,
+                  )
+                } catch {
+                  // Diagnostics must never block state recovery.
+                }
+                reportPluginError(`Could not quarantine corrupt state at ${file}`, quarantine.error)
+                notifyStateRecovery(notice)
+              } else {
+                const unchanged = yield* verifyRecoverySourceEffect(file, recoveryContent, quarantine.quarantineFile)
+                if (!unchanged) {
+                  const message = "goal state changed while recovery was being quarantined; refusing to overwrite it"
+                  notifyStateRecovery({
+                    stateFile: file,
+                    quarantineFile: quarantine.quarantineFile,
+                    outcome: "sourceChanged",
+                    error: message,
+                  })
+                  return yield* Effect.fail(new StateWriteError({ cause: new Error(message) }))
+                }
+                try {
+                  console.warn(
+                    `[opencode-goal-plugin] Preserved corrupt state from ${file} at ${quarantine.quarantineFile}; continuing recovery.`,
+                  )
+                } catch {
+                  // Diagnostics must never block state recovery.
+                }
+                notifyStateRecovery({
+                  stateFile: file,
+                  quarantineFile: quarantine.quarantineFile,
+                  outcome: "quarantined",
+                })
+              }
+            }
+            // Another instance may have written the file while this mutation
+            // was running. Writing now would drop that instance's changes, so
+            // the mutation is applied again to the newer state instead.
+            const current = yield* readRawStateEffect(file)
+            if (current !== raw) continue
+            yield* writeStateEffect(state, file)
+            return result
           }
-        }
-        yield* writeStateEffect(state, file)
-        return result
-      }),
-    )
+          // The state kept changing under this mutation. The last attempt is
+          // written so the caller's change is not lost entirely.
+          if (lastState) yield* writeStateEffect(lastState, file)
+          return lastResult as T
+        }),
+      )
+    } finally {
+      await lock.release()
+    }
   })
 }
 
@@ -646,6 +712,10 @@ function normalizeGoal(goal: Goal) {
     typeof goal.lastContinuationAt === "number" && Number.isFinite(goal.lastContinuationAt)
       ? Math.floor(goal.lastContinuationAt >= 1_000_000_000_000 ? goal.lastContinuationAt / 1000 : goal.lastContinuationAt)
       : null
+  goal.lastContinuationAtMs =
+    typeof goal.lastContinuationAtMs === "number" && Number.isFinite(goal.lastContinuationAtMs)
+      ? Math.floor(goal.lastContinuationAtMs)
+      : null
   goal.pendingAttempt = normalizePendingAttempt(goal.pendingAttempt)
   goal.continuationBaselineMessageID ??= ""
   goal.continuationBaselineSummary ??= ""
@@ -696,6 +766,10 @@ function normalizePendingAttempt(attempt: PendingAttempt | null | undefined): Pe
     previousLastContinuationAt:
       typeof attempt.previousLastContinuationAt === "number" && Number.isFinite(attempt.previousLastContinuationAt)
         ? attempt.previousLastContinuationAt
+        : null,
+    previousLastContinuationAtMs:
+      typeof attempt.previousLastContinuationAtMs === "number" && Number.isFinite(attempt.previousLastContinuationAtMs)
+        ? attempt.previousLastContinuationAtMs
         : null,
   }
 }
@@ -886,6 +960,7 @@ function createGoalRecord(
     lastAccountedAt: paused ? null : now,
     autoTurns: 0,
     lastContinuationAt: null,
+    lastContinuationAtMs: null,
     continuationFailures: 0,
     pendingAttempt: null,
     lastStatus: paused ? "Goal recorded from Plan mode; execution paused until resumed from Build mode." : "Goal set.",
@@ -1412,10 +1487,18 @@ export async function reserveContinuation(sessionID: string, maxAutoTurns: numbe
     const now = nowSeconds()
     accountWallClock(goal, now)
     if (maybeStopForUsageLimit(goal, maxAutoTurns, now)) return reserveWrapup(goal)
-    if (goal.lastContinuationAt && now - goal.lastContinuationAt < minIntervalSeconds) return null
+    // The minimum interval is measured from the millisecond anchor of the last
+    // continuation. The persisted lastContinuationAt is a whole second, so
+    // comparing whole seconds lets a follow-up continuation start as soon as
+    // the wall clock crosses into the next second, even when far less than the
+    // configured minimum has actually elapsed.
+    const anchor = goal.lastContinuationAtMs ?? (goal.lastContinuationAt != null ? goal.lastContinuationAt * 1000 : null)
+    if (anchor != null && Date.now() - anchor < minIntervalSeconds * 1000) return null
     goal.autoTurns += 1
     const previousLastContinuationAt = goal.lastContinuationAt
+    const previousLastContinuationAtMs = goal.lastContinuationAtMs
     goal.lastContinuationAt = now
+    goal.lastContinuationAtMs = Date.now()
     // The baseline is captured at reservation time, but the no-progress
     // evaluation is only armed once recordContinuationResult confirms the
     // continuation prompt was actually delivered.
@@ -1429,6 +1512,7 @@ export async function reserveContinuation(sessionID: string, maxAutoTurns: numbe
       committed: true,
       armNoProgress: true,
       previousLastContinuationAt,
+      previousLastContinuationAtMs,
     }
     goal.awaitingContinuationProgress = false
     goal.lastStatus = `Auto-continue ${goal.autoTurns} reserved.`
@@ -1461,6 +1545,7 @@ export async function rollbackContinuationAttempt(
     }
     goal.autoTurns = Math.max(0, goal.autoTurns - 1)
     goal.lastContinuationAt = attempt.previousLastContinuationAt
+    goal.lastContinuationAtMs = attempt.previousLastContinuationAtMs
     goal.pendingAttempt = null
     goal.awaitingContinuationProgress = false
     goal.lastStatus = "Auto-continue attempt canceled before delivery."
@@ -1515,8 +1600,9 @@ export async function recordContinuationResult(
             committed: false,
             armNoProgress: options?.armNoProgress !== false,
             previousLastContinuationAt: goal.lastContinuationAt,
+            previousLastContinuationAtMs: goal.lastContinuationAtMs,
           }
-          if (goal.pendingAttempt.armNoProgress) goal.awaitingContinuationProgress = true
+          if (goal.pendingAttempt?.armNoProgress) goal.awaitingContinuationProgress = true
         }
         goal.lastStatus = "Auto-continue prompt sent."
       }

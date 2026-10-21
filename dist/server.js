@@ -50,40 +50,40 @@ var GoalPlanInputSchema = GoalPlanDraftSchema.superRefine((plan, ctx) => {
   const ids = new Set;
   let runningPhases = 0;
   let runningTasks = 0;
-  for (const [phaseIndex, phase2] of plan.phases.entries()) {
+  for (const [phaseIndex, phase] of plan.phases.entries()) {
     const phasePath = ["phases", phaseIndex];
-    if (ids.has(phase2.id))
+    if (ids.has(phase.id))
       ctx.addIssue({ code: "custom", message: "plan IDs must be unique", path: [...phasePath, "id"] });
-    ids.add(phase2.id);
-    if (phase2.status === "in_progress")
+    ids.add(phase.id);
+    if (phase.status === "in_progress")
       runningPhases++;
-    if (phase2.status === "blocked" && !phase2.blocker)
+    if (phase.status === "blocked" && !phase.blocker)
       ctx.addIssue({ code: "custom", message: "blocked phases require a blocker", path: [...phasePath, "blocker"] });
-    if (phase2.status === "completed" && (!phase2.verification || phase2.tasks.some((task2) => task2.status !== "completed"))) {
+    if (phase.status === "completed" && (!phase.verification || phase.tasks.some((task) => task.status !== "completed"))) {
       ctx.addIssue({
         code: "custom",
         message: "completed phases require verified tasks and phase verification",
         path: [...phasePath, "verification"]
       });
     }
-    for (const [taskIndex, task2] of phase2.tasks.entries()) {
+    for (const [taskIndex, task] of phase.tasks.entries()) {
       const taskPath = [...phasePath, "tasks", taskIndex];
-      if (ids.has(task2.id))
+      if (ids.has(task.id))
         ctx.addIssue({ code: "custom", message: "plan IDs must be unique", path: [...taskPath, "id"] });
-      ids.add(task2.id);
-      if (task2.status === "completed" && !task2.evidence)
+      ids.add(task.id);
+      if (task.status === "completed" && !task.evidence)
         ctx.addIssue({ code: "custom", message: "completed tasks require evidence", path: [...taskPath, "evidence"] });
-      if (task2.status === "blocked" && !task2.blocker)
+      if (task.status === "blocked" && !task.blocker)
         ctx.addIssue({ code: "custom", message: "blocked tasks require a blocker", path: [...taskPath, "blocker"] });
-      if (task2.status === "in_progress") {
+      if (task.status === "in_progress") {
         runningTasks++;
-        if (phase2.status !== "in_progress")
+        if (phase.status !== "in_progress")
           ctx.addIssue({ code: "custom", message: "running tasks require a running phase", path: [...taskPath, "status"] });
       }
     }
   }
-  const firstUnfinished = plan.phases.find((phase2) => phase2.status !== "completed");
-  if (plan.phases.some((phase2) => phase2.status === "in_progress" && phase2 !== firstUnfinished))
+  const firstUnfinished = plan.phases.find((phase) => phase.status !== "completed");
+  if (plan.phases.some((phase) => phase.status === "in_progress" && phase !== firstUnfinished))
     ctx.addIssue({ code: "custom", message: "verify the current phase before starting the next phase", path: ["phases"] });
   if (runningPhases > 1 || runningTasks > 1)
     ctx.addIssue({ code: "custom", message: "choose one current phase and task", path: ["phases"] });
@@ -121,30 +121,30 @@ function applyGoalPlanOps(previous, ops) {
         errors.push(`plan_ops[${index}].phase_id (${op.phase_id}): set_phase requires a field to change`);
         continue;
       }
-      const target2 = next.phases.find((phase2) => phase2.id === op.phase_id);
-      if (!target2) {
+      const target = next.phases.find((phase) => phase.id === op.phase_id);
+      if (!target) {
         errors.push(`plan_ops[${index}].phase_id (${op.phase_id}): unknown phase ID`);
         continue;
       }
-      if (op.status !== undefined && op.status !== target2.status) {
+      if (op.status !== undefined && op.status !== target.status) {
         if (op.status !== "completed")
-          target2.verification = null;
+          target.verification = null;
         if (op.status !== "blocked")
-          target2.blocker = null;
+          target.blocker = null;
       }
       if (op.status !== undefined)
-        target2.status = op.status;
+        target.status = op.status;
       if (op.verification !== undefined)
-        target2.verification = op.verification;
+        target.verification = op.verification;
       if (op.blocker !== undefined)
-        target2.blocker = op.blocker;
+        target.blocker = op.blocker;
       continue;
     }
     if (op.status === undefined && op.evidence === undefined && op.blocker === undefined) {
       errors.push(`plan_ops[${index}].task_id (${op.task_id}): set_task requires a field to change`);
       continue;
     }
-    const target = next.phases.flatMap((phase2) => phase2.tasks).find((task2) => task2.id === op.task_id);
+    const target = next.phases.flatMap((phase) => phase.tasks).find((task) => task.id === op.task_id);
     if (!target) {
       errors.push(`plan_ops[${index}].task_id (${op.task_id}): unknown task ID`);
       continue;
@@ -172,14 +172,14 @@ function planError(path, message, before, after) {
 function planPath(path, input) {
   if (path[0] !== "phases" || typeof path[1] !== "number")
     return path.join(".") || "plan";
-  const phase2 = input.phases[path[1]];
-  if (!phase2)
+  const phase = input.phases[path[1]];
+  if (!phase)
     return path.join(".");
-  const prefix = `phases[${phase2.id}]`;
+  const prefix = `phases[${phase.id}]`;
   if (path[2] !== "tasks" || typeof path[3] !== "number")
     return `${prefix}${path.length > 2 ? `.${path.slice(2).join(".")}` : ""}`;
-  const task2 = phase2.tasks[path[3]];
-  return task2 ? `${prefix}.tasks[${task2.id}]${path.length > 4 ? `.${path.slice(4).join(".")}` : ""}` : path.join(".");
+  const task = phase.tasks[path[3]];
+  return task ? `${prefix}.tasks[${task.id}]${path.length > 4 ? `.${path.slice(4).join(".")}` : ""}` : path.join(".");
 }
 function planValidationErrors(input) {
   const parsed = GoalPlanInputSchema.safeParse(input);
@@ -192,13 +192,13 @@ function reviseGoalPlan(previous, input, expectedRevision, reason, now, revisitE
   const why = text.parse(reason);
   if (previous) {
     for (const newPhase of next.phases) {
-      const oldPhase = previous.phases.find((phase2) => phase2.id === newPhase.id);
+      const oldPhase = previous.phases.find((phase) => phase.id === newPhase.id);
       if (oldPhase?.status === "completed" && newPhase.status !== "completed")
         newPhase.verification = null;
       if (newPhase.status !== "blocked")
         newPhase.blocker = null;
       for (const newTask of newPhase.tasks) {
-        const oldTask = oldPhase?.tasks.find((task2) => task2.id === newTask.id);
+        const oldTask = oldPhase?.tasks.find((task) => task.id === newTask.id);
         if (oldTask?.status === "completed" && newTask.status !== "completed")
           newTask.evidence = null;
         if (newTask.status !== "blocked")
@@ -206,12 +206,12 @@ function reviseGoalPlan(previous, input, expectedRevision, reason, now, revisitE
       }
     }
   } else {
-    for (const phase2 of next.phases) {
-      if (phase2.status !== "blocked")
-        phase2.blocker = null;
-      for (const task2 of phase2.tasks)
-        if (task2.status !== "blocked")
-          task2.blocker = null;
+    for (const phase of next.phases) {
+      if (phase.status !== "blocked")
+        phase.blocker = null;
+      for (const task of phase.tasks)
+        if (task.status !== "blocked")
+          task.blocker = null;
     }
   }
   const violations = [...preflightErrors, ...planValidationErrors(next)];
@@ -220,9 +220,9 @@ function reviseGoalPlan(previous, input, expectedRevision, reason, now, revisitE
       violations.push(planError("completionCriteria", "preserve overall completion criteria; replace the goal for a new scope"));
     }
     for (const oldPhase of previous.phases) {
-      const newPhase = next.phases.find((phase2) => phase2.id === oldPhase.id);
+      const newPhase = next.phases.find((phase) => phase.id === oldPhase.id);
       if (!newPhase) {
-        if (oldPhase.status === "completed" || oldPhase.tasks.some((task2) => task2.status === "completed"))
+        if (oldPhase.status === "completed" || oldPhase.tasks.some((task) => task.status === "completed"))
           violations.push(planError(`phases[${oldPhase.id}]`, "preserve verified phase and task history"));
         else if (!revisitEvidence?.trim())
           violations.push(planError(`phases[${oldPhase.id}]`, "removing planned scope requires concrete revisit evidence"));
@@ -236,7 +236,7 @@ function reviseGoalPlan(previous, input, expectedRevision, reason, now, revisitE
         violations.push(planError(`phases[${oldPhase.id}].status`, "reopening a verified phase requires concrete revisit evidence"));
       }
       for (const oldTask of oldPhase.tasks) {
-        const newTask = newPhase.tasks.find((task2) => task2.id === oldTask.id);
+        const newTask = newPhase.tasks.find((task) => task.id === oldTask.id);
         if (oldTask.status !== "completed") {
           if ((!newTask || newTask.description !== oldTask.description) && !revisitEvidence?.trim())
             violations.push(planError(`phases[${oldPhase.id}].tasks[${oldTask.id}].description`, "removing or changing planned task scope requires concrete revisit evidence", oldTask.description, newTask?.description));
@@ -270,30 +270,30 @@ function reviseGoalPlan(previous, input, expectedRevision, reason, now, revisitE
   });
 }
 function goalPlanProgress(plan) {
-  const current = plan.phases.find((phase2) => phase2.status === "in_progress") ?? plan.phases.find((phase2) => phase2.status !== "completed");
-  const running = current?.tasks.find((task2) => task2.status === "in_progress");
-  const next = current?.tasks.find((task2) => task2.status === "pending");
+  const current = plan.phases.find((phase) => phase.status === "in_progress") ?? plan.phases.find((phase) => phase.status !== "completed");
+  const running = current?.tasks.find((task) => task.status === "in_progress");
+  const next = current?.tasks.find((task) => task.status === "pending");
   return {
     currentPhaseID: current?.id ?? null,
     currentTaskID: running?.id ?? null,
     nextTaskID: next?.id ?? null,
-    nextPhaseID: plan.phases.find((phase2) => phase2.id !== current?.id && phase2.status !== "completed")?.id ?? null,
-    completedPhaseIDs: plan.phases.filter((phase2) => phase2.status === "completed").map((phase2) => phase2.id),
-    completedTaskIDs: plan.phases.flatMap((phase2) => phase2.tasks.filter((task2) => task2.status === "completed").map((task2) => task2.id))
+    nextPhaseID: plan.phases.find((phase) => phase.id !== current?.id && phase.status !== "completed")?.id ?? null,
+    completedPhaseIDs: plan.phases.filter((phase) => phase.status === "completed").map((phase) => phase.id),
+    completedTaskIDs: plan.phases.flatMap((phase) => phase.tasks.filter((task) => task.status === "completed").map((task) => task.id))
   };
 }
 function goalPlanEntries(plan) {
-  return plan.phases.flatMap((phase2) => phase2.tasks.map((task2) => ({
-    content: `${phase2.objective}: ${task2.description}${task2.blocker ? ` \u2014 Blocked: ${task2.blocker}` : ""}`,
+  return plan.phases.flatMap((phase) => phase.tasks.map((task) => ({
+    content: `${phase.objective}: ${task.description}${task.blocker ? ` \u2014 Blocked: ${task.blocker}` : ""}`,
     priority: "medium",
-    status: task2.status === "blocked" ? "pending" : task2.status
+    status: task.status === "blocked" ? "pending" : task.status
   })));
 }
 
 // src/state.ts
 import { randomUUID as randomUUID2 } from "crypto";
 import { mkdir, readFile } from "fs/promises";
-import { dirname as dirname2 } from "path";
+import { dirname as dirname3 } from "path";
 import { Data, Effect, Schema } from "effect-goal-state";
 
 // src/atomic-write.ts
@@ -309,6 +309,20 @@ function isTransientRenameError(error, platform) {
     return false;
   const code = error?.code;
   return code === "EPERM" || code === "EACCES" || code === "EBUSY";
+}
+var OPEN_ATTEMPTS = 10;
+async function openWithRetry(ops, path, flags, mode) {
+  let attempt = 0;
+  for (;; ) {
+    try {
+      return await ops.open(path, flags, mode);
+    } catch (error) {
+      attempt += 1;
+      if (!isTransientRenameError(error, ops.platform) || attempt >= OPEN_ATTEMPTS)
+        throw error;
+      await ops.sleep(renameRetryDelayMs(attempt));
+    }
+  }
 }
 async function bestEffort(action) {
   try {
@@ -356,8 +370,13 @@ var defaultAtomicWriteOps = {
   syncDir: (dir, platform) => syncDirectory(dir, defaultDirOpenOps, platform),
   sleep: defaultSleep
 };
-var RENAME_ATTEMPTS = 3;
+var RENAME_ATTEMPTS = 10;
 var RENAME_RETRY_DELAY_MS = 20;
+var RENAME_RETRY_MAX_DELAY_MS = 500;
+function renameRetryDelayMs(attempt) {
+  const exponential = RENAME_RETRY_DELAY_MS * 2 ** Math.max(0, attempt - 1);
+  return Math.min(RENAME_RETRY_MAX_DELAY_MS, exponential);
+}
 async function renameWithRetry(ops, from, to) {
   let attempt = 0;
   for (;; ) {
@@ -368,8 +387,7 @@ async function renameWithRetry(ops, from, to) {
       attempt += 1;
       if (!isTransientRenameError(error, ops.platform) || attempt >= RENAME_ATTEMPTS)
         throw error;
-      const delay = RENAME_RETRY_DELAY_MS * attempt;
-      await ops.sleep(delay);
+      await ops.sleep(renameRetryDelayMs(attempt));
     }
   }
 }
@@ -379,7 +397,7 @@ async function atomicWriteFile(file, data, ops = defaultAtomicWriteOps) {
   let created = false;
   let renamed = false;
   try {
-    handle = await ops.open(tmp, "wx", 384);
+    handle = await openWithRetry(ops, tmp, "wx", 384);
     created = true;
     await handle.write(data);
     await handle.sync();
@@ -404,6 +422,10 @@ async function atomicWriteFile(file, data, ops = defaultAtomicWriteOps) {
   }
 }
 
+// src/diagnostics.ts
+import { appendFileSync, mkdirSync, renameSync, statSync, unlinkSync } from "fs";
+import { dirname as dirname2, join as join2 } from "path";
+
 // src/state-path.ts
 import { homedir } from "os";
 import { join } from "path";
@@ -412,6 +434,137 @@ function statePath() {
     return process.env.OPENCODE_GOAL_STATE_PATH;
   const dataHome = process.env.XDG_DATA_HOME || (process.platform === "win32" && process.env.APPDATA ? process.env.APPDATA : join(homedir(), ".local", "share"));
   return join(dataHome, "opencode-goal-plugin", "goals.json");
+}
+
+// src/diagnostics.ts
+var MAX_LOG_BYTES = 1024 * 1024;
+function diagnosticsLogPath() {
+  return join2(dirname2(statePath()), "goal-plugin.log");
+}
+function rotateIfNeeded(path) {
+  let size;
+  try {
+    size = statSync(path).size;
+  } catch {
+    return;
+  }
+  if (size < MAX_LOG_BYTES)
+    return;
+  const previous = `${path}.1`;
+  try {
+    unlinkSync(previous);
+  } catch {}
+  try {
+    renameSync(path, previous);
+  } catch {}
+}
+var EFFECT_CAUSE = Symbol.for("effect/Runtime/FiberFailure/Cause");
+function describeEffectCause(cause, depth) {
+  if (cause == null || typeof cause !== "object")
+    return String(cause);
+  const record = cause;
+  if (record._tag === "Fail")
+    return describeError(record.error, depth + 1);
+  if (record._tag === "Die")
+    return describeError(record.defect, depth + 1);
+  if (record._tag === "Interrupt")
+    return "interrupted";
+  const failures = record.failures;
+  if (failures && typeof failures === "object") {
+    const parts = [...failures].map((failure) => describeEffectCause(failure, depth + 1)).filter(Boolean);
+    if (parts.length)
+      return parts.join(" ; ");
+  }
+  return describeError(cause, depth + 1);
+}
+function describeError(error, depth = 0) {
+  if (error == null)
+    return String(error);
+  if (typeof error === "string")
+    return error;
+  if (typeof error !== "object")
+    return String(error);
+  if (depth > 6)
+    return "...";
+  const record = error;
+  const tag = typeof record._tag === "string" ? record._tag : typeof record.name === "string" ? record.name : typeof record.constructor === "string" ? record.constructor : "Error";
+  const message = typeof record.message === "string" ? record.message : "";
+  const head = message && message !== tag ? `${tag}: ${message}` : tag;
+  const effectCause = record[EFFECT_CAUSE];
+  if (effectCause)
+    return `${head} <- ${describeEffectCause(effectCause, depth)}`;
+  const cause = record.cause;
+  if (cause == null)
+    return head;
+  if (typeof cause === "string")
+    return `${head} <- ${cause}`;
+  if (typeof cause === "object") {
+    const pretty = cause.pretty;
+    if (typeof pretty === "string" && pretty.trim()) {
+      return `${head} <- ${pretty.split(`
+`).map((line) => line.trim()).filter(Boolean).join(" | ")}`;
+    }
+  }
+  return `${head} <- ${describeError(cause, depth + 1)}`;
+}
+function reportPluginError(message, error) {
+  try {
+    const path = diagnosticsLogPath();
+    mkdirSync(dirname2(path), { recursive: true });
+    rotateIfNeeded(path);
+    const detail = error === undefined ? "" : ` | ${describeError(error)}`;
+    appendFileSync(path, `${new Date().toISOString()} | error | ${message}${detail}
+`);
+  } catch {}
+}
+
+// src/state-lock.ts
+import { open as open2, stat, unlink as unlink2 } from "fs/promises";
+var LOCK_STALE_MS = 30000;
+var LOCK_TIMEOUT_MS = 5000;
+var LOCK_RETRY_MS = 20;
+function stateLockPath(stateFile) {
+  return `${stateFile}.lock`;
+}
+async function acquireStateLock(lockPath, options = {}) {
+  const timeoutMs = options.timeoutMs ?? LOCK_TIMEOUT_MS;
+  const staleMs = options.staleMs ?? LOCK_STALE_MS;
+  const deadline = Date.now() + timeoutMs;
+  for (;; ) {
+    try {
+      const handle = await open2(lockPath, "wx");
+      try {
+        await handle.close();
+      } catch {}
+      return {
+        held: true,
+        release: async () => {
+          try {
+            await unlink2(lockPath);
+          } catch {}
+        }
+      };
+    } catch (error) {
+      const code = error?.code;
+      const contended = code === "EEXIST" || code === "EPERM" || code === "EACCES";
+      if (!contended) {
+        reportPluginError(`Could not create the state lock at ${lockPath}`, error instanceof Error ? error : new Error(String(code ?? "unknown error")));
+        return { held: false, release: async () => {} };
+      }
+      try {
+        const stats = await stat(lockPath);
+        if (Date.now() - stats.mtimeMs > staleMs) {
+          await unlink2(lockPath);
+          continue;
+        }
+      } catch {}
+      if (Date.now() >= deadline) {
+        reportPluginError(`Gave up waiting for the state lock at ${lockPath}`);
+        return { held: false, release: async () => {} };
+      }
+      await new Promise((resolve) => setTimeout(resolve, LOCK_RETRY_MS));
+    }
+  }
 }
 
 // src/state.ts
@@ -454,7 +607,8 @@ var PendingAttemptSchema = Schema.Struct({
   delivered: Schema.Boolean,
   committed: Schema.Boolean,
   armNoProgress: Schema.Boolean,
-  previousLastContinuationAt: Schema.NullOr(Schema.Number)
+  previousLastContinuationAt: Schema.NullOr(Schema.Number),
+  previousLastContinuationAtMs: Schema.optionalWith(NullableNumber, { default: () => null })
 });
 var UsageTrackerSchema = Schema.Struct({
   baseline: Schema.optionalWith(Schema.Unknown, { default: () => null }),
@@ -483,6 +637,7 @@ var GoalSchema = Schema.Struct({
   lastAccountedAt: NullableNumber,
   autoTurns: Schema.Number,
   lastContinuationAt: NullableNumber,
+  lastContinuationAtMs: Schema.optionalWith(NullableNumber, { default: () => null }),
   continuationFailures: Schema.optionalWith(Schema.Number, { default: () => 0 }),
   pendingAttempt: Schema.optionalWith(Schema.NullOr(PendingAttemptSchema), { default: () => null }),
   lastStatus: Schema.optionalWith(NullableString, { default: () => null }),
@@ -562,6 +717,7 @@ function notifyStateRecovery(notice) {
       try {
         console.error(`[opencode-goal-plugin] Failed to report quarantined state at ${notice.quarantineFile}:`, error instanceof Error ? error.message : String(error));
       } catch {}
+      reportPluginError(`Failed to report quarantined state at ${notice.quarantineFile}`, error);
     });
   }
 }
@@ -594,7 +750,13 @@ function readStateResultEffect(file = statePath()) {
   }).pipe(Effect.flatMap((raw) => Effect.try({
     try: () => parseStateText(raw, file),
     catch: (cause) => new StateDecodeError({ cause })
-  })), Effect.flatMap(({ value, recoveryContent }) => decodeState(value).pipe(Effect.map((state) => ({ state, recoveryContent })))), Effect.catchAll((error) => error._tag === "StateReadError" && isMissingStateFile(error.cause) ? Effect.succeed({ state: emptyState(), recoveryContent: null }) : Effect.fail(error)));
+  }).pipe(Effect.flatMap(({ value, recoveryContent }) => decodeState(value).pipe(Effect.map((state) => ({ state, recoveryContent, raw })))))), Effect.catchAll((error) => error._tag === "StateReadError" && isMissingStateFile(error.cause) ? Effect.succeed({ state: emptyState(), recoveryContent: null, raw: null }) : Effect.fail(error)));
+}
+function readRawStateEffect(file = statePath()) {
+  return Effect.tryPromise({
+    try: () => readFile(file, "utf8"),
+    catch: (cause) => new StateReadError({ cause })
+  }).pipe(Effect.catchAll((error) => error._tag === "StateReadError" && isMissingStateFile(error.cause) ? Effect.succeed(null) : Effect.fail(error)));
 }
 function readStateEffect(file = statePath()) {
   return readStateResultEffect(file).pipe(Effect.map(({ state }) => state));
@@ -603,7 +765,7 @@ function quarantineStateEffect(file, content) {
   return Effect.promise(async () => {
     const quarantineFile = `${file}.corrupt-${Date.now()}-${randomUUID2()}`;
     try {
-      await mkdir(dirname2(file), { recursive: true, mode: 448 });
+      await mkdir(dirname3(file), { recursive: true, mode: 448 });
       await atomicWriteFile(quarantineFile, content);
       return { quarantineFile, error: null };
     } catch (error) {
@@ -620,6 +782,7 @@ function verifyRecoverySourceEffect(file, expectedContent, quarantineFile) {
         try {
           console.error(`[opencode-goal-plugin] Could not re-read ${file} after preserving it at ${quarantineFile}; continuing recovery:`, error instanceof Error ? error.message : String(error));
         } catch {}
+        reportPluginError(`Could not re-read ${file} after preserving it at ${quarantineFile}`, error);
       }
       return true;
     }
@@ -628,7 +791,7 @@ function verifyRecoverySourceEffect(file, expectedContent, quarantineFile) {
 function writeStateEffect(state, file = statePath()) {
   return Effect.tryPromise({
     try: async () => {
-      await mkdir(dirname2(file), { recursive: true, mode: 448 });
+      await mkdir(dirname3(file), { recursive: true, mode: 448 });
       await atomicWriteFile(file, JSON.stringify(state, null, 2) + `
 `);
     },
@@ -639,6 +802,7 @@ async function readState() {
   return Effect.runPromise(readStateEffect());
 }
 var mutationQueue = Promise.resolve();
+var MAX_MUTATION_ATTEMPTS = 8;
 function enqueueMutation(operation) {
   const current = mutationQueue.then(operation, operation);
   mutationQueue = current.then(() => {
@@ -649,52 +813,70 @@ function enqueueMutation(operation) {
   return current;
 }
 async function mutate(fn) {
-  return enqueueMutation(() => {
+  return enqueueMutation(async () => {
     const file = statePath();
-    return Effect.runPromise(Effect.gen(function* () {
-      const { state, recoveryContent } = yield* readStateResultEffect(file);
-      const result = yield* Effect.tryPromise({
-        try: () => Promise.resolve(fn(state)),
-        catch: (cause) => cause instanceof Error ? cause : new Error(String(cause))
-      });
-      if (recoveryContent != null) {
-        const quarantine = yield* quarantineStateEffect(file, recoveryContent);
-        if (quarantine.error != null) {
-          const notice = {
-            stateFile: file,
-            quarantineFile: quarantine.quarantineFile,
-            outcome: "quarantineFailed",
-            error: quarantine.error
-          };
-          try {
-            console.error(`[opencode-goal-plugin] Could not quarantine corrupt state at ${file}; continuing recovery:`, quarantine.error);
-          } catch {}
-          notifyStateRecovery(notice);
-        } else {
-          const unchanged = yield* verifyRecoverySourceEffect(file, recoveryContent, quarantine.quarantineFile);
-          if (!unchanged) {
-            const message = "goal state changed while recovery was being quarantined; refusing to overwrite it";
-            notifyStateRecovery({
-              stateFile: file,
-              quarantineFile: quarantine.quarantineFile,
-              outcome: "sourceChanged",
-              error: message
-            });
-            return yield* Effect.fail(new StateWriteError({ cause: new Error(message) }));
-          }
-          try {
-            console.warn(`[opencode-goal-plugin] Preserved corrupt state from ${file} at ${quarantine.quarantineFile}; continuing recovery.`);
-          } catch {}
-          notifyStateRecovery({
-            stateFile: file,
-            quarantineFile: quarantine.quarantineFile,
-            outcome: "quarantined"
+    const lock = await acquireStateLock(stateLockPath(file));
+    try {
+      return await Effect.runPromise(Effect.gen(function* () {
+        let lastState = null;
+        let lastResult;
+        for (let attempt = 0;attempt < MAX_MUTATION_ATTEMPTS; attempt++) {
+          const { state, recoveryContent, raw } = yield* readStateResultEffect(file);
+          const result = yield* Effect.tryPromise({
+            try: () => Promise.resolve(fn(state)),
+            catch: (cause) => cause instanceof Error ? cause : new Error(String(cause))
           });
+          lastState = state;
+          lastResult = result;
+          if (recoveryContent != null) {
+            const quarantine = yield* quarantineStateEffect(file, recoveryContent);
+            if (quarantine.error != null) {
+              const notice = {
+                stateFile: file,
+                quarantineFile: quarantine.quarantineFile,
+                outcome: "quarantineFailed",
+                error: quarantine.error
+              };
+              try {
+                console.error(`[opencode-goal-plugin] Could not quarantine corrupt state at ${file}; continuing recovery:`, quarantine.error);
+              } catch {}
+              reportPluginError(`Could not quarantine corrupt state at ${file}`, quarantine.error);
+              notifyStateRecovery(notice);
+            } else {
+              const unchanged = yield* verifyRecoverySourceEffect(file, recoveryContent, quarantine.quarantineFile);
+              if (!unchanged) {
+                const message = "goal state changed while recovery was being quarantined; refusing to overwrite it";
+                notifyStateRecovery({
+                  stateFile: file,
+                  quarantineFile: quarantine.quarantineFile,
+                  outcome: "sourceChanged",
+                  error: message
+                });
+                return yield* Effect.fail(new StateWriteError({ cause: new Error(message) }));
+              }
+              try {
+                console.warn(`[opencode-goal-plugin] Preserved corrupt state from ${file} at ${quarantine.quarantineFile}; continuing recovery.`);
+              } catch {}
+              notifyStateRecovery({
+                stateFile: file,
+                quarantineFile: quarantine.quarantineFile,
+                outcome: "quarantined"
+              });
+            }
+          }
+          const current = yield* readRawStateEffect(file);
+          if (current !== raw)
+            continue;
+          yield* writeStateEffect(state, file);
+          return result;
         }
-      }
-      yield* writeStateEffect(state, file);
-      return result;
-    }));
+        if (lastState)
+          yield* writeStateEffect(lastState, file);
+        return lastResult;
+      }));
+    } finally {
+      await lock.release();
+    }
   });
 }
 var DEFAULT_MAX_OBJECTIVE_CHARS = 1e5;
@@ -744,6 +926,7 @@ function normalizeGoal(goal) {
   goal.lastPromptAgent ??= null;
   goal.awaitingContinuationProgress = goal.awaitingContinuationProgress === true;
   goal.lastContinuationAt = typeof goal.lastContinuationAt === "number" && Number.isFinite(goal.lastContinuationAt) ? Math.floor(goal.lastContinuationAt >= 1000000000000 ? goal.lastContinuationAt / 1000 : goal.lastContinuationAt) : null;
+  goal.lastContinuationAtMs = typeof goal.lastContinuationAtMs === "number" && Number.isFinite(goal.lastContinuationAtMs) ? Math.floor(goal.lastContinuationAtMs) : null;
   goal.pendingAttempt = normalizePendingAttempt(goal.pendingAttempt);
   goal.continuationBaselineMessageID ??= "";
   goal.continuationBaselineSummary ??= "";
@@ -789,7 +972,8 @@ function normalizePendingAttempt(attempt) {
     delivered: attempt.delivered === true,
     committed: attempt.committed === true,
     armNoProgress: attempt.armNoProgress !== false,
-    previousLastContinuationAt: typeof attempt.previousLastContinuationAt === "number" && Number.isFinite(attempt.previousLastContinuationAt) ? attempt.previousLastContinuationAt : null
+    previousLastContinuationAt: typeof attempt.previousLastContinuationAt === "number" && Number.isFinite(attempt.previousLastContinuationAt) ? attempt.previousLastContinuationAt : null,
+    previousLastContinuationAtMs: typeof attempt.previousLastContinuationAtMs === "number" && Number.isFinite(attempt.previousLastContinuationAtMs) ? attempt.previousLastContinuationAtMs : null
   };
 }
 function randomId() {
@@ -828,11 +1012,11 @@ function nonNegativeInteger(value, fallback) {
 function nonNegativeIntegerOrNull(value) {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
 }
-function isClosed(status2) {
-  return status2 === "complete" || status2 === "unmet" || status2 === "cancelled";
+function isClosed(status) {
+  return status === "complete" || status === "unmet" || status === "cancelled";
 }
-function canContinue(status2) {
-  return status2 === "active";
+function canContinue(status) {
+  return status === "active";
 }
 function remainingTokens(goal) {
   return goal.tokenBudget == null ? null : Math.max(0, goal.tokenBudget - goal.tokensUsed);
@@ -948,6 +1132,7 @@ function createGoalRecord(sessionID, objective, normalizedOptions, now = nowSeco
     lastAccountedAt: paused ? null : now,
     autoTurns: 0,
     lastContinuationAt: null,
+    lastContinuationAtMs: null,
     continuationFailures: 0,
     pendingAttempt: null,
     lastStatus: paused ? "Goal recorded from Plan mode; execution paused until resumed from Build mode." : "Goal set.",
@@ -1050,7 +1235,7 @@ async function createGoal(sessionID, objective, options) {
     return snapshot(goal);
   });
 }
-async function updateGoalObjective(sessionID, objective, status2 = "active", options) {
+async function updateGoalObjective(sessionID, objective, status = "active", options) {
   const value = validateObjective(objective, resolveMaxObjectiveChars(options?.maxObjectiveChars));
   const agent = typeof options?.agent === "string" && options.agent.trim() ? options.agent.trim() : null;
   const planModePause = options?.planModePause === true;
@@ -1069,7 +1254,7 @@ async function updateGoalObjective(sessionID, objective, status2 = "active", opt
       goal.planRevision += 1;
     }
     goal.objective = value;
-    goal.status = planModePause ? "paused" : status2;
+    goal.status = planModePause ? "paused" : status;
     goal.updatedAt = nowSeconds();
     goal.lastAccountedAt = goal.status === "active" ? goal.updatedAt : null;
     goal.completionEvidence = null;
@@ -1122,7 +1307,7 @@ async function pauseGoalForPlanMode(sessionID) {
     return snapshot(goal);
   });
 }
-async function setGoalStatus(sessionID, status2, agent, options) {
+async function setGoalStatus(sessionID, status, agent, options) {
   const agentValue = typeof agent === "string" && agent.trim() ? agent.trim() : null;
   return mutate((state) => {
     const goal = state.goals[sessionID];
@@ -1130,26 +1315,26 @@ async function setGoalStatus(sessionID, status2, agent, options) {
       throw new Error("cannot update goal because this session has no goal");
     if (isClosed(goal.status))
       throw new Error("cannot update goal status because this goal is closed");
-    if (goal.status === status2)
+    if (goal.status === status)
       return snapshot(goal);
-    if (status2 === "paused" && goal.status !== "active")
+    if (status === "paused" && goal.status !== "active")
       return snapshot(goal);
-    const resumesAutoTurnLimit = options?.resetAutoTurnLimit === true && status2 === "active" && goal.status === "usageLimited" && goal.stopReason?.startsWith(MAX_AUTO_CONTINUES_STOP_REASON_PREFIX) === true;
+    const resumesAutoTurnLimit = options?.resetAutoTurnLimit === true && status === "active" && goal.status === "usageLimited" && goal.stopReason?.startsWith(MAX_AUTO_CONTINUES_STOP_REASON_PREFIX) === true;
     accountWallClock(goal);
-    goal.status = status2;
+    goal.status = status;
     goal.updatedAt = nowSeconds();
-    goal.lastAccountedAt = status2 === "active" ? goal.updatedAt : null;
+    goal.lastAccountedAt = status === "active" ? goal.updatedAt : null;
     goal.autoTurns = resumesAutoTurnLimit ? 0 : goal.autoTurns;
-    goal.continuationFailures = status2 === "active" ? 0 : goal.continuationFailures;
-    goal.pendingAttempt = status2 === "active" ? null : goal.pendingAttempt;
-    goal.noProgressTurns = status2 === "active" ? 0 : goal.noProgressTurns;
-    goal.stopReason = status2 === "active" ? null : "paused";
-    goal.budgetWrapupSent = status2 === "active" ? false : goal.budgetWrapupSent;
-    goal.blocker = status2 === "active" ? null : goal.blocker;
+    goal.continuationFailures = status === "active" ? 0 : goal.continuationFailures;
+    goal.pendingAttempt = status === "active" ? null : goal.pendingAttempt;
+    goal.noProgressTurns = status === "active" ? 0 : goal.noProgressTurns;
+    goal.stopReason = status === "active" ? null : "paused";
+    goal.budgetWrapupSent = status === "active" ? false : goal.budgetWrapupSent;
+    goal.blocker = status === "active" ? null : goal.blocker;
     if (agentValue)
       goal.lastPromptAgent = agentValue;
-    goal.lastStatus = status2 === "active" ? "Goal resumed." : "Goal paused.";
-    pushHistory(goal, status2 === "active" ? "resumed" : "paused", goal.lastStatus);
+    goal.lastStatus = status === "active" ? "Goal resumed." : "Goal paused.";
+    pushHistory(goal, status === "active" ? "resumed" : "paused", goal.lastStatus);
     return snapshot(goal);
   });
 }
@@ -1161,7 +1346,7 @@ async function closeGoal(sessionID, input, maxObjectiveChars = DEFAULT_MAX_OBJEC
       throw new Error("cannot update goal because this session has no goal");
     if (isClosed(goal.status))
       throw new Error("cannot close goal because this goal is already closed");
-    if (input.status === "complete" && goal.plan?.phases.some((phase2) => phase2.status !== "completed")) {
+    if (input.status === "complete" && goal.plan?.phases.some((phase) => phase.status !== "completed")) {
       throw new Error("cannot complete the overall goal while planned phases still require work or verification");
     }
     accountWallClock(goal);
@@ -1324,20 +1509,20 @@ async function recordAssistantProgress(sessionID, input) {
     const goal = state.goals[sessionID];
     if (!goal || goal.status !== "active")
       return goal ? snapshot(goal) : null;
-    const text2 = input.text?.trim() ?? "";
+    const text = input.text?.trim() ?? "";
     const messageID = input.messageID?.trim() ?? "";
     const outputTokens = positiveIntegerOrNull(input.outputTokens) ?? 0;
     const threshold = positiveIntegerOrNull(input.noProgressTokenThreshold) ?? goal.noProgressTokenThreshold;
     const maxNoProgressTurns = positiveIntegerOrNull(input.maxNoProgressTurns) ?? goal.maxNoProgressTurns;
-    const summary = summarizeText(text2);
-    const substantive = /[\p{L}\p{N}]/u.test(text2);
+    const summary = summarizeText(text);
+    const substantive = /[\p{L}\p{N}]/u.test(text);
     const previousSummary = summarizeText(goal.lastAssistantText);
     const repeatedMessage = Boolean(messageID && messageID === goal.lastAssistantMessageID);
     const changed = Boolean(summary && summary !== previousSummary);
     if (summary && (!repeatedMessage || changed))
       recordCheckpoint(goal, summary);
-    if (text2)
-      goal.lastAssistantText = text2;
+    if (text)
+      goal.lastAssistantText = text;
     if (messageID)
       goal.lastAssistantMessageID = messageID;
     if (substantive && summary && (!repeatedMessage || changed)) {
@@ -1389,11 +1574,14 @@ async function reserveContinuation(sessionID, maxAutoTurns, minIntervalSeconds) 
     accountWallClock(goal, now);
     if (maybeStopForUsageLimit(goal, maxAutoTurns, now))
       return reserveWrapup(goal);
-    if (goal.lastContinuationAt && now - goal.lastContinuationAt < minIntervalSeconds)
+    const anchor = goal.lastContinuationAtMs ?? (goal.lastContinuationAt != null ? goal.lastContinuationAt * 1000 : null);
+    if (anchor != null && Date.now() - anchor < minIntervalSeconds * 1000)
       return null;
     goal.autoTurns += 1;
     const previousLastContinuationAt = goal.lastContinuationAt;
+    const previousLastContinuationAtMs = goal.lastContinuationAtMs;
     goal.lastContinuationAt = now;
+    goal.lastContinuationAtMs = Date.now();
     goal.continuationBaselineMessageID = goal.lastAssistantMessageID;
     goal.continuationBaselineSummary = summarizeText(goal.lastAssistantText);
     goal.pendingAttempt = {
@@ -1403,7 +1591,8 @@ async function reserveContinuation(sessionID, maxAutoTurns, minIntervalSeconds) 
       delivered: false,
       committed: true,
       armNoProgress: true,
-      previousLastContinuationAt
+      previousLastContinuationAt,
+      previousLastContinuationAtMs
     };
     goal.awaitingContinuationProgress = false;
     goal.lastStatus = `Auto-continue ${goal.autoTurns} reserved.`;
@@ -1429,6 +1618,7 @@ async function rollbackContinuationAttempt(sessionID, expected) {
     }
     goal.autoTurns = Math.max(0, goal.autoTurns - 1);
     goal.lastContinuationAt = attempt.previousLastContinuationAt;
+    goal.lastContinuationAtMs = attempt.previousLastContinuationAtMs;
     goal.pendingAttempt = null;
     goal.awaitingContinuationProgress = false;
     goal.lastStatus = "Auto-continue attempt canceled before delivery.";
@@ -1464,9 +1654,10 @@ async function recordContinuationResult(sessionID, result, maxFailures, options)
             delivered: true,
             committed: false,
             armNoProgress: options?.armNoProgress !== false,
-            previousLastContinuationAt: goal.lastContinuationAt
+            previousLastContinuationAt: goal.lastContinuationAt,
+            previousLastContinuationAtMs: goal.lastContinuationAtMs
           };
-          if (goal.pendingAttempt.armNoProgress)
+          if (goal.pendingAttempt?.armNoProgress)
             goal.awaitingContinuationProgress = true;
         }
         goal.lastStatus = "Auto-continue prompt sent.";
@@ -1499,8 +1690,8 @@ async function markPendingContinuationStarted(sessionID) {
     return current ? snapshotInternal(current) : null;
   if (current.pendingAttempt == null || current.pendingAttempt.started)
     return snapshotInternal(current);
-  return mutate((state2) => {
-    const goal = state2.goals[sessionID];
+  return mutate((state) => {
+    const goal = state.goals[sessionID];
     if (!goal || goal.status !== "active")
       return goal ? snapshotInternal(goal) : null;
     if (goal.pendingAttempt == null || goal.pendingAttempt.started)
@@ -1510,12 +1701,12 @@ async function markPendingContinuationStarted(sessionID) {
     return snapshotInternal(goal);
   });
 }
-async function recordToolProgress(sessionID, text2, expectedAttemptID) {
+async function recordToolProgress(sessionID, text, expectedAttemptID) {
   return mutate((state) => {
     const goal = state.goals[sessionID];
     if (!goal || goal.status !== "active")
       return goal ? snapshotInternal(goal) : null;
-    const value = text2?.trim() ?? "";
+    const value = text?.trim() ?? "";
     if (!value)
       return snapshotInternal(goal);
     if (goal.continuationFailures === 0 && goal.pendingAttempt == null)
@@ -1596,8 +1787,8 @@ function pushHistory(goal, type, detail) {
     return;
   goal.history = [...goal.history, { type, detail: value, timestamp: nowSeconds() }].slice(-MAX_HISTORY_ENTRIES);
 }
-function summarizeText(text2, limit = CHECKPOINT_CHAR_LIMIT) {
-  const normalized = text2.replace(/\s+/g, " ").trim();
+function summarizeText(text, limit = CHECKPOINT_CHAR_LIMIT) {
+  const normalized = text.replace(/\s+/g, " ").trim();
   if (!normalized)
     return "";
   return normalized.length > limit ? `${normalized.slice(0, Math.max(0, limit - 3))}...` : normalized;
@@ -1610,8 +1801,8 @@ function goalLimitSummary(goal) {
   ].filter(Boolean);
   return limits.length ? `Goal set with ${limits.join(", ")}.` : "Goal set with default continuation limits.";
 }
-function estimateTokensFromText(text2) {
-  return Math.ceil(text2.length / 4);
+function estimateTokensFromText(text) {
+  return Math.ceil(text.length / 4);
 }
 
 // src/i18n.ts
@@ -1852,8 +2043,8 @@ var STATUS_PRESENTATIONS = {
     cancelled: "\u5DF2\u53D6\u6D88"
   }
 };
-function presentGoalStatus(status2, locale) {
-  return STATUS_PRESENTATIONS[locale][status2] ?? status2;
+function presentGoalStatus(status, locale) {
+  return STATUS_PRESENTATIONS[locale][status] ?? status;
 }
 function presentGoalStopReason(reason, locale) {
   if (locale !== "zh-CN")
@@ -1885,9 +2076,9 @@ function presentGoalStopReason(reason, locale) {
     return `\u5DF2\u8FBE\u5230\u6301\u7EED\u65F6\u95F4\u4E0A\u9650\uFF08${duration[1]} \u79D2\uFF09`;
   return reason;
 }
-function presentGoalLastStatus(status2, locale) {
+function presentGoalLastStatus(status, locale) {
   if (locale !== "zh-CN")
-    return status2;
+    return status;
   const direct = {
     "Goal set.": "\u76EE\u6807\u5DF2\u8BBE\u7F6E\u3002",
     "Goal recorded from Plan mode; execution paused until resumed from Build mode.": "\u76EE\u6807\u5DF2\u5728 Plan \u6A21\u5F0F\u4E0B\u8BB0\u5F55\uFF1B\u6267\u884C\u5DF2\u6682\u505C\uFF0C\u9700\u5728 Build \u6A21\u5F0F\u4E0B\u7EE7\u7EED\u3002",
@@ -1906,30 +2097,30 @@ function presentGoalLastStatus(status2, locale) {
     "Auto-continue prompt failed repeatedly. Resume the goal to retry.": "\u81EA\u52A8\u7EE7\u7EED\u63D0\u793A\u53CD\u590D\u5931\u8D25\u3002\u8BF7\u7EE7\u7EED\u76EE\u6807\u540E\u91CD\u8BD5\u3002",
     "Goal execution is paused while the session is in Plan mode. Switch to Build mode and resume the goal to continue.": "\u4F1A\u8BDD\u5904\u4E8E Plan \u6A21\u5F0F\uFF0C\u56E0\u6B64\u76EE\u6807\u6267\u884C\u5DF2\u6682\u505C\u3002\u8BF7\u5207\u6362\u5230 Build \u6A21\u5F0F\u5E76\u7EE7\u7EED\u76EE\u6807\u3002"
   };
-  if (direct[status2])
-    return direct[status2];
+  if (direct[status])
+    return direct[status];
   const lowProgressPausePattern = /^Auto-continue paused after (\d+) low-progress continuation turn\(s\)\. Resume the goal to retry\.$/;
-  const lowProgressPause = lowProgressPausePattern.exec(status2);
+  const lowProgressPause = lowProgressPausePattern.exec(status);
   if (lowProgressPause)
     return `\u81EA\u52A8\u7EE7\u7EED\u5DF2\u5728 ${lowProgressPause[1]} \u4E2A\u4F4E\u8FDB\u5C55\u8F6E\u6B21\u540E\u6682\u505C\u3002\u8BF7\u7EE7\u7EED\u76EE\u6807\u540E\u91CD\u8BD5\u3002`;
-  const lowProgress = /^Low-progress continuation turn detected \((\d+)\/(\d+|unbounded)\)\.$/.exec(status2);
+  const lowProgress = /^Low-progress continuation turn detected \((\d+)\/(\d+|unbounded)\)\.$/.exec(status);
   if (lowProgress) {
     const limit = lowProgress[2] === "unbounded" ? "\u4E0D\u9650" : lowProgress[2];
     return `\u68C0\u6D4B\u5230\u4F4E\u8FDB\u5C55\u7684\u7EE7\u7EED\u8F6E\u6B21\uFF08${lowProgress[1]}/${limit}\uFF09\u3002`;
   }
-  const reserved = /^Auto-continue (\d+) reserved\.$/.exec(status2);
+  const reserved = /^Auto-continue (\d+) reserved\.$/.exec(status);
   if (reserved)
     return `\u5DF2\u9884\u7559\u7B2C ${reserved[1]} \u6B21\u81EA\u52A8\u7EE7\u7EED\u3002`;
-  const failed = /^Auto-continue failed (\d+) time\(s\)\.$/.exec(status2);
+  const failed = /^Auto-continue failed (\d+) time\(s\)\.$/.exec(status);
   if (failed)
     return `\u81EA\u52A8\u7EE7\u7EED\u5DF2\u5931\u8D25 ${failed[1]} \u6B21\u3002`;
-  const pausedAfterFailures = /^Paused after (\d+) auto-continue failure\(s\)\.$/.exec(status2);
+  const pausedAfterFailures = /^Paused after (\d+) auto-continue failure\(s\)\.$/.exec(status);
   if (pausedAfterFailures)
     return `\u5DF2\u5728 ${pausedAfterFailures[1]} \u6B21\u81EA\u52A8\u7EE7\u7EED\u5931\u8D25\u540E\u6682\u505C\u3002`;
-  const wrapUp = /^(.*); wrap-up required\.$/.exec(status2);
+  const wrapUp = /^(.*); wrap-up required\.$/.exec(status);
   if (wrapUp)
     return `${presentGoalStopReason(wrapUp[1], locale)}\uFF1B\u9700\u8981\u6536\u5C3E\u3002`;
-  return status2;
+  return status;
 }
 var HISTORY_TYPE_PRESENTATIONS = {
   en: {},
@@ -2020,11 +2211,11 @@ ${escapeXmlText(goal.objective)}
 function durablePlanContext(goal) {
   if (!goal.plan)
     return "";
-  const phase2 = goal.plan.phases.find((item) => item.id === goal.planProgress?.currentPhaseID);
-  const currentTask = phase2?.tasks.find((item) => item.id === goal.planProgress?.currentTaskID);
-  const nextTask = phase2?.tasks.find((item) => item.id === goal.planProgress?.nextTaskID);
-  const blockedTasks = phase2?.tasks.filter((item) => item.status === "blocked") ?? [];
-  const taskSummary = (task2) => task2 ? { id: task2.id, description: task2.description, status: task2.status, blocker: task2.blocker ?? null } : null;
+  const phase = goal.plan.phases.find((item) => item.id === goal.planProgress?.currentPhaseID);
+  const currentTask = phase?.tasks.find((item) => item.id === goal.planProgress?.currentTaskID);
+  const nextTask = phase?.tasks.find((item) => item.id === goal.planProgress?.nextTaskID);
+  const blockedTasks = phase?.tasks.filter((item) => item.status === "blocked") ?? [];
+  const taskSummary = (task) => task ? { id: task.id, description: task.description, status: task.status, blocker: task.blocker ?? null } : null;
   return `
 
 <untrusted_goal_plan>
@@ -2034,7 +2225,7 @@ ${escapeXmlText(JSON.stringify({
     summary: goal.plan.summary,
     completionCriteria: goal.plan.completionCriteria,
     progress: goal.planProgress,
-    currentPhase: phase2 ? { id: phase2.id, objective: phase2.objective, status: phase2.status, blocker: phase2.blocker ?? null } : null,
+    currentPhase: phase ? { id: phase.id, objective: phase.objective, status: phase.status, blocker: phase.blocker ?? null } : null,
     currentTask: taskSummary(currentTask),
     nextTask: taskSummary(nextTask),
     blockedTasks: blockedTasks.slice(0, 3).map(taskSummary),
@@ -2228,7 +2419,7 @@ function compactionContextPrefix(locale = "en") {
 var COMPACTION_CONTEXT_PREFIX = compactionContextPrefix();
 function formatCompactionSnapshot(goal, locale) {
   if (locale === "zh-CN") {
-    const lines2 = [
+    const lines = [
       `\u76EE\u6807\uFF1A${goal.objective}`,
       `\u72B6\u6001\uFF1A${presentGoalStatus(goal.status, locale)}`,
       `\u5DF2\u7528\u65F6\u95F4\uFF1A${goal.timeUsedSeconds} \u79D2`,
@@ -2236,24 +2427,24 @@ function formatCompactionSnapshot(goal, locale) {
       `\u81EA\u52A8\u7EE7\u7EED\u6B21\u6570\uFF1A${goal.autoTurns}${goal.maxAutoTurns == null ? "" : `/${goal.maxAutoTurns}`}`
     ];
     if (goal.remainingTokens != null)
-      lines2.push(`\u5269\u4F59 Token\uFF1A${goal.remainingTokens}`);
+      lines.push(`\u5269\u4F59 Token\uFF1A${goal.remainingTokens}`);
     if (goal.maxDurationSeconds != null)
-      lines2.push(`\u6301\u7EED\u65F6\u95F4\u4E0A\u9650\uFF1A${goal.maxDurationSeconds} \u79D2`);
+      lines.push(`\u6301\u7EED\u65F6\u95F4\u4E0A\u9650\uFF1A${goal.maxDurationSeconds} \u79D2`);
     if (goal.noProgressTurns > 0)
-      lines2.push(`\u65E0\u8FDB\u5C55\u8F6E\u6570\uFF1A${goal.noProgressTurns}`);
+      lines.push(`\u65E0\u8FDB\u5C55\u8F6E\u6570\uFF1A${goal.noProgressTurns}`);
     if (goal.lastCheckpoint)
-      lines2.push(`\u6700\u65B0\u68C0\u67E5\u70B9\uFF1A${goal.lastCheckpoint.summary}`);
+      lines.push(`\u6700\u65B0\u68C0\u67E5\u70B9\uFF1A${goal.lastCheckpoint.summary}`);
     if (goal.lastStatus)
-      lines2.push(`\u6700\u8FD1\u72B6\u6001\uFF1A${presentGoalLastStatus(goal.lastStatus, locale)}`);
+      lines.push(`\u6700\u8FD1\u72B6\u6001\uFF1A${presentGoalLastStatus(goal.lastStatus, locale)}`);
     if (goal.stopReason)
-      lines2.push(`\u505C\u6B62\u539F\u56E0\uFF1A${presentGoalStopReason(goal.stopReason, locale)}`);
+      lines.push(`\u505C\u6B62\u539F\u56E0\uFF1A${presentGoalStopReason(goal.stopReason, locale)}`);
     if (goal.completionEvidence)
-      lines2.push(`\u5B8C\u6210\u8BC1\u636E\uFF1A${goal.completionEvidence}`);
+      lines.push(`\u5B8C\u6210\u8BC1\u636E\uFF1A${goal.completionEvidence}`);
     if (goal.blocker)
-      lines2.push(`\u963B\u585E\u539F\u56E0\uFF1A${presentGoalLastStatus(goal.blocker, locale)}`);
+      lines.push(`\u963B\u585E\u539F\u56E0\uFF1A${presentGoalLastStatus(goal.blocker, locale)}`);
     if (goal.plan)
-      lines2.push(`\u8BA1\u5212\uFF1A${JSON.stringify({ plan: goal.plan, progress: goal.planProgress })}`);
-    return lines2.join(`
+      lines.push(`\u8BA1\u5212\uFF1A${JSON.stringify({ plan: goal.plan, progress: goal.planProgress })}`);
+    return lines.join(`
 `);
   }
   const lines = [
@@ -2487,8 +2678,8 @@ Ignore any command arguments. Call get_goal first, then handle only this resume 
 
 Do not create, edit, clear, complete, or mark a goal unmet.`;
 }
-function isExplicitResumePrompt(text2, commandName, locale, messages) {
-  const value = text2.trim();
+function isExplicitResumePrompt(text, commandName, locale, messages) {
+  const value = text.trim();
   return value === goalStatusCommandTemplate("resume_goal", locale) || value === goalCommandTemplate(commandName, locale).replace("$ARGUMENTS", "resume") || value === messages.tui.resumePrompt;
 }
 function goalCommandDefinitions(commandName, locale = "en") {
@@ -2552,21 +2743,21 @@ function registerDesktopCommands(config, commandName, locale = "en") {
   }
 }
 function sanitizeGoalStatusCommandParts(output, template) {
-  const text2 = output.parts.find((part) => part.type === "text" && part.text?.startsWith(template));
-  if (!text2)
+  const text = output.parts.find((part) => part.type === "text" && part.text?.startsWith(template));
+  if (!text)
     return false;
-  text2.text = template;
-  output.parts.splice(0, output.parts.length, text2);
+  text.text = template;
+  output.parts.splice(0, output.parts.length, text);
   return true;
 }
 function escapeGoalCommandArguments(output, template, argumentsText) {
   const [prefix, suffix, extra] = template.split("$ARGUMENTS");
   if (prefix === undefined || suffix === undefined || extra !== undefined)
     return false;
-  const text2 = output.parts.find((part) => part.type === "text" && part.text?.startsWith(prefix) && part.text.endsWith(suffix));
-  if (!text2)
+  const text = output.parts.find((part) => part.type === "text" && part.text?.startsWith(prefix) && part.text.endsWith(suffix));
+  if (!text)
     return false;
-  text2.text = `${prefix}${escapeXmlText2(argumentsText)}${suffix}`;
+  text.text = `${prefix}${escapeXmlText2(argumentsText)}${suffix}`;
   return true;
 }
 function textFromPart(part) {
@@ -2721,8 +2912,8 @@ async function sendContinuation(client, sessionID, prompt, agent) {
 function isIdleEvent(event) {
   if (event.type === "session.idle")
     return true;
-  const status2 = event.properties?.status;
-  return event.type === "session.status" && typeof status2 === "object" && status2 !== null && status2.type === "idle";
+  const status = event.properties?.status;
+  return event.type === "session.status" && typeof status === "object" && status !== null && status.type === "idle";
 }
 function isTransportError(error) {
   const message = error instanceof Error ? error.message : typeof error === "string" ? error : "";
@@ -2798,7 +2989,7 @@ function toolOutputFailed(output) {
     return true;
   if (output.success === false)
     return true;
-  const text2 = typeof output.output === "string" ? output.output.trim() : "";
+  const text = typeof output.output === "string" ? output.output.trim() : "";
   const state = output.state ?? output.status;
   if (typeof state === "string") {
     const normalized = state.trim().toLowerCase();
@@ -2812,19 +3003,19 @@ function toolOutputFailed(output) {
     if (typeof metaState === "string" && TOOL_FAILURE_STATES.has(metaState.trim().toLowerCase()))
       return true;
   }
-  const taskState = parseTaskState(text2);
+  const taskState = parseTaskState(text);
   if (taskState)
     return taskState !== "completed";
-  if (/^state:\s*(failed|failure|error|cancelled|canceled|aborted|abort|interrupted|running|pending|incomplete|partial|timeout|timed_out)\b/im.test(text2))
+  if (/^state:\s*(failed|failure|error|cancelled|canceled|aborted|abort|interrupted|running|pending|incomplete|partial|timeout|timed_out)\b/im.test(text))
     return true;
-  if (/^<error>/i.test(text2) || /^<tool-error>/i.test(text2) || /^error:/i.test(text2))
+  if (/^<error>/i.test(text) || /^<tool-error>/i.test(text) || /^error:/i.test(text))
     return true;
   return false;
 }
-function taskBlockExpired(task2, maxBlockMs, now) {
+function taskBlockExpired(task, maxBlockMs, now) {
   if (maxBlockMs == null)
     return false;
-  const blockingSince = task2.state === "running" ? task2.runningSince : task2.terminalAt;
+  const blockingSince = task.state === "running" ? task.runningSince : task.terminalAt;
   return blockingSince != null && now - blockingSince >= maxBlockMs;
 }
 function sessionIDFromEvent(event) {
@@ -2891,14 +3082,14 @@ class TaskTracker {
       this.pendingTaskCalls.delete(input.callID);
     if (typeof parentSessionID !== "string")
       return;
-    const status2 = parseTaskStatus(output.output);
-    if (!status2)
+    const status = parseTaskStatus(output.output);
+    if (!status)
       return;
-    if (status2.state === "running") {
-      this.markRunning(parentSessionID, status2.taskID);
+    if (status.state === "running") {
+      this.markRunning(parentSessionID, status.taskID);
       return;
     }
-    this.markTerminal(status2.taskID, status2.state, parentSessionID, { resetReconciled: true });
+    this.markTerminal(status.taskID, status.state, parentSessionID, { resetReconciled: true });
   }
   observeSessionCreated(event) {
     const info = event.properties?.info;
@@ -2906,22 +3097,22 @@ class TaskTracker {
       return;
     this.markRunning(info.parentID, info.id);
   }
-  observeSessionStatus(sessionID, status2) {
-    const task2 = this.tasks.get(sessionID);
-    if (!task2)
+  observeSessionStatus(sessionID, status) {
+    const task = this.tasks.get(sessionID);
+    if (!task)
       return;
-    if (status2 === "busy") {
-      this.markRunning(task2.parentSessionID, sessionID);
+    if (status === "busy") {
+      this.markRunning(task.parentSessionID, sessionID);
       return;
     }
-    if (status2 === "idle")
-      this.markTerminal(sessionID, "completed", task2.parentSessionID);
+    if (status === "idle")
+      this.markTerminal(sessionID, "completed", task.parentSessionID);
   }
   observeSessionDeleted(sessionID) {
     this.tasks.delete(sessionID);
-    for (const task2 of this.tasks.values()) {
-      if (task2.parentSessionID === sessionID)
-        this.tasks.delete(task2.taskID);
+    for (const task of this.tasks.values()) {
+      if (task.parentSessionID === sessionID)
+        this.tasks.delete(task.taskID);
     }
     this.latestAssistantBySession.delete(sessionID);
     this.clearSnapshotIdleForSession(sessionID);
@@ -2937,13 +3128,13 @@ class TaskTracker {
         continue;
       }
       for (const part of message.parts ?? []) {
-        const status2 = parseTaskStatus(textFromPart(part));
-        if (!status2)
+        const status = parseTaskStatus(textFromPart(part));
+        if (!status)
           continue;
-        if (status2.state === "running")
-          this.markRunning(sessionID, status2.taskID);
+        if (status.state === "running")
+          this.markRunning(sessionID, status.taskID);
         else
-          this.markTerminal(status2.taskID, status2.state, sessionID, { resetReconciled: true });
+          this.markTerminal(status.taskID, status.state, sessionID, { resetReconciled: true });
       }
     }
   }
@@ -2967,25 +3158,25 @@ class TaskTracker {
           continue;
         if (entry.state.status === "streaming" || entry.state.status === "running")
           continue;
-        const status2 = parseTaskStatus(toolTextFromV2Content(entry.state.content ?? []));
-        if (!status2)
+        const status = parseTaskStatus(toolTextFromV2Content(entry.state.content ?? []));
+        if (!status)
           continue;
-        if (status2.state === "running")
-          this.markRunning(parentSessionID, status2.taskID);
+        if (status.state === "running")
+          this.markRunning(parentSessionID, status.taskID);
         else
-          this.markTerminal(status2.taskID, status2.state, parentSessionID, { resetReconciled: true, terminalAt });
+          this.markTerminal(status.taskID, status.state, parentSessionID, { resetReconciled: true, terminalAt });
       }
     }
   }
   hasBlockingTasks(parentSessionID, maxBlockMs = null) {
     this.pruneExpiredSnapshotIdleHolds();
     const now = Date.now();
-    for (const task2 of this.tasks.values()) {
-      if (task2.parentSessionID !== parentSessionID)
+    for (const task of this.tasks.values()) {
+      if (task.parentSessionID !== parentSessionID)
         continue;
-      if (task2.state !== "running" && !task2.terminalUnreconciled)
+      if (task.state !== "running" && !task.terminalUnreconciled)
         continue;
-      if (taskBlockExpired(task2, maxBlockMs, now))
+      if (taskBlockExpired(task, maxBlockMs, now))
         continue;
       return true;
     }
@@ -3028,8 +3219,8 @@ class TaskTracker {
       return;
     }
     for (const childID of childIDs) {
-      const status2 = statuses[childID];
-      const statusType = isRecord(status2) && typeof status2.type === "string" ? status2.type : undefined;
+      const status = statuses[childID];
+      const statusType = isRecord(status) && typeof status.type === "string" ? status.type : undefined;
       if (statusType === "busy")
         this.markRunning(parentSessionID, childID);
       else if (statusType === "idle") {
@@ -3107,16 +3298,16 @@ class TaskTracker {
         continue;
       this.snapshotIdleHolds.delete(key);
       this.settledSnapshotIdleTasks.add(key);
-      const task2 = this.tasks.get(hold.taskID);
-      if (task2?.parentSessionID === hold.parentSessionID && task2.state === "running")
+      const task = this.tasks.get(hold.taskID);
+      if (task?.parentSessionID === hold.parentSessionID && task.state === "running")
         this.tasks.delete(hold.taskID);
     }
   }
   markAbsentRunningChildren(parentSessionID, liveChildIDs) {
-    for (const task2 of this.tasks.values()) {
-      if (task2.parentSessionID !== parentSessionID || task2.state !== "running" || liveChildIDs.has(task2.taskID))
+    for (const task of this.tasks.values()) {
+      if (task.parentSessionID !== parentSessionID || task.state !== "running" || liveChildIDs.has(task.taskID))
         continue;
-      this.markSnapshotIdle(parentSessionID, task2.taskID);
+      this.markSnapshotIdle(parentSessionID, task.taskID);
     }
   }
   snapshotIdleKey(parentSessionID, taskID) {
@@ -3124,18 +3315,18 @@ class TaskTracker {
   }
   observeAssistant(sessionID, marker) {
     this.latestAssistantBySession.set(sessionID, marker);
-    for (const task2 of this.tasks.values()) {
-      if (task2.parentSessionID !== sessionID || !task2.terminalUnreconciled)
+    for (const task of this.tasks.values()) {
+      if (task.parentSessionID !== sessionID || !task.terminalUnreconciled)
         continue;
-      if (this.assistantReconcilesTask(task2, marker)) {
-        this.tasks.set(task2.taskID, { ...task2, terminalUnreconciled: false });
+      if (this.assistantReconcilesTask(task, marker)) {
+        this.tasks.set(task.taskID, { ...task, terminalUnreconciled: false });
       }
     }
   }
-  assistantReconcilesTask(task2, marker) {
-    if (marker.id && task2.lastAssistantMessageIDAtTerminal && marker.id !== task2.lastAssistantMessageIDAtTerminal)
+  assistantReconcilesTask(task, marker) {
+    if (marker.id && task.lastAssistantMessageIDAtTerminal && marker.id !== task.lastAssistantMessageIDAtTerminal)
       return true;
-    if (marker.completedAt != null && task2.terminalAt != null && marker.completedAt >= task2.terminalAt)
+    if (marker.completedAt != null && task.terminalAt != null && marker.completedAt >= task.terminalAt)
       return true;
     return false;
   }
@@ -3144,12 +3335,12 @@ async function recordAssistantMessage(sessionID, message, options, evaluateConti
   if (!message)
     return { goal: null, progressed: false };
   const before = await getGoal(sessionID);
-  const id2 = messageID(message) ?? "";
-  const text2 = textFromMessage(message);
-  const progressed = Boolean(/[\p{L}\p{N}]/u.test(text2) && (id2 !== (before?.lastAssistantMessageID ?? "") || text2 !== (before?.lastAssistantText ?? "")));
+  const id = messageID(message) ?? "";
+  const text = textFromMessage(message);
+  const progressed = Boolean(/[\p{L}\p{N}]/u.test(text) && (id !== (before?.lastAssistantMessageID ?? "") || text !== (before?.lastAssistantText ?? "")));
   const goal = await recordAssistantProgress(sessionID, {
-    messageID: id2,
-    text: text2,
+    messageID: id,
+    text,
     outputTokens: outputTokensFromMessage(message) ?? null,
     noProgressTokenThreshold: positiveIntegerOrNull2(options.no_progress_token_threshold),
     maxNoProgressTurns: positiveIntegerOrNull2(options.max_no_progress_turns),
@@ -3227,18 +3418,18 @@ async function planFromTool(args, context) {
 function summarizeGoal(goal) {
   if (!goal)
     return null;
-  const phase2 = goal.plan?.phases.find((item) => item.id === goal.planProgress?.currentPhaseID);
-  const currentTask = phase2?.tasks.find((item) => item.id === goal.planProgress?.currentTaskID);
-  const nextTask = phase2?.tasks.find((item) => item.id === goal.planProgress?.nextTaskID);
-  const blockedTasks = phase2?.tasks.filter((item) => item.status === "blocked") ?? [];
-  const taskSummary = (task2) => task2 ? { id: task2.id, description: task2.description, status: task2.status, blocker: task2.blocker ?? null } : null;
+  const phase = goal.plan?.phases.find((item) => item.id === goal.planProgress?.currentPhaseID);
+  const currentTask = phase?.tasks.find((item) => item.id === goal.planProgress?.currentTaskID);
+  const nextTask = phase?.tasks.find((item) => item.id === goal.planProgress?.nextTaskID);
+  const blockedTasks = phase?.tasks.filter((item) => item.status === "blocked") ?? [];
+  const taskSummary = (task) => task ? { id: task.id, description: task.description, status: task.status, blocker: task.blocker ?? null } : null;
   return {
     id: goal.id,
     objective: goal.objective,
     status: goal.status,
     planRevision: goal.planRevision,
     planProgress: goal.planProgress,
-    currentPhase: phase2 ? { id: phase2.id, objective: phase2.objective, status: phase2.status, blocker: phase2.blocker ?? null } : null,
+    currentPhase: phase ? { id: phase.id, objective: phase.objective, status: phase.status, blocker: phase.blocker ?? null } : null,
     currentTask: taskSummary(currentTask),
     nextTask: taskSummary(nextTask),
     blockedTasks: blockedTasks.slice(0, 3).map(taskSummary),
@@ -3405,10 +3596,10 @@ async function updateGoalObjectiveFromTool(input, context, services) {
 }
 async function closeGoalFromTool(input, context, services) {
   if (input.status === "complete") {
-    const goal2 = await completeGoal(context.sessionID, input.evidence ?? "", services.maxObjectiveChars);
-    const budget = goal2.tokenBudget == null ? "" : ` ${services.messages.reports.tokenUsage}: ${goal2.tokensUsed}/${goal2.tokenBudget}.`;
-    const report2 = `${services.messages.reports.achieved} ${services.messages.reports.timeUsed}: ` + `${goal2.timeUsedSeconds} ${services.messages.reports.seconds}.${budget} ` + `${services.messages.reports.evidence}: ${goal2.completionEvidence}.`;
-    return JSON.stringify({ goal: goal2, completion_report: report2 }, null, 2);
+    const goal = await completeGoal(context.sessionID, input.evidence ?? "", services.maxObjectiveChars);
+    const budget = goal.tokenBudget == null ? "" : ` ${services.messages.reports.tokenUsage}: ${goal.tokensUsed}/${goal.tokenBudget}.`;
+    const report = `${services.messages.reports.achieved} ${services.messages.reports.timeUsed}: ` + `${goal.timeUsedSeconds} ${services.messages.reports.seconds}.${budget} ` + `${services.messages.reports.evidence}: ${goal.completionEvidence}.`;
+    return JSON.stringify({ goal, completion_report: report }, null, 2);
   }
   const goal = await markGoalUnmet(context.sessionID, input.blocker ?? "", services.maxObjectiveChars);
   const report = `${services.messages.reports.unmet} ${services.messages.reports.timeUsed}: ` + `${goal.timeUsedSeconds} ${services.messages.reports.seconds}. ` + `${services.messages.reports.blocker}: ${goal.blocker}.`;
@@ -3451,9 +3642,9 @@ function textFromToolResult(result) {
   if (typeof result.content === "string")
     return result.content;
   if (Array.isArray(result.content)) {
-    const text2 = result.content.map(textFromPart).filter(Boolean).join(`
+    const text = result.content.map(textFromPart).filter(Boolean).join(`
 `).trim();
-    return text2 || undefined;
+    return text || undefined;
   }
   return;
 }
@@ -3708,10 +3899,10 @@ var server = async ({ client }, options) => {
       const statuses = isRecord(result.data) ? result.data : ("data" in result) || ("response" in result) ? null : result;
       if (!statuses)
         return true;
-      const status2 = statuses[sessionID];
-      if (isRecord(status2) && (status2.type === "busy" || status2.type === "retry"))
+      const status = statuses[sessionID];
+      if (isRecord(status) && (status.type === "busy" || status.type === "retry"))
         return true;
-      if ((status2 == null || isRecord(status2) && status2.type === "idle") && (busyRevisions.get(sessionID) ?? 0) === busyRevision) {
+      if ((status == null || isRecord(status) && status.type === "idle") && (busyRevisions.get(sessionID) ?? 0) === busyRevision) {
         busySessions.delete(sessionID);
       }
     } catch {
@@ -4028,9 +4219,9 @@ var server = async ({ client }, options) => {
         const sanitized = escapeGoalCommandArguments(output, goalCommandTemplate(commandName, locale), input.arguments);
         objectiveEdits.delete(input.sessionID);
         const edit = /^edit\s+([\s\S]+)$/i.exec(input.arguments.trim());
-        const goal2 = edit && sanitized ? await getGoal(input.sessionID) : null;
-        if (goal2 && edit)
-          objectiveEdits.set(input.sessionID, { goalID: goal2.id, objective: edit[1].trim() });
+        const goal = edit && sanitized ? await getGoal(input.sessionID) : null;
+        if (goal && edit)
+          objectiveEdits.set(input.sessionID, { goalID: goal.id, objective: edit[1].trim() });
         if (sanitized && input.arguments.trim().toLowerCase() === "resume") {
           explicitResumeRequests.add(input.sessionID);
         }
@@ -4071,15 +4262,15 @@ var server = async ({ client }, options) => {
       const toolResult = output;
       if (toolOutputFailed(toolResult))
         return;
-      const text2 = typeof toolResult.output === "string" ? toolResult.output : undefined;
-      if (!text2)
+      const text = typeof toolResult.output === "string" ? toolResult.output : undefined;
+      if (!text)
         return;
       const before = await getGoalInternal(sessionID);
       const scheduled = scheduledContinuations.get(sessionID);
       const hasFailureEpisode = Boolean(before && (before.continuationFailures > 0 || before.pendingAttempt != null));
       if (!before || !hasFailureEpisode && scheduled?.purpose !== "recovery")
         return;
-      const progressed = await recordToolProgress(sessionID, text2, expectedAttemptID);
+      const progressed = await recordToolProgress(sessionID, text, expectedAttemptID);
       if (progressed?.continuationFailures === 0 && progressed.pendingAttempt == null) {
         locallyDeliveredPendingSessions.delete(sessionID);
         cancelScheduledContinuation(sessionID);
@@ -4145,30 +4336,30 @@ var server = async ({ client }, options) => {
         taskTracker.observeSessionCreated(event);
       }
       if (sessionID && eventType === "session.status") {
-        const status2 = event.properties?.status;
-        if (isRecord(status2) && typeof status2.type === "string") {
-          if (status2.type === "busy") {
+        const status = event.properties?.status;
+        if (isRecord(status) && typeof status.type === "string") {
+          if (status.type === "busy") {
             busySessions.add(sessionID);
             busyRevisions.set(sessionID, (busyRevisions.get(sessionID) ?? 0) + 1);
             nativeRetrySessions.delete(sessionID);
           }
-          if (status2.type === "busy")
+          if (status.type === "busy")
             armTurnWatchdog(sessionID);
-          if (status2.type === "busy")
+          if (status.type === "busy")
             await markPendingContinuationStarted(sessionID);
-          if (status2.type === "idle") {
+          if (status.type === "idle") {
             explicitResumeRequests.delete(sessionID);
             busySessions.delete(sessionID);
             nativeRetrySessions.delete(sessionID);
             clearTurnWatchdog(sessionID);
             watchdogRescuedSessions.delete(sessionID);
           }
-          if (status2.type === "retry") {
+          if (status.type === "retry") {
             nativeRetrySessions.add(sessionID);
             clearTurnWatchdog(sessionID);
             cancelScheduledContinuation(sessionID);
           }
-          taskTracker.observeSessionStatus(sessionID, status2.type);
+          taskTracker.observeSessionStatus(sessionID, status.type);
         }
       }
       if (sessionID && eventType === "session.idle") {
@@ -4196,7 +4387,9 @@ var server = async ({ client }, options) => {
             const attempt = pendingAttemptOf(goal);
             if (attempt != null) {
               const afterFailure = await recordContinuationResult(sessionID, "failure", maxPromptFailures, {
-                requirePending: true
+                requirePending: true,
+                expectedGoalID: goal.id,
+                expectedAttemptID: attempt.id
               });
               if (afterFailure)
                 locallyDeliveredPendingSessions.delete(sessionID);
@@ -4247,6 +4440,7 @@ function v2ErrorLog(message, error) {
   try {
     console.error(`[opencode-goal-plugin] ${message}:`, error instanceof Error ? error.message : String(error));
   } catch {}
+  reportPluginError(message, error);
 }
 async function setupV2(context) {
   const options = context.options ?? {};
@@ -4322,12 +4516,19 @@ async function setupV2(context) {
     }
   };
   const registrations = [];
+  async function registerSafely(what, register) {
+    try {
+      registrations.push(await register());
+    } catch (error) {
+      v2ErrorLog(`Failed to register ${what}`, error);
+    }
+  }
   let disposed = false;
   let eventConsumerStopped = false;
-  function stepKey(sessionID, messageID2) {
-    return `${sessionID}\x00${messageID2}`;
+  function stepKey(sessionID, messageID) {
+    return `${sessionID}\x00${messageID}`;
   }
-  async function sendContinuation2(sessionID, prompt, agent) {
+  async function sendContinuation(sessionID, prompt, agent) {
     markSessionOwnership(sessionID, true);
     await context.session.prompt({
       sessionID,
@@ -4400,7 +4601,7 @@ async function setupV2(context) {
       watchdogRescuedSessions.add(sessionID);
       if (!isCurrent())
         return;
-      await sendContinuation2(sessionID, continuationPrompt(current, locale), current.lastPromptAgent ?? latestStep?.agent ?? null);
+      await sendContinuation(sessionID, continuationPrompt(current, locale), current.lastPromptAgent ?? latestStep?.agent ?? null);
       if (!isCurrent())
         return;
       const delivered = await recordContinuationResult(sessionID, "success", maxPromptFailures, {
@@ -4610,7 +4811,7 @@ async function setupV2(context) {
       const goal = await reserveContinuation(sessionID, maxAutoTurns, minInterval);
       if (!goal) {
         const waiting = await getGoalInternal(sessionID);
-        if (waiting?.status === "active" && waiting.pendingAttempt == null && waiting.lastContinuationAt != null && minInterval > 0) {
+        if (waiting?.status === "active" && waiting.lastContinuationAt != null && minInterval > 0) {
           scheduleSettledContinuation(sessionID, continuationDelayFromSnapshot(minInterval, waiting.lastContinuationAt), scheduled != null);
         }
         return;
@@ -4629,7 +4830,7 @@ async function setupV2(context) {
         await rollbackContinuationAttempt(sessionID, { goalID: attemptGoalID, attemptID });
         return;
       }
-      await sendContinuation2(sessionID, goal.status === "active" ? continuationPrompt(goal, locale) : limitPrompt(goal, locale), goal.lastPromptAgent ?? latestTurnAgent ?? null);
+      await sendContinuation(sessionID, goal.status === "active" ? continuationPrompt(goal, locale) : limitPrompt(goal, locale), goal.lastPromptAgent ?? latestTurnAgent ?? null);
       if (!isCurrent()) {
         await rollbackContinuationAttempt(sessionID, { goalID: attemptGoalID, attemptID });
         return;
@@ -4752,9 +4953,9 @@ async function setupV2(context) {
       case "session.execution.started":
       case "session.retry.scheduled":
       case "session.status": {
-        const status2 = event.type === "session.execution.started" ? { type: "busy" } : event.type === "session.retry.scheduled" ? { type: "retry" } : data.status;
-        if (sessionID && isRecord(status2) && typeof status2.type === "string") {
-          if (status2.type === "busy") {
+        const status = event.type === "session.execution.started" ? { type: "busy" } : event.type === "session.retry.scheduled" ? { type: "retry" } : data.status;
+        if (sessionID && isRecord(status) && typeof status.type === "string") {
+          if (status.type === "busy") {
             stoppedExecutions.delete(sessionID);
             busySessions.add(sessionID);
             busyRevisions.set(sessionID, (busyRevisions.get(sessionID) ?? 0) + 1);
@@ -4762,20 +4963,20 @@ async function setupV2(context) {
             armTurnWatchdog(sessionID);
             await markPendingContinuationStarted(sessionID);
           }
-          if (status2.type === "idle") {
+          if (status.type === "idle") {
             explicitResumeRequests.delete(sessionID);
             busySessions.delete(sessionID);
             nativeRetrySessions.delete(sessionID);
             clearTurnWatchdog(sessionID);
             watchdogRescuedSessions.delete(sessionID);
           }
-          if (status2.type === "retry") {
+          if (status.type === "retry") {
             nativeRetrySessions.add(sessionID);
             clearTurnWatchdog(sessionID);
             cancelScheduledContinuation(sessionID);
           }
-          taskTracker.observeSessionStatus(sessionID, status2.type);
-          if (status2.type === "idle") {
+          taskTracker.observeSessionStatus(sessionID, status.type);
+          if (status.type === "idle") {
             const goal = await getGoalInternal(sessionID);
             if (autoContinue || goal?.pendingAttempt != null)
               await runAutoContinue(sessionID);
@@ -4837,7 +5038,9 @@ async function setupV2(context) {
             const attempt = pendingAttemptOf(goal);
             if (attempt != null) {
               const afterFailure = await recordContinuationResult(sessionID, "failure", maxPromptFailures, {
-                requirePending: true
+                requirePending: true,
+                expectedGoalID: goal.id,
+                expectedAttemptID: attempt.id
               });
               if (afterFailure)
                 locallyDeliveredPendingSessions.delete(sessionID);
@@ -4887,16 +5090,16 @@ async function setupV2(context) {
       case "session.step.started": {
         if (!sessionID || typeof data.assistantMessageID !== "string")
           return;
-        const messageID2 = data.assistantMessageID;
+        const messageID = data.assistantMessageID;
         const agent = typeof data.agent === "string" ? data.agent : undefined;
         if (agent)
           await recordPromptAgent(sessionID, agent);
         taskTracker.observeAssistantMessage(sessionID, {
-          info: { id: messageID2, role: "assistant", time: { completed: event.created } }
+          info: { id: messageID, role: "assistant", time: { completed: event.created } }
         });
-        if (!stepTextBuffers.has(stepKey(sessionID, messageID2)))
-          stepTextBuffers.set(stepKey(sessionID, messageID2), "");
-        latestStepBySession.set(sessionID, { messageID: messageID2, agent, text: "", outputTokens: null, completedAt: event.created });
+        if (!stepTextBuffers.has(stepKey(sessionID, messageID)))
+          stepTextBuffers.set(stepKey(sessionID, messageID), "");
+        latestStepBySession.set(sessionID, { messageID, agent, text: "", outputTokens: null, completedAt: event.created });
         return;
       }
       case "session.text.delta": {
@@ -4915,7 +5118,7 @@ async function setupV2(context) {
       case "session.step.ended": {
         if (!sessionID || typeof data.assistantMessageID !== "string")
           return;
-        const messageID2 = data.assistantMessageID;
+        const messageID = data.assistantMessageID;
         const tokens = tokensFromRecord(data.tokens);
         if (typeof tokens === "number") {
           const sum = (stepTokenSums.get(sessionID) ?? 0) + tokens;
@@ -4926,27 +5129,27 @@ async function setupV2(context) {
             initialBaseline: Math.ceil(sum - tokens)
           });
         }
-        const text2 = stepTextBuffers.get(stepKey(sessionID, messageID2)) ?? "";
-        stepTextBuffers.delete(stepKey(sessionID, messageID2));
+        const text = stepTextBuffers.get(stepKey(sessionID, messageID)) ?? "";
+        stepTextBuffers.delete(stepKey(sessionID, messageID));
         const outputTokens = outputTokensFromRecord(data.tokens) ?? null;
         const afterStep = await recordAssistantProgress(sessionID, {
-          messageID: messageID2,
-          text: text2,
+          messageID,
+          text,
           outputTokens,
           noProgressTokenThreshold: positiveIntegerOrNull2(options.no_progress_token_threshold),
           maxNoProgressTurns: positiveIntegerOrNull2(options.max_no_progress_turns),
           completedAt: event.created
         });
         await reconcileLocalMarkerAfterProgress(locallyDeliveredPendingSessions, sessionID, afterStep);
-        if (/[\p{L}\p{N}]/u.test(text2)) {
+        if (/[\p{L}\p{N}]/u.test(text)) {
           const scheduled = scheduledContinuations.get(sessionID);
           if (scheduled?.purpose === "recovery")
             cancelScheduledContinuation(sessionID);
         }
         latestStepBySession.set(sessionID, {
-          messageID: messageID2,
+          messageID,
           agent: latestStepBySession.get(sessionID)?.agent,
-          text: text2,
+          text,
           outputTokens,
           completedAt: event.created
         });
@@ -4955,7 +5158,7 @@ async function setupV2(context) {
       case "session.step.failed": {
         if (!sessionID || typeof data.assistantMessageID !== "string")
           return;
-        const messageID2 = data.assistantMessageID;
+        const messageID = data.assistantMessageID;
         const tokens = tokensFromRecord(data.tokens);
         if (typeof tokens === "number") {
           const sum = (stepTokenSums.get(sessionID) ?? 0) + tokens;
@@ -4966,27 +5169,27 @@ async function setupV2(context) {
             initialBaseline: Math.ceil(sum - tokens)
           });
         }
-        const text2 = stepTextBuffers.get(stepKey(sessionID, messageID2)) ?? "";
-        stepTextBuffers.delete(stepKey(sessionID, messageID2));
+        const text = stepTextBuffers.get(stepKey(sessionID, messageID)) ?? "";
+        stepTextBuffers.delete(stepKey(sessionID, messageID));
         const outputTokens = outputTokensFromRecord(data.tokens) ?? null;
         const afterStep = await recordAssistantProgress(sessionID, {
-          messageID: messageID2,
-          text: text2,
+          messageID,
+          text,
           outputTokens,
           noProgressTokenThreshold: positiveIntegerOrNull2(options.no_progress_token_threshold),
           maxNoProgressTurns: positiveIntegerOrNull2(options.max_no_progress_turns),
           completedAt: event.created
         });
         await reconcileLocalMarkerAfterProgress(locallyDeliveredPendingSessions, sessionID, afterStep);
-        if (/[\p{L}\p{N}]/u.test(text2)) {
+        if (/[\p{L}\p{N}]/u.test(text)) {
           const scheduled = scheduledContinuations.get(sessionID);
           if (scheduled?.purpose === "recovery")
             cancelScheduledContinuation(sessionID);
         }
         latestStepBySession.set(sessionID, {
-          messageID: messageID2,
+          messageID,
           agent: latestStepBySession.get(sessionID)?.agent,
-          text: text2,
+          text,
           outputTokens,
           completedAt: event.created
         });
@@ -5003,8 +5206,13 @@ async function setupV2(context) {
     }
   }
   if (registerCommand) {
-    const existingCommands = new Set((await context.command.list()).data.map((command) => command.name));
-    registrations.push(await context.command.transform((draft) => {
+    let existingCommands = new Set;
+    try {
+      existingCommands = new Set((await context.command.list()).data.map((command) => command.name));
+    } catch (error) {
+      v2ErrorLog("Failed to list the existing commands", error);
+    }
+    await registerSafely("the goal command", () => context.command.transform((draft) => {
       const claimedCommands = new Set(existingCommands);
       for (const command of goalCommandDefinitions(commandName, locale)) {
         if (claimedCommands.has(command.name))
@@ -5101,7 +5309,7 @@ async function setupV2(context) {
     }));
   }
   if (registerCommand) {
-    registrations.push(await context.session.hook("prompt", async (input) => {
+    await registerSafely("the prompt hook", () => context.session.hook("prompt", async (input) => {
       if (typeof input.sessionID === "string")
         markSessionOwnership(input.sessionID, true);
       explicitResumeRequests.delete(input.sessionID);
@@ -5128,7 +5336,7 @@ async function setupV2(context) {
   }
   try {
     const hookInterrupt = context.session.hook;
-    registrations.push(await hookInterrupt("interrupt", async ({ sessionID }) => {
+    await registerSafely("the interrupt hook", () => hookInterrupt("interrupt", async ({ sessionID }) => {
       markSessionOwnership(sessionID, true);
       goalServices.stopAutonomy?.(sessionID);
       try {
@@ -5138,11 +5346,11 @@ async function setupV2(context) {
       }
     }));
   } catch {}
-  registrations.push(await context.tool.transform((draft) => {
+  await registerSafely("the goal tools", () => context.tool.transform((draft) => {
     for (const tool of goalToolsV2(goalServices))
       draft.add(tool);
   }));
-  registrations.push(await context.tool.hook("execute.before", async (input) => {
+  await registerSafely("the execute.before hook", () => context.tool.hook("execute.before", async (input) => {
     taskTracker.noteTaskCall({ tool: input.tool, sessionID: input.sessionID, callID: input.id });
     const sessionID = typeof input.sessionID === "string" ? input.sessionID : undefined;
     if (sessionID)
@@ -5153,7 +5361,7 @@ async function setupV2(context) {
       toolAttempts.set(toolAttemptKey(sessionID, callID), goal?.pendingAttempt?.id ?? null);
     }
   }));
-  registrations.push(await context.tool.hook("execute.after", async (input) => {
+  await registerSafely("the execute.after hook", () => context.tool.hook("execute.after", async (input) => {
     const sessionID = typeof input.sessionID === "string" ? input.sessionID : undefined;
     const callID = typeof input.id === "string" ? input.id : undefined;
     const attemptKey = sessionID && callID ? toolAttemptKey(sessionID, callID) : undefined;
@@ -5167,7 +5375,7 @@ async function setupV2(context) {
       if (goal || input.tool === "clear_goal")
         input.result = { ...input.result, metadata: { ...input.result.metadata, ...acpPlanMetadata(goal) } };
     }
-    const text2 = textFromToolResult(input.result);
+    const text = textFromToolResult(input.result);
     taskTracker.noteTaskOutput({ tool: input.tool, sessionID: input.sessionID, callID: input.id }, { output: textFromToolResult(input.result) });
     if (!sessionID || typeof input.tool !== "string")
       return;
@@ -5175,14 +5383,14 @@ async function setupV2(context) {
       return;
     if (toolOutputFailed(input.result))
       return;
-    if (!text2)
+    if (!text)
       return;
     const before = await getGoalInternal(sessionID);
     const scheduled = scheduledContinuations.get(sessionID);
     const hasFailureEpisode = Boolean(before && (before.continuationFailures > 0 || before.pendingAttempt != null));
     if (!before || !hasFailureEpisode && scheduled?.purpose !== "recovery")
       return;
-    const progressed = await recordToolProgress(sessionID, text2, expectedAttemptID);
+    const progressed = await recordToolProgress(sessionID, text, expectedAttemptID);
     if (progressed?.continuationFailures === 0 && progressed.pendingAttempt == null) {
       locallyDeliveredPendingSessions.delete(sessionID);
       cancelScheduledContinuation(sessionID);
@@ -5194,12 +5402,12 @@ async function setupV2(context) {
       return;
     system.push({ type: "text", text: reminder });
   };
-  registrations.push(await context.session.hook("context", (sessionContext) => {
+  await registerSafely("the context hook", () => context.session.hook("context", (sessionContext) => {
     ensureSystemReminder(sessionContext.system);
   }));
   try {
     const hookCompaction = context.session.hook;
-    registrations.push(await hookCompaction("compaction", async (event) => {
+    await registerSafely("the compaction hook", () => hookCompaction("compaction", async (event) => {
       ensureSystemReminder(event.system);
       const goal = await getGoal(event.sessionID);
       if (!goal)
