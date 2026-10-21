@@ -28,12 +28,15 @@
   "license": "MIT",
   "author": "Prevalentware",
   "type": "module",
+  "main": "./dist/server.js",
   "exports": {
     "./server": {
-      "import": "./dist/server.js"
+      "import": "./dist/server.js",
+      "default": "./dist/server.js"
     },
     "./tui": {
-      "import": "./src/tui.ts"
+      "import": "./src/tui.ts",
+      "default": "./src/tui.ts"
     }
   },
   "files": [
@@ -57,7 +60,6 @@
     "prepublishOnly": "bun run test && bun run build"
   },
   "dependencies": {
-    "@opencode-ai/plugin": "^1.17.1",
     "zod": "^4.1.8",
     "effect-goal-state": "npm:effect@^3.21.2"
   },
@@ -65,8 +67,17 @@
     "@opentui/solid": ">=0.5.8",
     "solid-js": ">=1.9.0"
   },
+  "peerDependenciesMeta": {
+    "@opentui/solid": {
+      "optional": true
+    },
+    "solid-js": {
+      "optional": true
+    }
+  },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
+    "@opencode-ai/plugin": "^1.17.1",
     "@opencode/client": "2.0.30",
     "@opencode/plugin": "2.0.30",
     "@opencode/schema": "2.0.30",

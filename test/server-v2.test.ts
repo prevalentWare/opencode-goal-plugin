@@ -209,6 +209,29 @@ async function waitFor(predicate: () => boolean | Promise<boolean>, deadlineMs =
   expect(await predicate()).toBe(true)
 }
 
+// The plugin anchors a continuation to a whole-second timestamp, so a
+// configured minimum interval of N seconds may legitimately hold the
+// continuation for up to N + 1 seconds before it reaches the host run
+// boundary. A deadline that only covers N leaves no room for timer drift, and
+// the continuation tests failed intermittently on a loaded machine. The
+// deadline below covers the full window plus scheduling slack.
+const CONTINUATION_BOUNDARY_DEADLINE_MS = 5_000
+
+// Bun's default per-test timeout is 5 seconds. The continuation tests wait
+// for a minimum continuation interval and for the host run boundary, so their
+// legitimate timeline can exceed that default even when every assertion
+// holds. The timeout below covers the waits above without shortening them.
+const CONTINUATION_TEST_TIMEOUT_MS = 30_000
+
+async function waitForLong(predicate: () => boolean | Promise<boolean>, deadlineMs = 3000) {
+  const deadline = Date.now() + deadlineMs
+  while (Date.now() < deadline) {
+    if (await predicate()) return
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+  expect(await predicate()).toBe(true)
+}
+
 // A task-block re-arm is a TASK_BLOCK_RETRY_MS timer and nothing else: the V2 poll touches
 // no mock surface, so counting the timers is the only way to tell a stopped loop from a
 // running one. Swapping the global back in a finally keeps a failed assertion from leaking
@@ -1766,16 +1789,16 @@ test("V2 fast execution success schedules the next continuation after the minimu
   const idleBarrier = new Promise<void>((resolve) => { releaseWait = resolve })
   mock.session.wait = async () => { waiting = true; await idleBarrier }
   await mock.stream.push({ type: "session.execution.started", created: Date.now(), data: { sessionID: "ses_v2" } })
-  await waitFor(() => waiting, 2500)
+  await waitForLong(() => waiting, CONTINUATION_BOUNDARY_DEADLINE_MS)
   expect(mock.promptCalls).toHaveLength(1)
   await mock.stream.push({ type: "session.execution.succeeded", created: Date.now(), data: { sessionID: "ses_v2" } })
   releaseWait()
   mock.session.wait = async () => {}
-  await waitFor(() => mock.promptCalls.length === 2, 3000)
+  await waitForLong(() => mock.promptCalls.length === 2, CONTINUATION_BOUNDARY_DEADLINE_MS)
   expect((await getGoal("ses_v2"))!.lastContinuationAt! - first).toBeGreaterThanOrEqual(1)
   mock.stream.end()
   await cleanup()
-})
+}, CONTINUATION_TEST_TIMEOUT_MS)
 
 test("V2 timed continuation waits for a live run boundary even when busy events are missing", async () => {
   const mock = makeMockContext({ min_continue_interval_seconds: 1 })
@@ -1795,13 +1818,13 @@ test("V2 timed continuation waits for a live run boundary even when busy events 
   mock.session.wait = async () => { waiting = true; await idleBarrier }
   // No busy event is delivered for the next execution; only the host's live
   // wait barrier knows that another assistant step is still running.
-  await waitFor(() => waiting, 2500)
+  await waitForLong(() => waiting, CONTINUATION_BOUNDARY_DEADLINE_MS)
   expect(mock.promptCalls).toHaveLength(1)
   releaseWait()
-  await waitFor(() => mock.promptCalls.length === 2)
+  await waitForLong(() => mock.promptCalls.length === 2, CONTINUATION_BOUNDARY_DEADLINE_MS)
   mock.stream.end()
   await cleanup()
-})
+}, CONTINUATION_TEST_TIMEOUT_MS)
 
 test("V2 idle event triggers auto-continue via ctx.session.prompt", async () => {
   const mock = makeMockContext({ auto_continue: true, min_continue_interval_seconds: 0, max_auto_turns: 5 })
@@ -2509,7 +2532,12 @@ test("V2 watchdog rescues a busy active goal without consuming auto-turn budgets
 })
 
 test("V2 create_goal keeps the current busy-turn watchdog armed", async () => {
-  const mock = makeMockContext({ auto_continue: false, max_turn_time: 0.03 })
+  // The busy event arms the turn watchdog, and the goal is created while that
+  // window is already running. The window has to be wide enough for the goal
+  // to be written before the watchdog fires, or the rescue finds no goal and
+  // the test measures the speed of a state write rather than the behaviour it
+  // is about.
+  const mock = makeMockContext({ auto_continue: false, max_turn_time: 0.3 })
   const cleanup = await setupPlugin(mock as never)
 
   await mock.stream.push({
@@ -2893,4 +2921,34 @@ test("V2 a command transport abort preserves the active goal for reconnection", 
   controller.abort()
   await command
   expect((await getGoal("ses_v2"))?.status).toBe("active")
+})
+
+test("V2 a failing registration does not remove the plugin", async () => {
+  // A plugin that fails to register takes the whole location with it:
+  // OpenCode reports "Location plugins did not finish activating" and every
+  // command that needs the location fails. A single failing registration must
+  // degrade the plugin, not remove it.
+  const mock = makeMockContext({ auto_continue: false })
+  const failing = new Error("host refused the command list")
+  const context = {
+    ...mock,
+    command: {
+      ...mock.command,
+      list: async () => {
+        throw failing
+      },
+    },
+  }
+  // The setup completes instead of rejecting, and the registrations that do
+  // not depend on the failing read still happen.
+  const cleanup = await setupPlugin(context as never)
+
+  const registered = mock.tools.map((tool) => tool.name)
+  expect(registered).toContain("get_goal")
+  expect(registered).toContain("create_goal")
+  const commands = mock.commands.map((command) => command.name)
+  expect(commands).toContain("goal")
+
+  mock.stream.end()
+  await cleanup()
 })

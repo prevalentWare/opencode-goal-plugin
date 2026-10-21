@@ -1,0 +1,5 @@
+# The repository stores every text file with LF line endings. Pin that down so
+# the convention does not depend on the core.autocrlf setting of the machine
+# that happens to make the commit: without this, an editor that writes CRLF
+# rewrites a whole file and turns a small fix into a whole-file diff.
+* text=auto eol=lf
