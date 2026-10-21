@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, beforeEach, expect, test } from "bun:test"
 import { mkdtempSync, rmSync, unlinkSync } from "node:fs"
-import { rename, writeFile } from "node:fs/promises"
+import { writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import type { ResolvedTheme } from "@opencode/theme/tui"
@@ -17,6 +17,7 @@ import plugin, {
   setupTuiV2,
   themeColorV2,
 } from "../src/tui.ts"
+import { atomicWriteFile } from "../src/atomic-write"
 
 type GoalSnapshot = Parameters<typeof liveTimeUsedSeconds>[0]
 
@@ -26,9 +27,11 @@ const isolatedStatePath = join(isolatedStateDir, "goals.json")
 let hostTheme: ResolvedTheme | undefined
 
 async function writeGoalState(value: unknown) {
-  const temporary = `${isolatedStatePath}.tmp`
-  await writeFile(temporary, JSON.stringify(value))
-  await rename(temporary, isolatedStatePath)
+  // Use the production atomic writer: replacing an existing file with a
+  // rename fails with EPERM on Windows while another reader (the sidebar
+  // poller below) still holds the target open, and the writer retries that
+  // transient lock instead of failing the test.
+  await atomicWriteFile(isolatedStatePath, JSON.stringify(value))
 }
 
 beforeAll(async () => {
