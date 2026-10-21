@@ -175,11 +175,38 @@ export const defaultAtomicWriteOps: AtomicWriteOps = {
   sleep: defaultSleep,
 }
 
-/** Total rename attempts for transient Windows replacement errors. */
-export const RENAME_ATTEMPTS = 3
+/**
+ * Total rename attempts for transient Windows replacement errors.
+ *
+ * The budget has to cover how long Windows actually holds the target. A
+ * rename-over-existing fails with `EPERM`/`EACCES` while an antivirus
+ * scanner, a search indexer, or another process keeps the file open, and
+ * those locks routinely outlive a couple of hundred milliseconds. The old
+ * three-attempt budget (60ms of waiting in total) gave up while the lock
+ * was still held and surfaced `EPERM` to the caller, which turned a
+ * transient Windows file lock into a failed goal state write.
+ */
+export const RENAME_ATTEMPTS = 10
 
-/** Base backoff between rename retries (multiplied by the attempt number). */
+/** Base backoff between rename retries (doubled per attempt). */
 export const RENAME_RETRY_DELAY_MS = 20
+
+/** Upper bound for a single rename retry backoff. */
+export const RENAME_RETRY_MAX_DELAY_MS = 500
+
+/**
+ * Backoff before the next rename attempt.
+ *
+ * Exponential so a briefly-locked target is retried quickly, capped so a
+ * target that stays locked cannot block the caller indefinitely. The full
+ * budget (10 attempts) waits roughly 2.6 seconds in the worst case, which
+ * covers the multi-second locks observed on Windows hosts while keeping
+ * the common (uncontended) path at a single rename.
+ */
+export function renameRetryDelayMs(attempt: number) {
+  const exponential = RENAME_RETRY_DELAY_MS * 2 ** Math.max(0, attempt - 1)
+  return Math.min(RENAME_RETRY_MAX_DELAY_MS, exponential)
+}
 
 async function renameWithRetry(ops: AtomicWriteOps, from: string, to: string): Promise<void> {
   let attempt = 0
@@ -192,8 +219,7 @@ async function renameWithRetry(ops: AtomicWriteOps, from: string, to: string): P
       // A non-transient error fails immediately; transient errors get a small,
       // bounded number of attempts (renaming over a briefly-locked target).
       if (!isTransientRenameError(error, ops.platform) || attempt >= RENAME_ATTEMPTS) throw error
-      const delay = RENAME_RETRY_DELAY_MS * attempt
-      await ops.sleep(delay)
+      await ops.sleep(renameRetryDelayMs(attempt))
     }
   }
 }

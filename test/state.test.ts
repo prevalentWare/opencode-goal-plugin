@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, expect, setSystemTime, spyOn, test } from "bun:test"
+import { readFileSync } from "node:fs"
 import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
@@ -41,6 +42,34 @@ beforeEach(async () => {
 afterEach(async () => {
   delete process.env.OPENCODE_GOAL_STATE_PATH
   await rm(dir, { recursive: true, force: true })
+})
+
+test("state writes stay atomic: the file is always complete JSON and no temp file is left behind", async () => {
+  const file = process.env.OPENCODE_GOAL_STATE_PATH!
+  await createGoal("ses_1", "atomic state", null)
+  await accountUsage("ses_1", 10)
+
+  // The state file is replaced through a same-directory temp file and a
+  // rename, so a concurrent reader never observes a partially written
+  // document: the file on disk is always the old or the new valid version.
+  expect(() => JSON.parse(readFileSync(file, "utf8"))).not.toThrow()
+  expect(JSON.parse(readFileSync(file, "utf8")).goals.ses_1.objective).toBe("atomic state")
+  // The writer cleans up after itself: no orphaned temp file survives.
+  expect((await readdir(dir)).filter((name) => name.endsWith(".tmp"))).toEqual([])
+})
+
+test("an orphaned temp file from a crashed writer does not corrupt the recovered state", async () => {
+  const file = process.env.OPENCODE_GOAL_STATE_PATH!
+  await createGoal("ses_1", "survive a crashed writer", null)
+
+  // A writer killed between creating the temp file and renaming it leaves the
+  // temp file behind. That leftover must never be mistaken for the state.
+  await writeFile(`${file}.11111111-2222-3333-4444-555555555555.tmp`, "{}", "utf8")
+  await accountUsage("ses_1", 5)
+
+  const goal = await getGoal("ses_1")
+  expect(goal?.objective).toBe("survive a crashed writer")
+  expect(goal?.tokensUsed).toBe(5)
 })
 
 test("creates, reads, pauses, resumes, completes, and clears a goal", async () => {
