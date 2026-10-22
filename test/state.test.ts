@@ -5,10 +5,12 @@ import { tmpdir } from "node:os"
 import {
   accountUsage,
   cancelGoal,
+  cancelShellNotification,
   cancelActiveGoal,
   clearGoal,
   completeGoal,
   createGoal,
+  deferGoalUntilShell,
   DEFAULT_MAX_OBJECTIVE_CHARS,
   getAllGoals,
   markPendingContinuationStarted,
@@ -18,11 +20,16 @@ import {
   getGoalInternal,
   getGoalSync,
   markGoalUnmet,
+  noteShellNotification,
+  noteShellNotificationDelivered,
   pauseGoalForPlanMode,
   recordContinuationResult,
   recordPromptAgent,
   recordToolProgress,
+  reconcileShellDeferralsForHost,
   reserveContinuation,
+  releaseDeliveredShellDeferrals,
+  releaseShellDeferral,
   replaceGoal,
   rollbackContinuationAttempt,
   setGoalStatus,
@@ -60,6 +67,81 @@ test("creates, reads, pauses, resumes, completes, and clears a goal", async () =
   expect(completed.completionEvidence).toBe("tests passed")
   expect(await clearGoal("ses_1")).toBe(true)
   expect(await getGoal("ses_1")).toBeNull()
+})
+
+test("Shell deferral survives state reload and clears only after its notification is delivered", async () => {
+  await createGoal("ses_shell", "wait for test output")
+  await deferGoalUntilShell("ses_shell", "sh_tests")
+  expect((await getGoalInternal("ses_shell"))?.shellDeferrals).toMatchObject([
+    { shellID: "sh_tests", notificationID: null, delivered: false, hostPID: process.pid },
+  ])
+  expect(await getGoal("ses_shell")).not.toHaveProperty("shellDeferrals")
+  expect((await getGoal("ses_shell"))?.waitingForShellIDs).toEqual(["sh_tests"])
+  expect(await releaseDeliveredShellDeferrals("ses_shell")).toBe(false)
+  expect(await noteShellNotification("ses_shell", "sh_tests", "msg_tests")).toBe(true)
+  expect(await releaseDeliveredShellDeferrals("ses_shell")).toBe(false)
+  expect(await noteShellNotificationDelivered("ses_shell", "msg_tests")).toBe(true)
+  expect(await releaseDeliveredShellDeferrals("ses_shell")).toBe(true)
+  expect((await getGoalInternal("ses_shell"))?.shellDeferrals).toEqual([])
+  expect((await getGoal("ses_shell"))?.waitingForShellIDs).toEqual([])
+})
+
+test("cancelled notifications and explicit release cannot leave a Shell wait stuck", async () => {
+  await createGoal("ses_shell", "wait for tests")
+  await deferGoalUntilShell("ses_shell", "sh_cancelled")
+  await deferGoalUntilShell("ses_shell", "sh_lost")
+  await noteShellNotification("ses_shell", "sh_cancelled", "msg_cancelled")
+  expect(await cancelShellNotification("ses_shell", "msg_cancelled")).toBe(true)
+  expect((await getGoal("ses_shell"))?.waitingForShellIDs).toEqual(["sh_lost"])
+  expect(await releaseShellDeferral("ses_shell", "sh_lost")).toBe(true)
+  expect((await getGoal("ses_shell"))?.waitingForShellIDs).toEqual([])
+  expect(await releaseShellDeferral("ses_shell", "sh_unknown")).toBe(false)
+})
+
+test("pausing or resuming a goal clears a stale Shell wait", async () => {
+  await createGoal("ses_shell", "wait for tests")
+  await deferGoalUntilShell("ses_shell", "sh_tests")
+  await setGoalStatus("ses_shell", "paused")
+  expect((await getGoal("ses_shell"))?.waitingForShellIDs).toEqual([])
+  await setGoalStatus("ses_shell", "active")
+  expect((await getGoal("ses_shell"))?.waitingForShellIDs).toEqual([])
+})
+
+test("a changed host process clears persisted Shell waits without a timeout", async () => {
+  await createGoal("ses_shell", "wait for tests")
+  await deferGoalUntilShell("ses_shell", "sh_old_host")
+  const stateFile = process.env.OPENCODE_GOAL_STATE_PATH!
+  const saved = JSON.parse(await readFile(stateFile, "utf8")) as { goals: Record<string, { shellDeferrals: Array<{ hostPID: number; hostStartedAt: number }> }> }
+  saved.goals.ses_shell!.shellDeferrals[0]!.hostStartedAt = 0
+  await writeFile(stateFile, JSON.stringify(saved))
+  expect(await reconcileShellDeferralsForHost("ses_shell")).toBe(true)
+  expect((await getGoal("ses_shell"))?.waitingForShellIDs).toEqual([])
+  expect((await getGoal("ses_shell"))?.lastStatus).toContain("host process restarted")
+})
+
+test("a wait owned by another live process remains deferred", async () => {
+  await createGoal("ses_shell", "wait for tests")
+  await deferGoalUntilShell("ses_shell", "sh_live_elsewhere")
+  const stateFile = process.env.OPENCODE_GOAL_STATE_PATH!
+  const saved = JSON.parse(await readFile(stateFile, "utf8")) as { goals: Record<string, { shellDeferrals: Array<{ hostPID: number }> }> }
+  saved.goals.ses_shell!.shellDeferrals[0]!.hostPID = process.ppid
+  await writeFile(stateFile, JSON.stringify(saved))
+  expect(await reconcileShellDeferralsForHost("ses_shell")).toBe(false)
+  expect((await getGoal("ses_shell"))?.waitingForShellIDs).toEqual(["sh_live_elsewhere"])
+})
+
+test("a Shell wait blocks atomic continuation reservation and progress accounting", async () => {
+  await createGoal("ses_shell", "wait for tests")
+  await deferGoalUntilShell("ses_shell", "sh_tests")
+  expect(await reserveContinuation("ses_shell", 10, 0)).toBeNull()
+  const before = await getGoal("ses_shell")
+  await recordAssistantProgress("ses_shell", {
+    messageID: "msg_wait", text: "Waiting for tests", outputTokens: 1,
+    evaluateContinuation: true,
+  })
+  const after = await getGoal("ses_shell")
+  expect(after?.autoTurns).toBe(before?.autoTurns)
+  expect(after?.noProgressTurns).toBe(before?.noProgressTurns)
 })
 
 test("cancels, clears, and replaces goals while preserving per-session history", async () => {

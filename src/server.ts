@@ -11,14 +11,18 @@ import {
   cancelGoal,
   cancelActiveGoal,
   clearGoal,
+  cancelShellNotification,
   completeGoal,
   createGoal,
+  deferGoalUntilShell,
   estimateTokensFromText,
   getAllGoals,
   getGoal,
   getGoalHistory,
   getGoalInternal,
   markGoalUnmet,
+  noteShellNotification,
+  noteShellNotificationDelivered,
   onStateRecovery,
   pauseGoalForPlanMode,
   PLAN_MODE_STOP_REASON,
@@ -26,8 +30,11 @@ import {
   recordContinuationResult,
   recordPromptAgent,
   recordToolProgress,
+  reconcileShellDeferralsForHost,
   markPendingContinuationStarted,
   reserveContinuation,
+  releaseDeliveredShellDeferrals,
+  releaseShellDeferral,
   replaceGoal,
   rollbackContinuationAttempt,
   setGoalStatus,
@@ -96,7 +103,7 @@ const RETRY_SETTLE_MS = 25
 const TRANSPORT_ERROR_PATTERN =
   /\b(?:network|fetch|socket|connect|connection|timeout|timed out|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|EPIPE|transport|stream|websocket|offline|internet|request failed|proxy)\b/i
 const NON_TRANSPORT_TERMINAL_PATTERN = /\b(?:abort(?:ed)?|interrupt(?:ed|ion)?)\b/i
-const NON_PROGRESS_TOOLS = new Set(["get_goal", "get_goal_history", "list_all_goals"])
+const NON_PROGRESS_TOOLS = new Set(["get_goal", "get_goal_history", "list_all_goals", "defer_goal_until_shell", "release_goal_shell_deferral"])
 const TASK_TERMINAL_STATES = new Set<TaskState>(["completed", "error", "cancelled"])
 const activeContinuations = new Set<string>()
 
@@ -1246,6 +1253,7 @@ type GoalServices = {
   initializeUsage?: (sessionID: string) => Promise<void>
   stopAutonomy?: (sessionID: string, mode?: "stop" | "replace") => void
   consumeObjectiveEdit?: (sessionID: string, objective: string) => { goalID: string; objective: string } | undefined
+  deferUntilShell?: (sessionID: string, shellID: string) => Promise<void>
 }
 
 function boundedGoalTextSchema(limit: number, description: string, validate: (value: string) => string) {
@@ -2445,12 +2453,20 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
   const latestStepBySession = new Map<string, V2StepRecord>()
   const stepTextBuffers = new Map<string, string>()
   const stepTokenSums = new Map<string, number>()
+  const runningShells = new Map<string, Set<string>>()
+  const seenShellNotifications = new Map<string, Map<string, string>>()
   const goalServices: GoalServices = {
     options,
     locale,
     messages,
     maxObjectiveChars: objectiveChars,
     isPlanAgent,
+    deferUntilShell: async (sessionID, shellID) => {
+      if (!runningShells.get(sessionID)?.has(shellID) || seenShellNotifications.get(sessionID)?.has(shellID)) {
+        throw new Error("Shell ID is not a running background Shell result in this session")
+      }
+      await deferGoalUntilShell(sessionID, shellID)
+    },
     consumeAutoTurnReset: (sessionID) => explicitResumeRequests.delete(sessionID),
     consumeObjectiveEdit: (sessionID, objective) => {
       const edit = objectiveEdits.get(sessionID)
@@ -2540,9 +2556,10 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       const taskStatus = taskBlockStatus(sessionID)
       if (turnWatchdogs.get(sessionID) !== watchdog || !busySessions.has(sessionID)) return
       if (taskStatus && taskStatus.blocked) return
+      await reconcileShellDeferralsForHost(sessionID)
       const current = await getGoalInternal(sessionID)
       if (turnWatchdogs.get(sessionID) !== watchdog || !busySessions.has(sessionID)) return
-      if (current?.status !== "active" || isPlanAgent(current.lastPromptAgent) || activeContinuationsV2.has(sessionID)) return
+      if (current?.status !== "active" || current.shellDeferrals.some((item) => !item.delivered) || isPlanAgent(current.lastPromptAgent) || activeContinuationsV2.has(sessionID)) return
 
       turnWatchdogs.delete(sessionID)
       activeContinuationsV2.add(sessionID)
@@ -2657,6 +2674,12 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
     let attemptGoalID: string | undefined
     let attemptID: string | undefined
     try {
+      // An explicit Shell deferral waits for the native completion message to
+      // finish its own execution. Do not reserve a turn or evaluate no-progress
+      // while the Shell result is still pending.
+      await reconcileShellDeferralsForHost(sessionID)
+      const deferredGoal = await getGoalInternal(sessionID)
+      if (!isCurrent() || (deferredGoal?.status === "active" && deferredGoal.shellDeferrals.some((item) => !item.delivered))) return
       // A completed assistant step is not an execution boundary. Timer wake-ups
       // run outside the event consumer and wait for the host's actual idle
       // barrier. An idle event has already reached that boundary; waiting in
@@ -2676,6 +2699,8 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
         // a newer busy event may represent another execution and must win.
         if ((busyRevisions.get(sessionID) ?? 0) === busyRevision) busySessions.delete(sessionID)
       }
+      const afterWait = await getGoalInternal(sessionID)
+      if (!isCurrent() || afterWait?.shellDeferrals.some((item) => !item.delivered)) return
       if (!isCurrent() || stoppedExecutions.has(sessionID)) return
       if (busySessions.has(sessionID)) {
         await rearmBusyContinuation(sessionID, scheduled)
@@ -2973,6 +2998,42 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       return
     }
     switch (event.type) {
+      case "session.inbox.enqueued": {
+        if (!sessionID || typeof data.inboxID !== "string") return
+        const item = data.item
+        if (!isRecord(item) || item.type !== "synthetic" || !isRecord(item.payload)) return
+        const metadata = item.payload.metadata
+        if (!isRecord(metadata) || metadata.source !== "shell" || typeof metadata.shellID !== "string") return
+        const seen = seenShellNotifications.get(sessionID) ?? new Map<string, string>()
+        seen.set(metadata.shellID, data.inboxID)
+        seenShellNotifications.set(sessionID, seen)
+        runningShells.get(sessionID)?.delete(metadata.shellID)
+        // Queue this mutation even if a concurrent defer tool has not finished
+        // writing. The state mutation queue preserves their order.
+        await noteShellNotification(sessionID, metadata.shellID, data.inboxID)
+        return
+      }
+      case "session.inbox.delivered": {
+        if (sessionID && typeof data.inboxID === "string") {
+          const goal = await getGoalInternal(sessionID)
+          if (goal?.shellDeferrals.some((item) => item.notificationID === data.inboxID)) {
+            await noteShellNotificationDelivered(sessionID, data.inboxID)
+          }
+        }
+        return
+      }
+      case "session.inbox.cancelled": {
+        if (sessionID && typeof data.inboxID === "string") {
+          const cancelled = await cancelShellNotification(sessionID, data.inboxID)
+          if (cancelled && autoContinue && !stoppedExecutions.has(sessionID)) {
+            const goal = await getGoalInternal(sessionID)
+            if (goal?.status === "active" && !goal.shellDeferrals.some((item) => !item.delivered)) {
+              scheduleSettledContinuation(sessionID)
+            }
+          }
+        }
+        return
+      }
       case "session.created": {
         const parentID = data.parentID
         if (sessionID && typeof parentID === "string") {
@@ -3023,6 +3084,12 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       // individual step completions may still be followed by tool/model work.
       case "session.execution.succeeded":
       case "session.idle": {
+        if (sessionID && event.type === "session.execution.succeeded") {
+          const goal = await getGoalInternal(sessionID)
+          if (goal?.shellDeferrals.some((item) => item.delivered)) {
+            await releaseDeliveredShellDeferrals(sessionID)
+          }
+        }
         if (sessionID) {
           explicitResumeRequests.delete(sessionID)
           busySessions.delete(sessionID)
@@ -3041,6 +3108,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       }
       case "session.execution.interrupted": {
         if (!sessionID) return
+        await releaseDeliveredShellDeferrals(sessionID)
         explicitResumeRequests.delete(sessionID)
         stoppedExecutions.add(sessionID)
         busySessions.delete(sessionID)
@@ -3055,6 +3123,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       }
       case "session.execution.failed": {
         if (!sessionID) return
+        await releaseDeliveredShellDeferrals(sessionID)
         explicitResumeRequests.delete(sessionID)
         // execution.failed is emitted only after the host's retry episode has
         // ended, so the failure can still recover.
@@ -3118,6 +3187,8 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
         scheduledContinuations.delete(sessionID)
         taskDeferredSessions.delete(sessionID)
         clearToolAttemptsForSession(toolAttempts, sessionID)
+        runningShells.delete(sessionID)
+        seenShellNotifications.delete(sessionID)
         taskTracker.observeSessionDeleted(sessionID)
         latestStepBySession.delete(sessionID)
         stepTokenSums.delete(sessionID)
@@ -3434,6 +3505,14 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       const expectedAttemptID = attemptKey ? toolAttempts.get(attemptKey) : undefined
       if (attemptKey) toolAttempts.delete(attemptKey)
       if (input.status !== "completed") return
+      if (sessionID && input.tool === "shell" && isRecord(input.result)) {
+        const metadata = input.result.metadata
+        if (isRecord(metadata) && metadata.status === "running" && typeof metadata.shellID === "string" && !seenShellNotifications.get(sessionID)?.has(metadata.shellID)) {
+          const shells = runningShells.get(sessionID) ?? new Set<string>()
+          shells.add(metadata.shellID)
+          runningShells.set(sessionID, shells)
+        }
+      }
       if (sessionID && GOAL_PLAN_TOOLS.has(input.tool)) {
         const goal = await getGoal(sessionID)
         if (goal || input.tool === "clear_goal") input.result = { ...input.result, metadata: { ...input.result.metadata, ...acpPlanMetadata(goal) } }
@@ -3464,7 +3543,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
     }),
   )
 
-  const reminder = systemReminder(locale)
+  const reminder = systemReminder(locale, true)
   const ensureSystemReminder = (system: Array<{ type: string; text: string }>) => {
     if (system.some((part) => part.type === "text" && part.text.includes(reminder))) return
     system.push({ type: "text", text: reminder })
@@ -3515,6 +3594,8 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       if (isClosedGoal(item)) continue
       try {
         if (!(await ownsSession(item.sessionID))) continue
+        const clearedShellWait = await reconcileShellDeferralsForHost(item.sessionID)
+        if (clearedShellWait && autoContinue) scheduleSettledContinuation(item.sessionID, 0, false, "recovery")
         const transcript = await context.session.context({ sessionID: item.sessionID })
         if (disposed) return
         taskTracker.recoverFromTranscript(item.sessionID, transcript)
@@ -3576,6 +3657,35 @@ function goalToolsV2(services: GoalServices): ToolV2Info[] {
   const messages = services.messages
   return [
     {
+      name: "defer_goal_until_shell",
+      description: services.locale === "zh-CN"
+        ? "仅当当前目标必须等待后台 Shell 的最终结果时，传入其返回的 shell ID。原生完成通知处理完毕前不会自动继续；持久服务无需调用。"
+        : "Defer goal auto-continuation only when the goal needs a background Shell's final result. Pass the shell ID returned by Shell, including a command moved to the background in the TUI. Native completion will resume the session; persistent services need no deferral.",
+      input: v2ObjectSchema({
+        shell_id: { type: "string", minLength: 1, description: "Shell ID from the running background Shell result" },
+      }, ["shell_id"]),
+      options: { codemode: false },
+      execute: async (args, context) => {
+        if (!services.deferUntilShell) throw new Error("Shell deferral is unavailable")
+        const shellID = (args as { shell_id: string }).shell_id
+        await services.deferUntilShell(context.sessionID, shellID)
+        return { content: JSON.stringify({ deferred: true, shell_id: shellID }) }
+      },
+    },
+    {
+      name: "release_goal_shell_deferral",
+      description: "Explicitly stop waiting for a Shell result when its native notification was cancelled or lost. The goal may then auto-continue at its next execution boundary.",
+      input: v2ObjectSchema({
+        shell_id: { type: "string", minLength: 1, description: "Shell ID currently shown in waitingForShellIDs by get_goal" },
+      }, ["shell_id"]),
+      options: { codemode: false },
+      execute: async (args, context) => {
+        const shellID = (args as { shell_id: string }).shell_id
+        if (!await releaseShellDeferral(context.sessionID, shellID)) throw new Error("No matching Shell deferral for this goal")
+        return { content: JSON.stringify({ released: true, shell_id: shellID }) }
+      },
+    },
+    {
       name: "update_goal_plan",
       description: planToolDescription(services.locale),
       input: planToolInput(),
@@ -3594,9 +3704,10 @@ function goalToolsV2(services: GoalServices): ToolV2Info[] {
         },
       }),
       options: { codemode: false },
-      execute: async (args, toolContext) => ({
-        content: await getGoalToolResult(await getGoal(toolContext.sessionID), messages, goalViewSchema.parse(args?.view)),
-      }),
+      execute: async (args, toolContext) => {
+        await reconcileShellDeferralsForHost(toolContext.sessionID)
+        return { content: await getGoalToolResult(await getGoal(toolContext.sessionID), messages, goalViewSchema.parse(args?.view)) }
+      },
     },
     {
       name: "get_goal_history",
