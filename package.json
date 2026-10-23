@@ -58,8 +58,11 @@
   },
   "dependencies": {
     "@opencode-ai/plugin": "^1.17.1",
-    "zod": "^4.1.8",
+    "zod": "^4.6.7",
     "effect-goal-state": "npm:effect@^3.21.2"
+  },
+  "overrides": {
+    "zod": "^4.6.7"
   },
   "peerDependencies": {
     "@opentui/solid": ">=0.5.8",
