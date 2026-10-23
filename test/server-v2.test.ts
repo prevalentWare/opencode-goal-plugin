@@ -940,25 +940,28 @@ test("V2 update_goal_plan input is provider-safe JSON Schema", async () => {
     "revisit_evidence",
   ])
   expect(root.required?.sort()).toEqual(["expected_revision", "goal_id", "reason"])
+  type OperationBranch = {
+    required?: string[]
+    additionalProperties?: boolean
+    properties?: { op?: { const?: string } }
+  }
   const ops = root.properties?.plan_ops as {
     type?: string
     minItems?: number
     maxItems?: number
     items?: {
-      anyOf?: Array<{
-        required?: string[]
-        additionalProperties?: boolean
-        properties?: { op?: { const?: string } }
-      }>
+      anyOf?: OperationBranch[]
+      oneOf?: OperationBranch[]
     }
   }
   expect(ops).toMatchObject({ type: "array", minItems: 1, maxItems: 32 })
-  expect(ops.items?.anyOf?.map((branch) => [branch.properties?.op?.const, branch.required])).toEqual([
+  const branches = ops.items?.oneOf ?? ops.items?.anyOf
+  expect(branches?.map((branch) => [branch.properties?.op?.const, branch.required])).toEqual([
     ["set_phase", ["op", "phase_id"]],
     ["set_task", ["op", "task_id"]],
     ["append_decision", ["op", "decision"]],
   ])
-  expect(ops.items?.anyOf?.every((branch) => branch.additionalProperties === false)).toBe(true)
+  expect(branches?.every((branch) => branch.additionalProperties === false)).toBe(true)
 })
 
 test("V2 update_goal_plan registrations do not share a mutable input schema", async () => {
