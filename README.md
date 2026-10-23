@@ -218,6 +218,8 @@ You can also ask the agent to formulate the objective and call `set_goal` itself
 
 When writing the objective, include the scope, non-goals, and verification path when they matter. The agent is reminded to audit real files, command output, tests, or PR state before closing the goal.
 
+On OpenCode V2, when a goal needs the final result of a background Shell command, the agent calls `defer_goal_until_shell` with the `shell_id` returned by Shell. This works for a command started with `background: true` and for one moved to the background in the TUI. The deferral survives a plugin reload in the same host process and holds auto-continuation without consuming an auto-turn or no-progress count. OpenCode's native Shell completion notification resumes the agent; after that notification is processed, Goal continuation is reconsidered. Leave persistent services such as development servers unmarked so the goal can continue while they run. The tool requires a running Shell result observed in the current plugin instance; if that result was emitted before a plugin reload, it cannot establish a new deferral from the old ID. `get_goal` shows pending IDs as `waitingForShellIDs`. A host process restart clears waits from the previous process and schedules a reassessment. If a notification is lost within the same process, the agent can call `release_goal_shell_deferral(shell_id)` after confirming that Shell is no longer running; pausing the goal also clears pending Shell waits.
+
 The `update_goal` tool can close a goal in two ways:
 
 - `status: "complete"` with `evidence` when every requirement is actually achieved.
