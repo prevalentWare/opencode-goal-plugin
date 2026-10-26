@@ -67,6 +67,7 @@ type Options = {
   restricted_agents?: string[]
   allow_goal_execution_from_plan?: boolean
   max_objective_chars?: number
+  wait_for_command?: boolean
 }
 
 type CreateGoalArgs = {
@@ -374,6 +375,11 @@ function commandNameFromOptions(options?: Options) {
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name)) return DEFAULT_COMMAND_NAME
   if (name.toLowerCase() === "pause_goal" || name.toLowerCase() === "resume_goal") return DEFAULT_COMMAND_NAME
   return name
+}
+
+function shouldHoldCommandExecution(options?: Options) {
+  if (typeof options?.wait_for_command === "boolean") return options.wait_for_command
+  return process.env.OPENCODE_CLIENT === "acp"
 }
 
 function positiveIntegerOrNull(value: unknown) {
@@ -3415,9 +3421,11 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
                   delivery: input.delivery,
                 })
                 admitted = true
-                // A goal command owns all its automatic execution cycles.
-                // Older hosts without wait retain admission-only behavior.
-                if (pursue && typeof context.session.wait === "function") {
+                // On ACP hosts (or when explicitly enabled via wait_for_command), a goal command
+                // holds its RPC open across automatic execution cycles so ACP keeps streaming.
+                // Desktop/Web/TUI hosts return after prompt admission to avoid the 60s HTTP
+                // request-headers timeout on POST /api/session/:sessionID/command.
+                if (pursue && shouldHoldCommandExecution(options) && typeof context.session.wait === "function") {
                   let pursuedGoalID: string | undefined
                   do {
                     await context.session.wait({ sessionID: input.sessionID }, { signal })

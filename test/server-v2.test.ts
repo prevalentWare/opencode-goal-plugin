@@ -289,11 +289,13 @@ async function setupPlugin(...args: Parameters<typeof plugin.setup>) {
 beforeEach(async () => {
   dir = await mkdtemp(join(tmpdir(), "opencode-goal-plugin-v2-"))
   process.env.OPENCODE_GOAL_STATE_PATH = join(dir, "goals.json")
+  process.env.OPENCODE_CLIENT = "acp"
 })
 
 afterEach(async () => {
   for (const dispose of setupDisposers.splice(0).reverse()) await dispose()
   delete process.env.OPENCODE_GOAL_STATE_PATH
+  delete process.env.OPENCODE_CLIENT
   await rm(dir, { recursive: true, force: true })
 })
 
@@ -3299,3 +3301,30 @@ test("V2 a command transport abort preserves the active goal for reconnection", 
   await command
   expect((await getGoal("ses_v2"))?.status).toBe("active")
 })
+
+test("V2 /goal returns immediately after prompt admission on Desktop and non-ACP hosts unless wait_for_command is enabled", async () => {
+  for (const clientEnv of ["desktop", undefined] as const) {
+    if (clientEnv === undefined) delete process.env.OPENCODE_CLIENT
+    else process.env.OPENCODE_CLIENT = clientEnv
+    const mock = makeMockContext()
+    let waits = 0
+    const context = {
+      ...mock,
+      session: {
+        ...mock.session,
+        wait: async () => {
+          waits++
+          await new Promise<void>(() => {})
+        },
+      },
+    }
+    const cleanup = await setupPlugin(context as never)
+    await mock.commands
+      .find((command) => command.name === "goal")!
+      .execute({ sessionID: "ses_v2", prompt: { text: "Run multi-minute desktop goal" }, delivery: "steer" })
+    expect(mock.promptCalls).toHaveLength(1)
+    expect(waits).toBe(0)
+    await cleanup()
+  }
+})
+
