@@ -50,6 +50,31 @@ afterEach(async () => {
   await rm(dir, { recursive: true, force: true })
 })
 
+test("state writes persist complete JSON and clean their temporary files", async () => {
+  const file = process.env.OPENCODE_GOAL_STATE_PATH!
+  await createGoal("ses_1", "atomic state", null)
+  await accountUsage("ses_1", 10)
+
+  expect(JSON.parse(await readFile(file, "utf8"))).toMatchObject({
+    goals: { ses_1: { objective: "atomic state", tokensUsed: 10 } },
+  })
+  expect((await readdir(dir)).filter((name) => name.endsWith(".tmp"))).toEqual([])
+})
+
+test("an orphaned temp file from a crashed writer does not corrupt the recovered state", async () => {
+  const file = process.env.OPENCODE_GOAL_STATE_PATH!
+  await createGoal("ses_1", "survive a crashed writer", null)
+
+  // A writer killed between creating the temp file and renaming it leaves the
+  // temp file behind. That leftover must never be mistaken for the state.
+  await writeFile(`${file}.11111111-2222-3333-4444-555555555555.tmp`, "{}", "utf8")
+  await accountUsage("ses_1", 5)
+
+  const goal = await getGoal("ses_1")
+  expect(goal?.objective).toBe("survive a crashed writer")
+  expect(goal?.tokensUsed).toBe(5)
+})
+
 test("creates, reads, pauses, resumes, completes, and clears a goal", async () => {
   const created = await createGoal("ses_1", "ship the plugin", 100)
   expect(created.status).toBe("active")
@@ -67,6 +92,48 @@ test("creates, reads, pauses, resumes, completes, and clears a goal", async () =
   expect(completed.completionEvidence).toBe("tests passed")
   expect(await clearGoal("ses_1")).toBe(true)
   expect(await getGoal("ses_1")).toBeNull()
+})
+
+test("an awaiting-user pause persists the request without closing or auto-continuing the goal", async () => {
+  await createGoal("ses_wait", "submit the form")
+  const paused = await setGoalStatus("ses_wait", "paused", "build", { awaitingUserBlocker: "User must finish browser login" })
+  expect(paused).toMatchObject({ status: "paused", stopReason: "awaiting user", blocker: "User must finish browser login", closedAt: null })
+  expect(await reserveContinuation("ses_wait", 10, 0)).toBeNull()
+  expect(await getGoal("ses_wait")).toMatchObject({ status: "paused", stopReason: "awaiting user" })
+  expect(await setGoalStatus("ses_wait", "active")).toMatchObject({ status: "active", stopReason: null, blocker: null })
+})
+
+test("only a user-interrupted goal can be explicitly reopened", async () => {
+  await createGoal("ses_interrupt", "continue after steering")
+  const interrupted = await cancelActiveGoal("ses_interrupt")
+  expect(interrupted).toMatchObject({ status: "cancelled", stopReason: "interrupted", closedAt: expect.any(Number) })
+  await expect(setGoalStatus("ses_interrupt", "active")).rejects.toThrow("goal is closed")
+  expect(await setGoalStatus("ses_interrupt", "active", "build", { allowInterruptedResume: true })).toMatchObject({
+    status: "active", stopReason: null, closedAt: null,
+  })
+  await cancelGoal("ses_interrupt")
+  await expect(setGoalStatus("ses_interrupt", "active", "build", { allowInterruptedResume: true })).rejects.toThrow("goal is closed")
+})
+
+test("explicit stop makes an interrupted goal permanently closed", async () => {
+  await createGoal("ses_interrupted_stop", "stop after steering")
+  await cancelActiveGoal("ses_interrupted_stop")
+  const stopped = await cancelGoal("ses_interrupted_stop")
+  expect(stopped).toMatchObject({ status: "cancelled", stopReason: "cancelled", lastStatus: "Goal cancelled." })
+  await expect(setGoalStatus("ses_interrupted_stop", "active", "build", { allowInterruptedResume: true })).rejects.toThrow("goal is closed")
+  const history = stopped?.history.filter((entry) => entry.type === "cancelled")
+  expect(history).toHaveLength(2)
+})
+
+test("usage in a session without a goal leaves the state file untouched", async () => {
+  expect(await accountUsage("ses_missing", 12)).toBeNull()
+  await expect(stat(process.env.OPENCODE_GOAL_STATE_PATH!)).rejects.toMatchObject({ code: "ENOENT" })
+  await createGoal("ses_other", "preserve the state bytes")
+  const file = process.env.OPENCODE_GOAL_STATE_PATH!
+  const compact = JSON.stringify(JSON.parse(await readFile(file, "utf8")))
+  await writeFile(file, compact)
+  expect(await accountUsage("ses_missing", 12)).toBeNull()
+  expect(await readFile(file, "utf8")).toBe(compact)
 })
 
 test("Shell deferral survives state reload and clears only after its notification is delivered", async () => {
@@ -210,9 +277,47 @@ test("archives compact goal state and writes version 3 after migrating version 1
   persisted.archives.ses_1![0]!.completionEvidence = "z".repeat(5_000)
   await writeFile(process.env.OPENCODE_GOAL_STATE_PATH!, JSON.stringify(persisted), "utf8")
   expect((await getGoalHistory("ses_1")).previous[0]?.completionEvidence?.length).toBeLessThanOrEqual(2_000)
-  await accountUsage("missing")
+  await createGoal("ses_2", "trigger a state write")
   const normalized = JSON.parse(await readFile(process.env.OPENCODE_GOAL_STATE_PATH!, "utf8")) as typeof persisted
   expect(String(normalized.archives.ses_1?.[0]?.completionEvidence).length).toBeLessThanOrEqual(2_000)
+})
+
+test("long repeated refusal turns pause without substantive tool calls", async () => {
+  await createGoal("ses_loop", "finish the task")
+  const refusal = (turn: number) => `Auto-continue turn ${turn}: I cannot do this step. Please run /goal stop; my assessment will not change by trying the same action again.`
+  await recordAssistantProgress("ses_loop", { messageID: "m0", text: refusal(8), outputTokens: 80 })
+  for (const turn of [9, 10]) {
+    await reserveContinuation("ses_loop", 20, 0)
+    await recordContinuationResult("ses_loop", "success", 5)
+    await recordAssistantProgress("ses_loop", {
+      messageID: `m${turn}`, text: refusal(turn), outputTokens: 80, evaluateContinuation: true, completedAt: Date.now(),
+    })
+  }
+  expect(await getGoal("ses_loop")).toMatchObject({ status: "paused", stopReason: "no progress", noProgressTurns: 2 })
+})
+
+test("a successful substantive tool with empty output prevents a repeated summary from counting as a stall", async () => {
+  await createGoal("ses_work", "finish the task")
+  await recordAssistantProgress("ses_work", { messageID: "m0", text: "Checking the remaining work", outputTokens: 80 })
+  await reserveContinuation("ses_work", 20, 0)
+  await recordContinuationResult("ses_work", "success", 5)
+  await recordToolProgress("ses_work", "")
+  await recordAssistantProgress("ses_work", {
+    messageID: "m1", text: "Checking the remaining work", outputTokens: 80, evaluateContinuation: true, completedAt: Date.now(),
+  })
+  expect(await getGoal("ses_work")).toMatchObject({ status: "active", noProgressTurns: 0 })
+})
+
+test("plan bookkeeping does not mask a repeated no-progress continuation", async () => {
+  await createGoal("ses_plan_loop", "finish the task")
+  await recordAssistantProgress("ses_plan_loop", { messageID: "m0", text: "Still waiting for an answer", outputTokens: 80 })
+  await reserveContinuation("ses_plan_loop", 20, 0)
+  await recordContinuationResult("ses_plan_loop", "success", 5)
+  await recordToolProgress("ses_plan_loop", "plan unchanged", undefined, false)
+  await recordAssistantProgress("ses_plan_loop", {
+    messageID: "m1", text: "Still waiting for an answer", outputTokens: 80, evaluateContinuation: true, completedAt: Date.now(),
+  })
+  expect(await getGoal("ses_plan_loop")).toMatchObject({ status: "active", noProgressTurns: 1 })
 })
 
 test("reads and updates planless version 3 state without downgrading or losing metadata", async () => {
@@ -267,6 +372,15 @@ test("status transitions are idempotent and cannot reopen closed goals", async (
   await completeGoal("ses_1", "verified")
   await expect(setGoalStatus("ses_1", "active")).rejects.toThrow("goal is closed")
   expect((await getGoal("ses_1"))?.status).toBe("complete")
+})
+
+test("awaiting-user pause requires an active goal and a concrete blocker", async () => {
+  await createGoal("ses_wait", "finish after user input")
+  await expect(setGoalStatus("ses_wait", "active", null, { awaitingUserBlocker: "Answer needed" })).rejects.toThrow("requires paused status")
+  await expect(setGoalStatus("ses_wait", "paused", null, { awaitingUserBlocker: "  " })).rejects.toThrow()
+  await setGoalStatus("ses_wait", "paused")
+  await expect(setGoalStatus("ses_wait", "paused", null, { awaitingUserBlocker: "Answer needed" })).rejects.toThrow("not active")
+  expect(await getGoal("ses_wait")).toMatchObject({ status: "paused", stopReason: "paused", blocker: null })
 })
 
 test("pausing an already limited goal preserves its safety status", async () => {
