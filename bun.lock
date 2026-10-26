@@ -245,9 +245,9 @@
 
     "@npmcli/run-script": ["@npmcli/run-script@10.0.4", "", { "dependencies": { "@npmcli/node-gyp": "^5.0.0", "@npmcli/package-json": "^7.0.0", "@npmcli/promise-spawn": "^9.0.0", "node-gyp": "^12.1.0", "proc-log": "^6.0.0" } }, "sha512-mGUWr1uMnf0le2TwfOZY4SFxZGXGfm4Jtay/nwAa2FLNAKXUoUwaGwBMNH36UHPtinWfTSJ3nqFQr0091CxVGg=="],
 
-    "@opencode-ai/plugin": ["@opencode-ai/plugin@1.19.2", "", { "dependencies": { "@ai-sdk/provider": "3.0.8", "@opencode-ai/sdk": "1.19.2", "effect": "4.0.0-beta.83", "zod": "4.1.8" }, "peerDependencies": { "@opentui/core": ">=0.4.5", "@opentui/keymap": ">=0.4.5", "@opentui/solid": ">=0.4.5" }, "optionalPeers": ["@opentui/core", "@opentui/keymap", "@opentui/solid"] }, "sha512-aS4WUtjHMuCqAT+SHq9N3O8xx+VEa/wN7PhWL94uhrY2YOcniq6yqDM6BWwmWopOvXCkcDp3nSG+43r1yDcj4w=="],
+    "@opencode-ai/plugin": ["@opencode-ai/plugin@1.19.4", "", { "dependencies": { "@ai-sdk/provider": "3.0.8", "@opencode-ai/sdk": "1.19.4", "effect": "4.0.0-beta.83", "zod": "4.1.8" }, "peerDependencies": { "@opentui/core": ">=0.4.5", "@opentui/keymap": ">=0.4.5", "@opentui/solid": ">=0.4.5" }, "optionalPeers": ["@opentui/core", "@opentui/keymap", "@opentui/solid"] }, "sha512-VN71q/OmfggxIhiDbuzYDYmZcQMsNyVSw1o91e7LD6WUn/9jx4usI9ZpoPbC5p/Prpo/Umzpd+38+EuLoKRr+A=="],
 
-    "@opencode-ai/sdk": ["@opencode-ai/sdk@1.19.2", "", { "dependencies": { "cross-spawn": "7.0.6" } }, "sha512-1KG4L3iWVgXzaliqilcorRikw3idrGPhLllgiO78VL3o1AY64FgFrr3ftIW0V9koIsj0kyrcWfJ8jGOftRs+ug=="],
+    "@opencode-ai/sdk": ["@opencode-ai/sdk@1.19.4", "", { "dependencies": { "cross-spawn": "7.0.6" } }, "sha512-3Wuc4t8gEuWKHbX1Na9oDK6PgOveid70l4Ks5RCjRIo2RcP8FQN3NS6Mg3XWc2+WiUfpfrmvBWlh5u1zeQfDQw=="],
 
     "@opencode/ai": ["@opencode/ai@2.0.30", "", { "dependencies": { "@aws-sdk/credential-providers": "3.1057.0", "@opencode/schema": "2.0.30", "@smithy/eventstream-codec": "4.2.14", "@smithy/util-utf8": "4.2.2", "aws4fetch": "1.0.20", "effect": "4.0.1", "google-auth-library": "10.5.0" } }, "sha512-N+P3qE9qIaBvO9qM+aQPr8T8yjpUGG7QIuHvl59AAIa2FXgGhqfMRq3o6zlFB9B2cvavsHEXKPWuqxIP2MHPXg=="],
 
