@@ -1114,7 +1114,7 @@ test("V2 only renews the auto-turn window after an explicit resume command", asy
   await reserveContinuation("ses_resume_limit", 25, 0)
 
   const statusTool = goalTool(mock, "update_goal_status")
-  await statusTool.execute({ status: "active" }, toolContext("ses_resume_limit"))
+  await expect(statusTool.execute({ status: "active" }, toolContext("ses_resume_limit"))).rejects.toThrow("explicit /goal resume")
   expect((await getGoal("ses_resume_limit"))?.autoTurns).toBe(1)
   await reserveContinuation("ses_resume_limit", 25, 0)
   expect((await getGoal("ses_resume_limit"))?.status).toBe("usageLimited")
@@ -1127,6 +1127,80 @@ test("V2 only renews the auto-turn window after an explicit resume command", asy
   await statusTool.execute({ status: "active" }, toolContext("ses_resume_limit"))
   expect(await getGoal("ses_resume_limit")).toMatchObject({ status: "active", autoTurns: 0 })
 
+  mock.stream.end()
+  await cleanup()
+})
+
+test("V2 leaves an awaiting-user goal paused for unrelated messages and resumes on a model tool call", async () => {
+  const mock = makeMockContext({ auto_continue: false })
+  const cleanup = await setupPlugin(mock as never)
+  await createGoalViaV2Tool(mock, "submit the form after login")
+  const statusTool = goalTool(mock, "update_goal_status")
+  await statusTool.execute({ status: "paused", reason: "awaiting_user", blocker: "User must finish browser login" }, toolContext())
+  expect(await getGoal("ses_v2")).toMatchObject({ status: "paused", stopReason: "awaiting user", blocker: "User must finish browser login" })
+
+  await mock.hooks.prompt?.({ sessionID: "ses_v2", prompt: { text: "What is the weather?" } })
+  expect((await getGoal("ses_v2"))?.status).toBe("paused")
+  await statusTool.execute({ status: "active" }, toolContext())
+  expect(await getGoal("ses_v2")).toMatchObject({ status: "active", stopReason: null, blocker: null })
+  mock.stream.end()
+  await cleanup()
+})
+
+test("V2 refuses model-only resume of an ordinary pause", async () => {
+  const mock = makeMockContext({ auto_continue: false })
+  const cleanup = await setupPlugin(mock as never)
+  await createGoalViaV2Tool(mock, "continue only on request")
+  const statusTool = goalTool(mock, "update_goal_status")
+  await statusTool.execute({ status: "paused" }, toolContext())
+  await mock.hooks.prompt?.({ sessionID: "ses_v2", prompt: { text: "Unrelated question" } })
+  await expect(statusTool.execute({ status: "active" }, toolContext())).rejects.toThrow("explicit /goal resume")
+  expect((await getGoal("ses_v2"))?.status).toBe("paused")
+
+  const resume = mock.commands.find((candidate) => candidate.name === "resume_goal")
+  await resume?.execute({ sessionID: "ses_v2", prompt: { text: "" }, delivery: "steer" })
+  const resumePrompt = mock.promptCalls.at(-1)
+  if (!resumePrompt) throw new Error("expected resume command prompt")
+  await mock.hooks.prompt?.({ sessionID: "ses_v2", prompt: resumePrompt })
+  await statusTool.execute({ status: "active" }, toolContext())
+  expect((await getGoal("ses_v2"))?.status).toBe("active")
+  mock.stream.end()
+  await cleanup()
+})
+
+test("V2 explicit resume reopens a user-interrupted goal but an ordinary status call cannot", async () => {
+  const mock = makeMockContext({ auto_continue: false })
+  const cleanup = await setupPlugin(mock as never)
+  await createGoalViaV2Tool(mock, "continue after steering")
+  await mock.stream.push({ type: "session.execution.interrupted", created: 1, data: { sessionID: "ses_v2", reason: "user" } })
+  expect(await getGoal("ses_v2")).toMatchObject({ status: "cancelled", stopReason: "interrupted" })
+  const statusTool = goalTool(mock, "update_goal_status")
+  await expect(statusTool.execute({ status: "active" }, toolContext())).rejects.toThrow("goal is closed")
+
+  const resume = mock.commands.find((candidate) => candidate.name === "resume_goal")
+  await resume?.execute({ sessionID: "ses_v2", prompt: { text: "" }, delivery: "steer" })
+  const resumePrompt = mock.promptCalls.at(-1)
+  if (!resumePrompt) throw new Error("expected resume command prompt")
+  await mock.hooks.prompt?.({ sessionID: "ses_v2", prompt: resumePrompt })
+  await statusTool.execute({ status: "active" }, toolContext())
+  expect(await getGoal("ses_v2")).toMatchObject({ status: "active", closedAt: null, stopReason: null })
+  mock.stream.end()
+  await cleanup()
+})
+
+test("V2 stop after interruption prevents a later explicit resume", async () => {
+  const mock = makeMockContext({ auto_continue: false })
+  const cleanup = await setupPlugin(mock as never)
+  await createGoalViaV2Tool(mock, "stop permanently after interruption")
+  await mock.stream.push({ type: "session.execution.interrupted", created: 1, data: { sessionID: "ses_v2", reason: "user" } })
+  await goalTool(mock, "stop_goal").execute({}, toolContext())
+  expect(await getGoal("ses_v2")).toMatchObject({ status: "cancelled", stopReason: "cancelled" })
+  const resume = mock.commands.find((candidate) => candidate.name === "resume_goal")
+  await resume?.execute({ sessionID: "ses_v2", prompt: { text: "" }, delivery: "steer" })
+  const resumePrompt = mock.promptCalls.at(-1)
+  if (!resumePrompt) throw new Error("expected resume command prompt")
+  await mock.hooks.prompt?.({ sessionID: "ses_v2", prompt: resumePrompt })
+  await expect(goalTool(mock, "update_goal_status").execute({ status: "active" }, toolContext())).rejects.toThrow("goal is closed")
   mock.stream.end()
   await cleanup()
 })
@@ -2253,7 +2327,7 @@ test("V2 task deferral keeps re-arming a limited goal until its wrap-up is spent
     // Positive control: nothing about the session or the blocked child changed, so resuming
     // the goal - which clears budgetWrapupSent - must bring the same deferral straight back.
     // Only the predicate was ever holding it, and the loop is provably still reachable.
-    await goalTool(mock, "update_goal_status").execute({ status: "active" }, toolContext())
+    await setGoalStatus("ses_v2", "active")
     mock.stream.push({ type: "session.idle", created: 105, data: { sessionID: "ses_v2" } })
     await waitFor(() => rearms() > rearmsAfterWrapup, 10_000)
 
@@ -2868,6 +2942,22 @@ test("V2 delayed tool output from a prior turn cannot clear a newer pending atte
   })
   expect((await getGoalInternal("ses_v2"))?.pendingAttempt).toBeNull()
 
+  mock.stream.end()
+  await cleanup()
+})
+
+test("V2 counts a successful substantive tool call even when its output is empty", async () => {
+  const mock = makeMockContext({ auto_continue: false })
+  const cleanup = await setupPlugin(mock as never)
+  await createGoalViaV2Tool(mock, "run the action")
+  await reserveContinuation("ses_v2", 10, 0)
+  await recordContinuationResult("ses_v2", "success", 5)
+  await mock.hooks["execute.before"]!({ tool: "bash", sessionID: "ses_v2", id: "call_empty", input: {} })
+  await mock.hooks["execute.after"]!({
+    tool: "bash", sessionID: "ses_v2", id: "call_empty", status: "completed", result: { output: "" },
+  })
+  const persisted = JSON.parse(await readFile(process.env.OPENCODE_GOAL_STATE_PATH!, "utf8"))
+  expect(persisted.goals.ses_v2.continuationToolCalls).toBe(1)
   mock.stream.end()
   await cleanup()
 })
