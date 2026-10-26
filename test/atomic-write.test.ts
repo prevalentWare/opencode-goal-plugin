@@ -2,9 +2,11 @@ import { afterEach, beforeEach, expect, test } from "bun:test"
 import { mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
+import { z } from "zod"
 import {
   RENAME_ATTEMPTS,
   RENAME_RETRY_DELAY_MS,
+  RENAME_RETRY_MAX_DELAY_MS,
   atomicWriteFile,
   defaultAtomicWriteOps,
   defaultDirOpenOps,
@@ -544,21 +546,66 @@ test("rename retry exhaustion fails, preserves the old file, and cleans the temp
     "write",
     "sync",
     "close",
-    "rename",
-    "sleep",
-    "rename",
-    "sleep",
-    "rename",
+    ...Array.from({ length: RENAME_ATTEMPTS }, () => "rename").flatMap((op, index) =>
+      index === RENAME_ATTEMPTS - 1 ? [op] : [op, "sleep"],
+    ),
     "unlink",
   ])
-  // Backoff grows per attempt: 20ms then 40ms.
-  expect(allArgsFor("sleep").map((args) => args[0])).toEqual([
-    RENAME_RETRY_DELAY_MS,
-    RENAME_RETRY_DELAY_MS * 2,
-  ])
+  // Backoff doubles per attempt and then stays capped.
+  const delays = z.array(z.number()).parse(allArgsFor("sleep").map(([delay]) => delay))
+  expect(delays).toHaveLength(RENAME_ATTEMPTS - 1)
+  expect(delays[0]).toBe(RENAME_RETRY_DELAY_MS)
+  expect(delays[1]).toBe(RENAME_RETRY_DELAY_MS * 2)
+  expect(Math.max(...delays)).toBeLessThanOrEqual(RENAME_RETRY_MAX_DELAY_MS)
+  expect(delays.every((delay) => delay <= RENAME_RETRY_MAX_DELAY_MS)).toBe(true)
   // The old file survived and the temp file was cleaned up.
   expect(await readFile(file, "utf8")).toBe("old state")
   expect(await leftoverTmpFiles()).toEqual([])
+})
+
+test("rename survives a Windows lock that outlives the old three-attempt budget", async () => {
+  // Regression: the previous budget gave up after three attempts (60ms of
+  // waiting) while Windows was still holding the target, so a transient
+  // antivirus/indexer lock surfaced as an EPERM state-write failure.
+  const failures = 4
+  let remaining = failures
+  const { ops, allArgsFor } = makeRecordingOps({
+    ops: {
+      platform: "win32",
+      rename: async (from, to) => {
+        if (remaining > 0) {
+          remaining -= 1
+          throw errno("EPERM", "EPERM: target temporarily locked")
+        }
+        return defaultAtomicWriteOps.rename(from, to)
+      },
+    },
+  })
+
+  await atomicWriteFile(file, DATA, ops)
+
+  expect(allArgsFor("rename")).toHaveLength(failures + 1)
+  expect(await readFile(file, "utf8")).toBe(DATA)
+  expect(await leftoverTmpFiles()).toEqual([])
+})
+
+test("the rename retry backoff stays inside a bounded total wait", async () => {
+  // Check the stated backoff budget independently of its implementation.
+  const { ops, allArgsFor } = makeRecordingOps({
+    ops: {
+      platform: "win32",
+      rename: async () => {
+        throw errno("EBUSY", "EBUSY: target busy")
+      },
+    },
+  })
+
+  await expect(atomicWriteFile(file, DATA, ops)).rejects.toThrow("EBUSY: target busy")
+
+  const delays = z.array(z.number()).parse(allArgsFor("sleep").map(([delay]) => delay))
+  const total = delays.reduce((sum, delay) => sum + delay, 0)
+  expect(delays).toEqual([20, 40, 80, 160, 320, 500, 500, 500, 500])
+  expect(total).toBe(2620)
 })
 
 test("a non-transient rename error is never retried", async () => {

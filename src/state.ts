@@ -157,6 +157,7 @@ export type Goal = {
   awaitingContinuationProgress: boolean
   continuationBaselineMessageID: string
   continuationBaselineSummary: string
+  continuationToolCalls: number
 }
 
 type UsageTracker = {
@@ -308,6 +309,7 @@ const GoalSchema = Schema.Struct({
   awaitingContinuationProgress: Schema.optionalWith(Schema.Boolean, { default: () => false }),
   continuationBaselineMessageID: Schema.optionalWith(Schema.String, { default: () => "" }),
   continuationBaselineSummary: Schema.optionalWith(Schema.String, { default: () => "" }),
+  continuationToolCalls: Schema.optionalWith(Schema.Number, { default: () => 0 }),
 })
 const ArchivedGoalSchema = Schema.Struct({
   id: Schema.String,
@@ -346,7 +348,7 @@ const PersistedStateSchema = Schema.Union(LegacyStateSchema, StateSchema)
 // getGoalInternal / the internal snapshot type instead.
 export type GoalSnapshot = Omit<
   Goal,
-  "lastAccountedAt" | "autoTurns" | "lastContinuationAt" | "pendingAttempt" | "usageTrackers" | "shellDeferrals"
+  "lastAccountedAt" | "autoTurns" | "lastContinuationAt" | "pendingAttempt" | "usageTrackers" | "shellDeferrals" | "continuationToolCalls"
 > & {
   waitingForShellIDs: string[]
   remainingTokens: number | null
@@ -567,7 +569,7 @@ function enqueueMutation<T>(operation: () => Promise<T>) {
   return current
 }
 
-async function mutate<T>(fn: (state: State) => T | Promise<T>) {
+async function mutate<T>(fn: (state: State) => T | Promise<T>, shouldWrite: (result: T) => boolean = () => true) {
   return enqueueMutation(() => {
     const file = statePath()
     return Effect.runPromise(
@@ -621,7 +623,7 @@ async function mutate<T>(fn: (state: State) => T | Promise<T>) {
             })
           }
         }
-        yield* writeStateEffect(state, file)
+        if (recoveryContent != null || shouldWrite(result)) yield* writeStateEffect(state, file)
         return result
       }),
     )
@@ -690,6 +692,7 @@ function normalizeGoal(goal: Goal) {
   )
   goal.continuationBaselineMessageID ??= ""
   goal.continuationBaselineSummary ??= ""
+  goal.continuationToolCalls = nonNegativeInteger(goal.continuationToolCalls, 0)
   goal.noProgressTurns = nonNegativeInteger(goal.noProgressTurns, 0)
   goal.maxAutoTurns = positiveIntegerOrNull(goal.maxAutoTurns)
   goal.maxDurationSeconds = positiveIntegerOrNull(goal.maxDurationSeconds)
@@ -1028,6 +1031,7 @@ function createGoalRecord(
     awaitingContinuationProgress: false,
     continuationBaselineMessageID: "",
     continuationBaselineSummary: "",
+    continuationToolCalls: 0,
   }
   pushHistory(goal, "created", goalLimitSummary(goal))
   if (paused) pushHistory(goal, "paused", goal.lastStatus)
@@ -1084,7 +1088,14 @@ function archiveGoal(state: State, goal: Goal) {
   pruneArchives(state)
 }
 
-function cancelGoalRecord(goal: Goal, reason: "cancelled" | "cleared" | "replaced") {
+function cancelGoalRecord(goal: Goal, reason: "cancelled" | "cleared" | "replaced" | "interrupted") {
+  if (goal.status === "cancelled" && goal.stopReason === "interrupted" && reason === "cancelled") {
+    goal.updatedAt = nowSeconds()
+    goal.stopReason = "cancelled"
+    goal.lastStatus = "Goal cancelled."
+    pushHistory(goal, "cancelled", goal.lastStatus)
+    return
+  }
   if (isClosed(goal.status)) return
   accountWallClock(goal)
   const now = nowSeconds()
@@ -1097,7 +1108,9 @@ function cancelGoalRecord(goal: Goal, reason: "cancelled" | "cleared" | "replace
   goal.budgetWrapupSent = false
   goal.stopReason = reason
   goal.blocker = null
-  goal.lastStatus = reason === "replaced" ? "Goal cancelled because it was replaced." : "Goal cancelled."
+  goal.lastStatus = reason === "replaced"
+    ? "Goal cancelled because it was replaced."
+    : reason === "interrupted" ? "Goal interrupted by the user; explicit resume is available." : "Goal cancelled."
   pushHistory(goal, "cancelled", goal.lastStatus)
 }
 
@@ -1196,13 +1209,29 @@ export async function setGoalStatus(
   sessionID: string,
   status: MutableGoalStatus,
   agent?: string | null,
-  options?: { resetAutoTurnLimit?: boolean },
+  options?: { resetAutoTurnLimit?: boolean; allowInterruptedResume?: boolean; awaitingUserBlocker?: string; requireAwaitingUserResume?: boolean },
 ) {
   const agentValue = typeof agent === "string" && agent.trim() ? agent.trim() : null
+  const awaitingUserBlocker = options?.awaitingUserBlocker == null
+    ? null
+    : validateEvidence(options.awaitingUserBlocker, "awaiting-user blocker")
+  if (awaitingUserBlocker !== null && status !== "paused") {
+    throw new Error("awaiting-user blocker requires paused status")
+  }
   return mutate((state) => {
     const goal = state.goals[sessionID]
     if (!goal) throw new Error("cannot update goal because this session has no goal")
-    if (isClosed(goal.status)) throw new Error("cannot update goal status because this goal is closed")
+    if (status === "active" && options?.requireAwaitingUserResume === true &&
+      (goal.status === "paused" || goal.status === "budgetLimited" || goal.status === "usageLimited") &&
+      !(goal.status === "paused" && goal.stopReason === "awaiting user")) {
+      throw new Error("only an awaiting-user goal can resume without an explicit /goal resume or /resume_goal command")
+    }
+    const interruptedResume = status === "active" && goal.status === "cancelled" &&
+      goal.stopReason === "interrupted" && options?.allowInterruptedResume === true
+    if (isClosed(goal.status) && !interruptedResume) throw new Error("cannot update goal status because this goal is closed")
+    if (awaitingUserBlocker !== null && goal.status !== "active") {
+      throw new Error("cannot await user input because this goal is not active")
+    }
     if (goal.status === status) return snapshot(goal)
     if (status === "paused" && goal.status !== "active") return snapshot(goal)
     const resumesAutoTurnLimit =
@@ -1212,6 +1241,7 @@ export async function setGoalStatus(
       goal.stopReason?.startsWith(MAX_AUTO_CONTINUES_STOP_REASON_PREFIX) === true
     accountWallClock(goal)
     goal.status = status
+    if (interruptedResume) goal.closedAt = null
     goal.shellDeferrals = []
     goal.updatedAt = nowSeconds()
     goal.lastAccountedAt = status === "active" ? goal.updatedAt : null
@@ -1219,11 +1249,11 @@ export async function setGoalStatus(
     goal.continuationFailures = status === "active" ? 0 : goal.continuationFailures
     goal.pendingAttempt = status === "active" ? null : goal.pendingAttempt
     goal.noProgressTurns = status === "active" ? 0 : goal.noProgressTurns
-    goal.stopReason = status === "active" ? null : "paused"
+    goal.stopReason = status === "active" ? null : awaitingUserBlocker == null ? "paused" : "awaiting user"
     goal.budgetWrapupSent = status === "active" ? false : goal.budgetWrapupSent
-    goal.blocker = status === "active" ? null : goal.blocker
+    goal.blocker = status === "active" ? null : awaitingUserBlocker ?? goal.blocker
     if (agentValue) goal.lastPromptAgent = agentValue
-    goal.lastStatus = status === "active" ? "Goal resumed." : "Goal paused."
+    goal.lastStatus = status === "active" ? "Goal resumed." : awaitingUserBlocker == null ? "Goal paused." : "Goal paused awaiting user input."
     pushHistory(goal, status === "active" ? "resumed" : "paused", goal.lastStatus)
     return snapshot(goal)
   })
@@ -1332,7 +1362,7 @@ export async function cancelActiveGoal(sessionID: string) {
   return mutate((state) => {
     const goal = state.goals[sessionID]
     if (!goal) return null
-    if (goal.status === "active") cancelGoalRecord(goal, "cancelled")
+    if (goal.status === "active") cancelGoalRecord(goal, "interrupted")
     return snapshot(goal)
   })
 }
@@ -1440,7 +1470,11 @@ export async function accountUsage(
     maybeStopForBudget(goal)
     goal.updatedAt = nowSeconds()
     return snapshot(goal)
-  })
+  }, (result) => result !== null)
+}
+
+function normalizedStallSummary(text: string) {
+  return text.toLowerCase().replace(/\b\d+\b/g, "#").replace(/\s+/g, " ").trim()
 }
 
 export async function recordAssistantProgress(sessionID: string, input: AssistantProgressInput) {
@@ -1498,7 +1532,9 @@ export async function recordAssistantProgress(sessionID: string, input: Assistan
       goal.pendingAttempt = null
       const lowOutput = outputTokens > 0 && outputTokens < (threshold ?? DEFAULT_NO_PROGRESS_TOKEN_THRESHOLD)
       const changedSinceContinuation = Boolean(summary && summary !== goal.continuationBaselineSummary)
-      if (lowOutput && !changedSinceContinuation) {
+      const repeatedWithoutTools = goal.continuationToolCalls === 0 && Boolean(summary) &&
+        normalizedStallSummary(summary) === normalizedStallSummary(goal.continuationBaselineSummary)
+      if (goal.continuationToolCalls === 0 && ((lowOutput && !changedSinceContinuation) || repeatedWithoutTools)) {
         goal.noProgressTurns += 1
         if (maxNoProgressTurns && goal.noProgressTurns >= maxNoProgressTurns) {
           accountWallClock(goal)
@@ -1548,6 +1584,7 @@ export async function reserveContinuation(sessionID: string, maxAutoTurns: numbe
     // continuation prompt was actually delivered.
     goal.continuationBaselineMessageID = goal.lastAssistantMessageID
     goal.continuationBaselineSummary = summarizeText(goal.lastAssistantText)
+    goal.continuationToolCalls = 0
     goal.pendingAttempt = {
       id: randomId(),
       reservedAt: Date.now(),
@@ -1697,10 +1734,17 @@ export async function markPendingContinuationStarted(sessionID: string) {
  * earlier turn can never clear a newer pending attempt. Omitting the argument
  * keeps the legacy unconditional reset for direct callers.
  */
-export async function recordToolProgress(sessionID: string, text?: string, expectedAttemptID?: string | null) {
+export async function recordToolProgress(sessionID: string, text?: string, expectedAttemptID?: string | null, substantiveTool = true) {
+  let changed = false
   return mutate((state) => {
     const goal = state.goals[sessionID]
     if (!goal || goal.status !== "active") return goal ? snapshotInternal(goal) : null
+    if (substantiveTool && goal.awaitingContinuationProgress &&
+      (goal.pendingAttempt == null || expectedAttemptID === undefined || expectedAttemptID === goal.pendingAttempt.id)) {
+      goal.continuationToolCalls += 1
+      goal.updatedAt = nowSeconds()
+      changed = true
+    }
     const value = text?.trim() ?? ""
     if (!value) return snapshotInternal(goal)
     if (goal.continuationFailures === 0 && goal.pendingAttempt == null) return snapshotInternal(goal)
@@ -1720,8 +1764,9 @@ export async function recordToolProgress(sessionID: string, text?: string, expec
     goal.continuationFailures = 0
     goal.pendingAttempt = null
     goal.updatedAt = nowSeconds()
+    changed = true
     return snapshotInternal(goal)
-  })
+  }, () => changed)
 }
 
 function reserveWrapup(goal: Goal): InternalGoalSnapshot | null {

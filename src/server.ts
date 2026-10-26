@@ -104,6 +104,7 @@ const TRANSPORT_ERROR_PATTERN =
   /\b(?:network|fetch|socket|connect|connection|timeout|timed out|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|EPIPE|transport|stream|websocket|offline|internet|request failed|proxy)\b/i
 const NON_TRANSPORT_TERMINAL_PATTERN = /\b(?:abort(?:ed)?|interrupt(?:ed|ion)?)\b/i
 const NON_PROGRESS_TOOLS = new Set(["get_goal", "get_goal_history", "list_all_goals", "defer_goal_until_shell", "release_goal_shell_deferral"])
+const NON_SUBSTANTIVE_TOOLS = new Set(["update_goal_plan", "update_goal_objective", "update_goal", "update_goal_status", "create_goal", "set_goal", "stop_goal", "replace_goal", "clear_goal", "todowrite"])
 const TASK_TERMINAL_STATES = new Set<TaskState>(["completed", "error", "cancelled"])
 const activeContinuations = new Set<string>()
 
@@ -207,10 +208,10 @@ $ARGUMENTS
 - 如果参数是 "clear"、"off"、"reset" 或 "none"，调用 clear_goal，将当前目标归档并从活动会话中清除。
 - 如果参数以 "replace " 开头，调用 replace_goal，使用其后的完整文本原子地取消并归档当前目标，然后创建新目标。
 - 如果参数是 "pause"，调用 update_goal_status 并将 status 设为 "paused" 来暂停当前目标，然后报告结果。
-- 如果参数是 "resume"，调用 update_goal_status 并将 status 设为 "active" 来继续当前目标，然后继续推进目标。
+- 如果参数是 "resume"，调用 update_goal_status 并将 status 设为 "active" 来继续当前目标；用户中断的 cancelled 目标也可通过此明确命令继续，但明确 stop_goal 取消的目标不能重开。
 - 如果参数以 "edit " 开头，调用 update_goal_objective，使用其后的文本更新当前目标。
 - 如果参数以 "complete " 或 "done " 开头，依据真实产物和命令输出执行完成审计。只有目标确实已达成时，才调用 update_goal 并将 status 设为 "complete"，同时提供简洁证据。
-- 如果参数以 "unmet "、"blocked " 或 "blocker " 开头，只有目标无法达成或需要外部输入时，才调用 update_goal 并将 status 设为 "unmet"，使用其后的参数作为 blocker。
+- 如果参数以 "unmet "、"blocked " 或 "blocker " 开头，只有目标无法达成或永久阻塞时，才调用 update_goal 并将 status 设为 "unmet"，使用其后的参数作为 blocker；普通的等待用户回答应使用 awaiting_user 暂停。
 - 其他情况先调用 get_goal。如果返回相同目标的未关闭目标，不要再次创建，直接从返回状态继续；
   如果返回不同的未关闭目标，报告冲突，不要替换。只有不存在未关闭目标时，才调用一次 create_goal。
   目标必须完整忠实地表达参数中的每项要求、约束、范围边界和成功标准，不得遗漏或压缩含义。
@@ -256,10 +257,10 @@ Use the goal tools to handle this command:
 - If the arguments are "clear", "off", "reset", or "none", call clear_goal to archive and detach the current goal.
 - If the arguments start with "replace ", call replace_goal with the complete remaining text to atomically cancel and archive the current goal, then create the new goal.
 - If the arguments are "pause", pause the current goal by calling update_goal_status with status "paused" and report the result.
-- If the arguments are "resume", resume the current goal by calling update_goal_status with status "active" and continue working toward it.
+- If the arguments are "resume", resume the current goal by calling update_goal_status with status "active" and continue working toward it. This explicit command may reopen a user-interrupted cancelled goal, but not an explicitly stopped goal.
 - If the arguments start with "edit ", update the current goal objective by calling update_goal_objective with the remaining text.
 - If the arguments start with "complete " or "done ", perform a completion audit against real artifacts and command output. Call update_goal with status "complete" only if the goal is achieved, using concise evidence from the audit.
-- If the arguments start with "unmet ", "blocked ", or "blocker ", call update_goal with status "unmet" only when the goal cannot be achieved or needs external input, using the remaining arguments as the blocker.
+- If the arguments start with "unmet ", "blocked ", or "blocker ", call update_goal with status "unmet" only when the goal cannot be achieved or is permanently blocked, using the remaining arguments as the blocker; pause with awaiting_user for an ordinary user reply.
 - ${createGuidance}
 
 Create a goal only from these explicit command arguments. Do not infer a goal from unrelated session context. After create_goal succeeds or returns an existing matching goal, never call it again for this command; continue working from the returned goal state.`
@@ -286,9 +287,9 @@ function goalStatusCommandTemplate(commandName: "pause_goal" | "resume_goal", lo
 忽略所有命令参数。先调用 get_goal，然后只处理此次继续请求：
 
 - 如果没有目标，简要报告当前未设置目标。
-- 如果目标为 complete 或 unmet，不要修改；不得重新打开已关闭目标。
+- 如果目标为 complete、unmet，或明确 stop_goal 取消的 cancelled，不要修改；不得重新打开。
 - 如果目标已经为 active，不要修改；继续推进现有目标。
-- 如果目标为 paused、budgetLimited 或 usageLimited，调用 update_goal_status 并将 status 设为 "active"，然后继续推进现有目标。
+- 如果目标为 paused、budgetLimited、usageLimited，或由用户中断的 cancelled，调用 update_goal_status 并将 status 设为 "active"，然后继续推进现有目标。
 - 如果 Plan 模式或其他受限 Agent 阻止继续目标，报告用户必须切换到 Build 模式，不要重复尝试。
 
 不要创建、编辑、清除、完成目标，也不要将目标标记为 unmet。使用简体中文回复用户。`
@@ -312,9 +313,9 @@ Do not create, resume, or continue a goal. Do not edit, clear, complete, or mark
 Ignore any command arguments. Call get_goal first, then handle only this resume request:
 
 - If there is no goal, briefly report that no goal is set.
-- If the goal is complete or unmet, do not mutate it; you must not reopen it.
+- If the goal is complete, unmet, or cancelled by an explicit stop_goal, do not mutate it; you must not reopen it.
 - If the goal is already active, do not mutate it; continue working toward its existing objective.
-- If the goal is paused, budgetLimited, or usageLimited, call update_goal_status with status "active", then continue working toward its existing objective.
+- If the goal is paused, budgetLimited, usageLimited, or cancelled by a user interruption, call update_goal_status with status "active", then continue working toward its existing objective.
 - If Plan mode or another restricted agent prevents resuming, report that the user must switch to Build mode instead of retrying.
 
 Do not create, edit, clear, complete, or mark a goal unmet.`
@@ -1249,7 +1250,7 @@ type GoalServices = {
   messages: GoalMessages
   maxObjectiveChars: number
   isPlanAgent: (agent: unknown) => boolean
-  consumeAutoTurnReset: (sessionID: string) => boolean
+  consumeExplicitResume: (sessionID: string) => boolean
   initializeUsage?: (sessionID: string) => Promise<void>
   stopAutonomy?: (sessionID: string, mode?: "stop" | "replace") => void
   consumeObjectiveEdit?: (sessionID: string, objective: string) => { goalID: string; objective: string } | undefined
@@ -1432,21 +1433,32 @@ async function closeGoalFromTool(input: UpdateGoalArgs, context: ToolExecContext
 }
 
 async function updateGoalStatusFromTool(
-  input: { status: "active" | "paused" },
+  input: { status: "active" | "paused"; reason?: "awaiting_user"; blocker?: string },
   context: ToolExecContext,
   services: GoalServices,
 ) {
-  const resetAutoTurnLimit = input.status === "active" && services.consumeAutoTurnReset(context.sessionID)
+  const explicitResume = input.status === "active" && services.consumeExplicitResume(context.sessionID)
   if (input.status === "active" && services.isPlanAgent(context.agent)) {
     throw new Error(
       services.messages.notices.cannotResumeInPlan,
     )
   }
+  if (input.reason === "awaiting_user" && (input.status !== "paused" || !input.blocker?.trim())) {
+    throw new Error("awaiting_user requires status paused and a concrete pending user request")
+  }
+  if (input.blocker && input.reason !== "awaiting_user") {
+    throw new Error("blocker is only valid for an awaiting_user pause")
+  }
   const goal = await setGoalStatus(
     context.sessionID,
     input.status,
     typeof context.agent === "string" ? context.agent : null,
-    { resetAutoTurnLimit },
+    {
+      resetAutoTurnLimit: explicitResume,
+      allowInterruptedResume: explicitResume,
+      requireAwaitingUserResume: !explicitResume,
+      awaitingUserBlocker: input.reason === "awaiting_user" ? input.blocker : undefined,
+    },
   )
   return JSON.stringify({ goal }, null, 2)
 }
@@ -1569,7 +1581,7 @@ const server: Plugin = async ({ client }, options?: Options) => {
     messages,
     isPlanAgent,
     maxObjectiveChars: objectiveChars,
-    consumeAutoTurnReset: (sessionID) => explicitResumeRequests.delete(sessionID),
+    consumeExplicitResume: (sessionID) => explicitResumeRequests.delete(sessionID),
     consumeObjectiveEdit: (sessionID, objective) => {
       const edit = objectiveEdits.get(sessionID)
       if (!edit || (edit.objective !== objective.trim() && escapeXmlText(edit.objective) !== objective.trim())) return
@@ -2134,9 +2146,11 @@ const server: Plugin = async ({ client }, options?: Options) => {
           messages.tools.updateGoalStatus,
         args: {
           status: z.enum(["active", "paused"]).describe(messages.tools.activePausedStatus),
+          reason: z.enum(["awaiting_user"]).optional().describe("Use only when pausing for a direct answer, login, or other required user action."),
+          blocker: z.string().optional().describe("The concrete user answer or action still needed when reason is awaiting_user."),
         },
         async execute(args, context) {
-          return updateGoalStatusFromTool(args as { status: "active" | "paused" }, context, goalServices)
+          return updateGoalStatusFromTool(args as { status: "active" | "paused"; reason?: "awaiting_user"; blocker?: string }, context, goalServices)
         },
       },
       stop_goal: {
@@ -2214,22 +2228,21 @@ const server: Plugin = async ({ client }, options?: Options) => {
         const goal = await getGoal(sessionID)
         if (goal || input.tool === "clear_goal") output.metadata = { ...output.metadata, ...acpPlanMetadata(goal) }
       }
-      if (typeof input?.tool === "string" && NON_PROGRESS_TOOLS.has(input.tool.toLowerCase())) return
+      if (typeof input?.tool !== "string" || NON_PROGRESS_TOOLS.has(input.tool.toLowerCase())) return
       const toolResult = output as { output?: unknown; error?: unknown }
       // A successful tool output is real progress: it resolves any pending
       // continuation and clears the prompt-failure counter. Failed tool
       // outputs leave the failure counter and pending window untouched.
       if (toolOutputFailed(toolResult)) return
       const text = typeof toolResult.output === "string" ? toolResult.output : undefined
-      if (!text) return
       const before = await getGoalInternal(sessionID)
-      const scheduled = scheduledContinuations.get(sessionID)
-      const hasFailureEpisode = Boolean(
-        before && (before.continuationFailures > 0 || before.pendingAttempt != null),
-      )
-      if (!before || (!hasFailureEpisode && scheduled?.purpose !== "recovery")) return
-      const progressed = await recordToolProgress(sessionID, text, expectedAttemptID)
-      if (progressed?.continuationFailures === 0 && progressed.pendingAttempt == null) {
+      if (!before || before.status !== "active" ||
+        (!before.awaitingContinuationProgress && before.continuationFailures === 0 && before.pendingAttempt == null &&
+          scheduledContinuations.get(sessionID)?.purpose !== "recovery")) return
+      const resolvingFailure = Boolean(before && (before.continuationFailures > 0 || before.pendingAttempt != null)) ||
+        scheduledContinuations.get(sessionID)?.purpose === "recovery"
+      const progressed = await recordToolProgress(sessionID, text, expectedAttemptID, !NON_SUBSTANTIVE_TOOLS.has(input.tool.toLowerCase()))
+      if (resolvingFailure && progressed?.continuationFailures === 0 && progressed.pendingAttempt == null) {
         locallyDeliveredPendingSessions.delete(sessionID)
         cancelScheduledContinuation(sessionID)
       }
@@ -2467,7 +2480,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       }
       await deferGoalUntilShell(sessionID, shellID)
     },
-    consumeAutoTurnReset: (sessionID) => explicitResumeRequests.delete(sessionID),
+    consumeExplicitResume: (sessionID) => explicitResumeRequests.delete(sessionID),
     consumeObjectiveEdit: (sessionID, objective) => {
       const edit = objectiveEdits.get(sessionID)
       if (!edit || (edit.objective !== objective.trim() && escapeXmlText(edit.objective) !== objective.trim())) return
@@ -3528,15 +3541,14 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       if (!sessionID || typeof input.tool !== "string") return
       if (NON_PROGRESS_TOOLS.has(input.tool.toLowerCase())) return
       if (toolOutputFailed(input.result)) return
-      if (!text) return
       const before = await getGoalInternal(sessionID)
-      const scheduled = scheduledContinuations.get(sessionID)
-      const hasFailureEpisode = Boolean(
-        before && (before.continuationFailures > 0 || before.pendingAttempt != null),
-      )
-      if (!before || (!hasFailureEpisode && scheduled?.purpose !== "recovery")) return
-      const progressed = await recordToolProgress(sessionID, text, expectedAttemptID)
-      if (progressed?.continuationFailures === 0 && progressed.pendingAttempt == null) {
+      if (!before || before.status !== "active" ||
+        (!before.awaitingContinuationProgress && before.continuationFailures === 0 && before.pendingAttempt == null &&
+          scheduledContinuations.get(sessionID)?.purpose !== "recovery")) return
+      const resolvingFailure = Boolean(before && (before.continuationFailures > 0 || before.pendingAttempt != null)) ||
+        scheduledContinuations.get(sessionID)?.purpose === "recovery"
+      const progressed = await recordToolProgress(sessionID, text, expectedAttemptID, !NON_SUBSTANTIVE_TOOLS.has(input.tool.toLowerCase()))
+      if (resolvingFailure && progressed?.continuationFailures === 0 && progressed.pendingAttempt == null) {
         locallyDeliveredPendingSessions.delete(sessionID)
         cancelScheduledContinuation(sessionID)
       }
@@ -3828,12 +3840,14 @@ function goalToolsV2(services: GoalServices): ToolV2Info[] {
             enum: ["active", "paused"],
             description: messages.tools.activePausedStatus,
           },
+          reason: { type: "string", enum: ["awaiting_user"], description: "Use only when pausing for a direct answer, login, or other required user action." },
+          blocker: { type: "string", description: "The concrete user answer or action still needed when reason is awaiting_user." },
         },
         ["status"],
       ),
       options: { codemode: false },
       execute: async (args, toolContext) => ({
-        content: await updateGoalStatusFromTool(args as { status: "active" | "paused" }, toolContext, services),
+        content: await updateGoalStatusFromTool(args as { status: "active" | "paused"; reason?: "awaiting_user"; blocker?: string }, toolContext, services),
       }),
     },
     {
