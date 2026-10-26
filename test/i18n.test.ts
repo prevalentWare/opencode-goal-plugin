@@ -4,6 +4,7 @@ import {
   presentGoalHistoryDetail,
   presentGoalHistoryType,
   presentGoalLastStatus,
+  presentGoalStopReason,
   resolveLocale,
 } from "../src/i18n"
 
@@ -39,6 +40,8 @@ test("zh-CN presents every plugin-owned last-status shape and preserves unknown 
   const cases = [
     ["Goal set.", "目标已设置。"],
     ["Goal paused.", "目标已暂停。"],
+    ["Goal paused awaiting user input.", "目标已暂停，等待用户回应。"],
+    ["Goal interrupted by the user; explicit resume is available.", "目标已由用户中断；可通过明确的继续命令恢复。"],
     ["Goal completed.", "目标已完成。"],
     ["Auto-continue 3 reserved.", "已预留第 3 次自动继续。"],
     ["Auto-continue failed 2 time(s).", "自动继续已失败 2 次。"],
@@ -47,6 +50,8 @@ test("zh-CN presents every plugin-owned last-status shape and preserves unknown 
     ["token budget reached (12/10); wrap-up required.", "已达到 Token 预算（12/10）；需要收尾。"],
   ] as const
   for (const [source, expected] of cases) expect(presentGoalLastStatus(source, "zh-CN")).toBe(expected)
+  expect(presentGoalStopReason("awaiting user", "zh-CN")).toBe("等待用户回应")
+  expect(presentGoalStopReason("interrupted", "zh-CN")).toBe("已由用户中断")
 
   const userText = "User says: do not translate this <tag>"
   expect(presentGoalLastStatus(userText, "zh-CN")).toBe(userText)

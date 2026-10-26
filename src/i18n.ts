@@ -123,8 +123,12 @@ const EN_MESSAGES: GoalMessages = {
       "is achieved and no required work remains, and include evidence. Use status unmet only when the objective " +
       "cannot be achieved or is blocked, and include the blocker. Do not close a goal merely because work is stopping.",
     updateGoalStatus:
-      "Pause or resume the current OpenCode goal when the user explicitly asks to pause or resume it. Resuming is not " +
-      "allowed while the session is in Plan mode; the user must switch to Build mode first.",
+      "Pause or resume the current OpenCode goal only when the user explicitly asks, except that the model may " +
+      "pause with reason awaiting_user and a concrete blocker when a direct " +
+      "user answer or action is required and no independent goal work remains. On the next user turn, resume only " +
+      "if their reply resolves that awaiting_user request. All other pauses require /goal resume or /resume_goal. " +
+      "An interrupted goal requires an explicit /goal resume or /resume_goal; " +
+      "Plan mode cannot resume a goal.",
     stopGoal:
       "Cancel the current OpenCode goal when the user explicitly asks to stop or cancel it. Cancellation is terminal " +
       "and prevents further autonomous continuation while preserving the goal and its history.",
@@ -241,7 +245,7 @@ const ZH_CN_MESSAGES: GoalMessages = {
     updateGoal:
       "只有在依据真实证据完成审计后才能关闭现有目标。仅当目标已经达成且没有剩余必需工作时使用 complete，并提供证据；仅当目标无法达成或被阻塞时使用 unmet，并提供阻塞原因。不要仅因为准备停止工作就关闭目标。",
     updateGoalStatus:
-      "仅当用户明确要求暂停或继续目标时，暂停或继续当前 OpenCode 目标。在 Plan 模式下不能继续目标；用户必须先切换到 Build 模式。",
+      "仅当用户明确要求时暂停或继续当前 OpenCode 目标；例外是确实需要用户直接回答或操作且没有其他可独立推进的目标工作时，模型可使用 awaiting_user 和具体阻塞说明暂停。用户下一轮明确解决该 awaiting_user 请求后才可继续；其他暂停状态必须使用 /goal resume 或 /resume_goal。中断的目标也必须由用户明确调用这些命令；Plan 模式不能继续目标。",
     stopGoal: "仅当用户明确要求停止或取消目标时，取消当前 OpenCode 目标。取消是终态，会阻止后续自动继续，并保留目标及其历史。",
     replaceGoal: "仅当用户明确要求替换目标时，原子地取消并归档当前目标，然后在同一会话中创建新的独立目标。",
     clearGoal: "仅当用户明确要求清除目标时，将当前目标从会话中分离并归档；若目标仍在活动，会先取消再清除。",
@@ -403,6 +407,8 @@ export function presentGoalStopReason(reason: string, locale: GoalLocale): strin
     paused: "已暂停",
     blocked: "已阻塞",
     cancelled: "已取消",
+    interrupted: "已由用户中断",
+    "awaiting user": "等待用户回应",
     cleared: "已清除",
     replaced: "已替换",
     "plan mode": "Plan 模式",
@@ -443,9 +449,11 @@ export function presentGoalLastStatus(status: string, locale: GoalLocale): strin
     "Auto-continue paused while the session is in Plan mode.": "会话处于 Plan 模式，因此自动继续已暂停。",
     "Goal resumed.": "目标已继续。",
     "Goal paused.": "目标已暂停。",
+    "Goal paused awaiting user input.": "目标已暂停，等待用户回应。",
     "Goal completed.": "目标已完成。",
     "Goal marked unmet.": "目标已标记为未达成。",
     "Goal cancelled.": "目标已取消。",
+    "Goal interrupted by the user; explicit resume is available.": "目标已由用户中断；可通过明确的继续命令恢复。",
     "Goal cancelled because it was replaced.": "目标因被替换而取消。",
     "Auto-continue attempt canceled before delivery.": "自动继续尝试已在发送前取消。",
     "Auto-continue prompt sent.": "自动继续提示已发送。",

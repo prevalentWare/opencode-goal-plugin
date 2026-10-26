@@ -300,7 +300,8 @@ function showSummary(
                 ),
               ]
             : []),
-          ...(goal.status === "paused" || goal.status === "budgetLimited" || goal.status === "usageLimited"
+          ...(goal.status === "paused" || goal.status === "budgetLimited" || goal.status === "usageLimited" ||
+            (goal.status === "cancelled" && goal.stopReason === "interrupted")
             ? [
                 actionOption(
                   api,
@@ -694,7 +695,8 @@ async function showSummaryV2(
           ...(goal.status === "active"
             ? [{ title: messages.tui.pause, value: "pause", description: messages.tui.pauseDescription }]
             : []),
-          ...(goal.status === "paused" || goal.status === "budgetLimited" || goal.status === "usageLimited"
+          ...(goal.status === "paused" || goal.status === "budgetLimited" || goal.status === "usageLimited" ||
+            (goal.status === "cancelled" && goal.stopReason === "interrupted")
             ? [{ title: messages.tui.resume, value: "resume", description: messages.tui.resumeDescription }]
             : []),
           { title: messages.tui.clear, value: "clear", description: messages.tui.clearDescription },

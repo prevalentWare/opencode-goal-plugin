@@ -1,10 +1,10 @@
 import { afterAll, beforeAll, beforeEach, expect, setSystemTime, spyOn, test } from "bun:test"
 import { mkdtempSync, rmSync, unlinkSync } from "node:fs"
-import { rename, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { testRender } from "@opentui/solid"
 import plugin, { formatDuration, formatGoal, goalStateFromSession, liveTimeUsedSeconds, readPersistedGoal } from "../src/tui.ts"
+import { atomicWriteFile } from "../src/atomic-write"
 import { messagesFor } from "../src/i18n"
 
 const previousStatePath = process.env.OPENCODE_GOAL_STATE_PATH
@@ -12,9 +12,8 @@ const isolatedStateDir = mkdtempSync(join(tmpdir(), "goal-tui-v1-"))
 const isolatedStatePath = join(isolatedStateDir, "goals.json")
 
 async function writeGoalState(value: unknown) {
-  const temporary = `${isolatedStatePath}.tmp`
-  await writeFile(temporary, JSON.stringify(value))
-  await rename(temporary, isolatedStatePath)
+  // Keep fixtures on the same atomic replacement and retry path as state writes.
+  await atomicWriteFile(isolatedStatePath, JSON.stringify(value))
 }
 
 beforeAll(() => {
