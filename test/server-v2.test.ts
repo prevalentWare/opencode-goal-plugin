@@ -3302,7 +3302,7 @@ test("V2 a command transport abort preserves the active goal for reconnection", 
   expect((await getGoal("ses_v2"))?.status).toBe("active")
 })
 
-test("V2 /goal returns immediately after prompt admission on Desktop and non-ACP hosts unless wait_for_command is enabled", async () => {
+test("V2 /goal returns after prompt admission on Desktop and hosts without a client marker", async () => {
   for (const clientEnv of ["desktop", undefined] as const) {
     if (clientEnv === undefined) delete process.env.OPENCODE_CLIENT
     else process.env.OPENCODE_CLIENT = clientEnv
@@ -3328,3 +3328,53 @@ test("V2 /goal returns immediately after prompt admission on Desktop and non-ACP
   }
 })
 
+test("V2 Desktop goal continues after its command returns", async () => {
+  process.env.OPENCODE_CLIENT = "desktop"
+  const mock = makeMockContext({ min_continue_interval_seconds: 0 })
+  let waits = 0
+  const context = {
+    ...mock,
+    session: { ...mock.session, wait: async () => { waits++ } },
+  }
+  const cleanup = await setupPlugin(context as never)
+  await createGoalViaV2Tool(mock, "Continue after the Desktop request returns")
+
+  await mock.commands.find((command) => command.name === "goal")!.execute({
+    sessionID: "ses_v2",
+    prompt: { text: "Continue after the Desktop request returns" },
+    delivery: "steer",
+  })
+  expect(mock.promptCalls).toHaveLength(1)
+  expect(waits).toBe(0)
+  expect((await getGoal("ses_v2"))?.status).toBe("active")
+
+  await mock.stream.push({ type: "session.execution.started", created: Date.now(), data: { sessionID: "ses_v2" } })
+  await mock.stream.push({ type: "session.execution.succeeded", created: Date.now(), data: { sessionID: "ses_v2" } })
+  await waitFor(() => mock.promptCalls.length === 2)
+  expect((await getGoal("ses_v2"))?.autoTurns).toBe(1)
+  await cleanup()
+})
+
+test("V2 wait_for_command overrides the client default in both directions", async () => {
+  for (const [client, waitForCommand, expectedWaits] of [
+    ["desktop", true, 1],
+    ["acp", false, 0],
+  ] as const) {
+    process.env.OPENCODE_CLIENT = client
+    const mock = makeMockContext({ auto_continue: false, wait_for_command: waitForCommand })
+    let waits = 0
+    const context = {
+      ...mock,
+      session: { ...mock.session, wait: async () => { waits++ } },
+    }
+    const cleanup = await setupPlugin(context as never)
+    await createGoalViaV2Tool(mock, "Explicit command wait override")
+    await mock.commands.find((command) => command.name === "goal")!.execute({
+      sessionID: "ses_v2",
+      prompt: { text: "Explicit command wait override" },
+      delivery: "steer",
+    })
+    expect(waits).toBe(expectedWaits)
+    await cleanup()
+  }
+})

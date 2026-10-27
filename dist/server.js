@@ -2721,6 +2721,11 @@ function commandNameFromOptions(options) {
     return DEFAULT_COMMAND_NAME;
   return name;
 }
+function shouldHoldCommandExecution(options) {
+  if (typeof options?.wait_for_command === "boolean")
+    return options.wait_for_command;
+  return process.env.OPENCODE_CLIENT === "acp";
+}
 function positiveIntegerOrNull2(value) {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : null;
 }
@@ -5342,7 +5347,7 @@ async function setupV2(context) {
                 delivery: input.delivery
               });
               admitted = true;
-              if (pursue && typeof context.session.wait === "function") {
+              if (pursue && shouldHoldCommandExecution(options) && typeof context.session.wait === "function") {
                 let pursuedGoalID;
                 do {
                   await context.session.wait({ sessionID: input.sessionID }, { signal });
