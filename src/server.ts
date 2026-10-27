@@ -47,6 +47,7 @@ import {
 } from "./state"
 import type { GoalLocale, GoalMessages } from "./i18n"
 import { formatGoalHistoryPresentation, messagesFor, resolveLocale } from "./i18n"
+import { reportPluginError } from "./diagnostics"
 import { compactionContext, compactionContextPrefix, continuationPrompt, limitPrompt, systemReminder } from "./prompts"
 
 type Options = {
@@ -2441,6 +2442,10 @@ function v2ErrorLog(message: string, error: unknown) {
   } catch {
     // Logging must never break plugin control flow.
   }
+  // The V2 plugin API has no logger and plugin console output does not reach
+  // the OpenCode log, so the failure is also written to the plugin's own
+  // diagnostics log where a monitor can see it.
+  reportPluginError(message, error)
 }
 
 async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugin.Cleanup> {

@@ -1,6 +1,6 @@
 // @bun
 // src/server.ts
-import { z as z2 } from "zod";
+import { z as z3 } from "zod";
 
 // src/goal-plan.ts
 import { z } from "zod";
@@ -293,7 +293,7 @@ function goalPlanEntries(plan) {
 // src/state.ts
 import { randomUUID as randomUUID2 } from "crypto";
 import { mkdir, readFile } from "fs/promises";
-import { dirname as dirname2 } from "path";
+import { dirname as dirname3 } from "path";
 import { Data, Effect, Schema } from "effect-goal-state";
 
 // src/atomic-write.ts
@@ -408,6 +408,12 @@ async function atomicWriteFile(file, data, ops = defaultAtomicWriteOps) {
   }
 }
 
+// src/diagnostics.ts
+import { closeSync, constants, fchmodSync, fstatSync, mkdirSync, openSync, renameSync, writeFileSync } from "fs";
+import { dirname as dirname2, join as join2 } from "path";
+import { Cause, Runtime } from "effect-goal-state";
+import { z as z2 } from "zod";
+
 // src/state-path.ts
 import { homedir } from "os";
 import { join } from "path";
@@ -416,6 +422,83 @@ function statePath() {
     return process.env.OPENCODE_GOAL_STATE_PATH;
   const dataHome = process.env.XDG_DATA_HOME || (process.platform === "win32" && process.env.APPDATA ? process.env.APPDATA : join(homedir(), ".local", "share"));
   return join(dataHome, "opencode-goal-plugin", "goals.json");
+}
+
+// src/diagnostics.ts
+var MAX_LOG_BYTES = 1024 * 1024;
+var MAX_ENTRY_CHARS = 16000;
+var ErrorDetails = z2.object({
+  _tag: z2.unknown().optional(),
+  name: z2.unknown().optional(),
+  message: z2.unknown().optional(),
+  cause: z2.unknown().optional()
+});
+function diagnosticsLogPath() {
+  return join2(dirname2(statePath()), "goal-plugin.log");
+}
+function clipped(text2) {
+  return text2.length > MAX_ENTRY_CHARS ? `${text2.slice(0, MAX_ENTRY_CHARS)}...` : text2;
+}
+function withPrivateLog(path, create, run) {
+  const flags = constants.O_WRONLY | constants.O_APPEND | constants.O_NOFOLLOW | constants.O_NONBLOCK | (create ? constants.O_CREAT : 0);
+  const fd = openSync(path, flags, 384);
+  try {
+    if (!fstatSync(fd).isFile())
+      throw new Error("diagnostic log destination is not a regular file");
+    fchmodSync(fd, 384);
+    return run(fd);
+  } finally {
+    closeSync(fd);
+  }
+}
+function secureArchive(path) {
+  try {
+    withPrivateLog(path, false, () => {});
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT")
+      return;
+    throw error;
+  }
+}
+function appendWithinBudget(path, line) {
+  return withPrivateLog(path, true, (fd) => {
+    if (fstatSync(fd).size + Buffer.byteLength(line) > MAX_LOG_BYTES)
+      return false;
+    writeFileSync(fd, line);
+    return true;
+  });
+}
+function describeError(error, depth = 0) {
+  try {
+    if (error == null || typeof error !== "object")
+      return clipped(String(error));
+    if (depth > 6)
+      return "...";
+    const record = ErrorDetails.parse(error);
+    const tag = typeof record._tag === "string" ? record._tag : typeof record.name === "string" ? record.name : "Error";
+    const message = typeof record.message === "string" ? clipped(record.message) : "";
+    const head = message && message !== tag ? `${tag}: ${message}` : tag;
+    if (Runtime.isFiberFailure(error)) {
+      return clipped(`${head} <- ${Cause.pretty(error[Runtime.FiberFailureCauseId])}`);
+    }
+    return record.cause == null ? clipped(head) : clipped(`${head} <- ${describeError(record.cause, depth + 1)}`);
+  } catch {
+    return "[unreadable error]";
+  }
+}
+function reportPluginError(message, error) {
+  try {
+    const path = diagnosticsLogPath();
+    mkdirSync(dirname2(path), { recursive: true, mode: 448 });
+    const detail = error === undefined ? "" : ` | ${describeError(error)}`;
+    const line = clipped(`${new Date().toISOString()} | error | ${message}${detail}`).replace(/\p{Cc}/gu, " ") + `
+`;
+    secureArchive(`${path}.1`);
+    if (!appendWithinBudget(path, line)) {
+      renameSync(path, `${path}.1`);
+      appendWithinBudget(path, line);
+    }
+  } catch {}
 }
 
 // src/state.ts
@@ -597,6 +680,7 @@ function notifyStateRecovery(notice) {
       try {
         console.error(`[opencode-goal-plugin] Failed to report quarantined state at ${notice.quarantineFile}:`, error instanceof Error ? error.message : String(error));
       } catch {}
+      reportPluginError(`Failed to report quarantined state at ${notice.quarantineFile}`, error);
     });
   }
 }
@@ -638,7 +722,7 @@ function quarantineStateEffect(file, content) {
   return Effect.promise(async () => {
     const quarantineFile = `${file}.corrupt-${Date.now()}-${randomUUID2()}`;
     try {
-      await mkdir(dirname2(file), { recursive: true, mode: 448 });
+      await mkdir(dirname3(file), { recursive: true, mode: 448 });
       await atomicWriteFile(quarantineFile, content);
       return { quarantineFile, error: null };
     } catch (error) {
@@ -655,6 +739,7 @@ function verifyRecoverySourceEffect(file, expectedContent, quarantineFile) {
         try {
           console.error(`[opencode-goal-plugin] Could not re-read ${file} after preserving it at ${quarantineFile}; continuing recovery:`, error instanceof Error ? error.message : String(error));
         } catch {}
+        reportPluginError(`Could not re-read ${file} after preserving it at ${quarantineFile}`, error);
       }
       return true;
     }
@@ -663,7 +748,7 @@ function verifyRecoverySourceEffect(file, expectedContent, quarantineFile) {
 function writeStateEffect(state, file = statePath()) {
   return Effect.tryPromise({
     try: async () => {
-      await mkdir(dirname2(file), { recursive: true, mode: 448 });
+      await mkdir(dirname3(file), { recursive: true, mode: 448 });
       await atomicWriteFile(file, JSON.stringify(state, null, 2) + `
 `);
     },
@@ -704,6 +789,7 @@ async function mutate(fn, shouldWrite = () => true) {
           try {
             console.error(`[opencode-goal-plugin] Could not quarantine corrupt state at ${file}; continuing recovery:`, quarantine.error);
           } catch {}
+          reportPluginError(`Could not quarantine corrupt state at ${file}`, quarantine.error);
           notifyStateRecovery(notice);
         } else {
           const unchanged = yield* verifyRecoverySourceEffect(file, recoveryContent, quarantine.quarantineFile);
@@ -3369,8 +3455,8 @@ function mergeSystemReminder(output, reminder) {
 ${reminder}`;
 }
 var planToolArgs = {
-  goal_id: z2.string().min(1).describe("Goal ID from get_goal; required for optimistic concurrency."),
-  expected_revision: z2.number().int().nonnegative().describe("Current planRevision from get_goal."),
+  goal_id: z3.string().min(1).describe("Goal ID from get_goal; required for optimistic concurrency."),
+  expected_revision: z3.number().int().nonnegative().describe("Current planRevision from get_goal."),
   plan: GoalPlanDraftSchema.optional().describe([
     "Full plan for creation or wholesale revision. Use plan_ops for routine changes.",
     "Completion criteria are immutable; blocked phases need a blocker, completed tasks need evidence,",
@@ -3380,16 +3466,16 @@ var planToolArgs = {
     "Atomic edits to an existing plan. Supply either plan or plan_ops, never both.",
     "Set status and its required blocker/evidence/verification together."
   ].join(" ")),
-  reason: z2.string().trim().min(1).max(2000).describe("Why this revision is needed."),
-  revisit_evidence: z2.string().trim().min(1).max(2000).optional().describe("Concrete evidence required to remove or change planned scope or reopen verified work;" + " never use it to bless an accidental edit."),
-  response_mode: z2.enum(["summary", "full"]).optional().describe("Summary omits the full plan and history. Full preserves the previous tool response.")
+  reason: z3.string().trim().min(1).max(2000).describe("Why this revision is needed."),
+  revisit_evidence: z3.string().trim().min(1).max(2000).optional().describe("Concrete evidence required to remove or change planned scope or reopen verified work;" + " never use it to bless an accidental edit."),
+  response_mode: z3.enum(["summary", "full"]).optional().describe("Summary omits the full plan and history. Full preserves the previous tool response.")
 };
-var PlanToolSchema = z2.object(planToolArgs).strict();
-var planToolInputSchema = z2.toJSONSchema(PlanToolSchema, {
+var PlanToolSchema = z3.object(planToolArgs).strict();
+var planToolInputSchema = z3.toJSONSchema(PlanToolSchema, {
   io: "input",
   unrepresentable: "any"
 });
-var goalViewSchema = z2.enum(["summary", "full"]).optional().describe("Use summary for status/revision checks; full includes the complete plan and history.");
+var goalViewSchema = z3.enum(["summary", "full"]).optional().describe("Use summary for status/revision checks; full includes the complete plan and history.");
 function planToolDescription(locale) {
   return locale === "zh-CN" ? [
     "\u4FDD\u5B58\u76EE\u6807\u8BA1\u5212\u3002\u521D\u6B21\u521B\u5EFA\u7528\u5B8C\u6574 plan\uFF1B\u65E5\u5E38\u72B6\u6001\u66F4\u65B0\u7528 plan_ops\uFF0C",
@@ -3488,7 +3574,7 @@ function getGoalToolResult(goal, messages = messagesFor("en"), view = "full") {
   return JSON.stringify(result, null, 2);
 }
 function boundedGoalTextSchema(limit, description, validate) {
-  return z2.string().superRefine((value, ctx) => {
+  return z3.string().superRefine((value, ctx) => {
     try {
       validate(value);
     } catch (error) {
@@ -4147,9 +4233,9 @@ var server = async ({ client }, options) => {
         description: messages.tools.createGoal,
         args: {
           objective: boundedGoalTextSchema(objectiveChars, messages.tools.objective, (value) => validateObjective(value, objectiveChars)),
-          token_budget: z2.number().int().positive().nullable().optional().describe(messages.tools.tokenBudget),
-          max_auto_turns: z2.number().int().positive().nullable().optional().describe(messages.tools.maxAutoTurns),
-          max_duration_seconds: z2.number().int().positive().nullable().optional().describe(messages.tools.maxDurationSeconds)
+          token_budget: z3.number().int().positive().nullable().optional().describe(messages.tools.tokenBudget),
+          max_auto_turns: z3.number().int().positive().nullable().optional().describe(messages.tools.maxAutoTurns),
+          max_duration_seconds: z3.number().int().positive().nullable().optional().describe(messages.tools.maxDurationSeconds)
         },
         async execute(args, context) {
           return createGoalFromTool(args, context, goalServices);
@@ -4159,9 +4245,9 @@ var server = async ({ client }, options) => {
         description: messages.tools.setGoal,
         args: {
           objective: boundedGoalTextSchema(objectiveChars, messages.tools.modelObjective, (value) => validateObjective(value, objectiveChars)),
-          token_budget: z2.number().int().positive().nullable().optional().describe(messages.tools.tokenBudget),
-          max_auto_turns: z2.number().int().positive().nullable().optional().describe(messages.tools.maxAutoTurns),
-          max_duration_seconds: z2.number().int().positive().nullable().optional().describe(messages.tools.maxDurationSeconds)
+          token_budget: z3.number().int().positive().nullable().optional().describe(messages.tools.tokenBudget),
+          max_auto_turns: z3.number().int().positive().nullable().optional().describe(messages.tools.maxAutoTurns),
+          max_duration_seconds: z3.number().int().positive().nullable().optional().describe(messages.tools.maxDurationSeconds)
         },
         async execute(args, context) {
           return createGoalFromTool(args, context, goalServices);
@@ -4171,7 +4257,7 @@ var server = async ({ client }, options) => {
         description: messages.tools.updateGoalObjective,
         args: {
           objective: boundedGoalTextSchema(objectiveChars, messages.tools.updatedObjective, (value) => validateObjective(value, objectiveChars)),
-          status: z2.enum(["active", "paused"]).optional().describe(messages.tools.editStatus)
+          status: z3.enum(["active", "paused"]).optional().describe(messages.tools.editStatus)
         },
         async execute(args, context) {
           return updateGoalObjectiveFromTool(args, context, goalServices);
@@ -4185,7 +4271,7 @@ var server = async ({ client }, options) => {
       update_goal: {
         description: messages.tools.updateGoal,
         args: {
-          status: z2.enum(["complete", "unmet"]).describe(messages.tools.closeStatus),
+          status: z3.enum(["complete", "unmet"]).describe(messages.tools.closeStatus),
           evidence: boundedGoalTextSchema(objectiveChars, messages.tools.evidence, (value) => validateEvidence(value, "completion evidence", objectiveChars)).optional(),
           blocker: boundedGoalTextSchema(objectiveChars, messages.tools.blocker, (value) => validateEvidence(value, "blocker", objectiveChars)).optional()
         },
@@ -4196,9 +4282,9 @@ var server = async ({ client }, options) => {
       update_goal_status: {
         description: messages.tools.updateGoalStatus,
         args: {
-          status: z2.enum(["active", "paused"]).describe(messages.tools.activePausedStatus),
-          reason: z2.enum(["awaiting_user"]).optional().describe("Use only when pausing for a direct answer, login, or other required user action."),
-          blocker: z2.string().optional().describe("The concrete user answer or action still needed when reason is awaiting_user.")
+          status: z3.enum(["active", "paused"]).describe(messages.tools.activePausedStatus),
+          reason: z3.enum(["awaiting_user"]).optional().describe("Use only when pausing for a direct answer, login, or other required user action."),
+          blocker: z3.string().optional().describe("The concrete user answer or action still needed when reason is awaiting_user.")
         },
         async execute(args, context) {
           return updateGoalStatusFromTool(args, context, goalServices);
@@ -4215,9 +4301,9 @@ var server = async ({ client }, options) => {
         description: messages.tools.replaceGoal,
         args: {
           objective: boundedGoalTextSchema(objectiveChars, messages.tools.objective, (value) => validateObjective(value, objectiveChars)),
-          token_budget: z2.number().int().positive().nullable().optional().describe(messages.tools.tokenBudget),
-          max_auto_turns: z2.number().int().positive().nullable().optional().describe(messages.tools.maxAutoTurns),
-          max_duration_seconds: z2.number().int().positive().nullable().optional().describe(messages.tools.maxDurationSeconds)
+          token_budget: z3.number().int().positive().nullable().optional().describe(messages.tools.tokenBudget),
+          max_auto_turns: z3.number().int().positive().nullable().optional().describe(messages.tools.maxAutoTurns),
+          max_duration_seconds: z3.number().int().positive().nullable().optional().describe(messages.tools.maxDurationSeconds)
         },
         async execute(args, context) {
           return replaceGoalFromTool(args, context, goalServices);
@@ -4463,6 +4549,7 @@ function v2ErrorLog(message, error) {
   try {
     console.error(`[opencode-goal-plugin] ${message}:`, error instanceof Error ? error.message : String(error));
   } catch {}
+  reportPluginError(message, error);
 }
 async function setupV2(context) {
   const options = context.options ?? {};
