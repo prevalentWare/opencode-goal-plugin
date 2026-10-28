@@ -96,7 +96,7 @@
     "eslint": "^10.3.0",
     "semver": "^7.8.5",
     "solid-js": "1.9.17",
-    "typescript": "^6.0.3",
+    "typescript": "^7.0.2",
     "typescript-eslint": "^8.59.2"
   },
   "engines": {
