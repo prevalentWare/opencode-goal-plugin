@@ -4,6 +4,22 @@
 [![GitHub repository](https://img.shields.io/badge/GitHub-prevalentWare%2Fopencode--goal--plugin-blue?logo=github)](https://github.com/prevalentWare/opencode-goal-plugin)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
+> [!IMPORTANT]
+> **OpenCode 2.2.1+ includes native `/goal` support.**
+> For most users on these versions, we recommend the built-in command,
+> which automatically reviews progress and continues until the objective
+> is met. No additional plugin is required.
+>
+> This plugin remains useful for OpenCode 1 and workflows that need its
+> configurable token and duration budgets, goal history, checkpoints,
+> or persistent plans with phases and tasks.
+>
+> Before switching, finish or pause existing plugin goals, then remove
+> this plugin from your server and TUI configuration to avoid overlapping
+> `/goal` commands and continuation behavior.
+>
+> See the [official release notes](https://github.com/anomalyco/opencode/releases/tag/v2.2.1).
+
 OpenCode Goal Plugin adds Codex-style long-running goal mode to OpenCode. It gives AI coding agents a `/goal` slash command, persistent goal state, completion evidence, idle continuation, and a terminal UI goal indicator so an OpenCode session can keep working toward one explicit objective until it is complete, blocked, or cleared.
 
 If you are searching for an OpenCode goal plugin, goal mode for OpenCode, or a way to keep an OpenCode AI coding agent focused on a long-running task, this package is the npm plugin for that workflow.

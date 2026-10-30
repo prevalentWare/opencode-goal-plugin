@@ -447,8 +447,8 @@ var ErrorDetails = z2.object({
   message: z2.unknown().optional(),
   cause: z2.unknown().optional()
 });
-function diagnosticsLogPath() {
-  return join2(dirname2(statePath()), "goal-plugin.log");
+function diagnosticsLogPath(stateFile) {
+  return join2(dirname2(stateFile ?? statePath()), "goal-plugin.log");
 }
 function clipped(text2) {
   return text2.length > MAX_ENTRY_CHARS ? `${text2.slice(0, MAX_ENTRY_CHARS)}...` : text2;
@@ -500,9 +500,9 @@ function describeError(error, depth = 0) {
     return "[unreadable error]";
   }
 }
-function reportPluginError(message, error) {
+function reportPluginError(message, error, stateFile) {
   try {
-    const path = diagnosticsLogPath();
+    const path = diagnosticsLogPath(stateFile);
     mkdirSync(dirname2(path), { recursive: true, mode: 448 });
     const detail = error === undefined ? "" : ` | ${describeError(error)}`;
     const line = clipped(`${new Date().toISOString()} | error | ${message}${detail}`).replace(/\p{Cc}/gu, " ") + `
@@ -815,7 +815,7 @@ function notifyStateRecovery(notice) {
       try {
         console.error(`[opencode-goal-plugin] Failed to report quarantined state at ${notice.quarantineFile}:`, error instanceof Error ? error.message : String(error));
       } catch {}
-      reportPluginError(`Failed to report quarantined state at ${notice.quarantineFile}`, error);
+      reportPluginError(`Failed to report quarantined state at ${notice.quarantineFile}`, error, notice.stateFile);
     });
   }
 }
@@ -923,7 +923,7 @@ async function mutate(fn, shouldWrite = () => true) {
           try {
             console.error(`[opencode-goal-plugin] Could not quarantine corrupt state at ${file}; continuing recovery:`, quarantine.error);
           } catch {}
-          reportPluginError(`Could not quarantine corrupt state at ${file}`, quarantine.error);
+          reportPluginError(`Could not quarantine corrupt state at ${file}`, quarantine.error, file);
           notifyStateRecovery(notice);
         } else {
           const unchanged = yield* verifyRecoverySourceEffect(file, recoveryContent);

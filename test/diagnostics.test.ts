@@ -1,9 +1,10 @@
 import { expect, test } from "bun:test"
-import { chmod, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises"
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { Cause, Effect } from "effect-goal-state"
 import { describeError, diagnosticsLogPath, reportPluginError } from "../src/diagnostics"
+import { createGoal, onStateRecovery } from "../src/state"
 
 let dir = ""
 
@@ -27,6 +28,60 @@ test("a reported plugin error is written next to the goal state file", async () 
     expect(contents).toContain("Turn watchdog retry failed")
     expect(contents).toContain("provider unreachable")
     expect(contents).toContain("| error |")
+  })
+})
+
+test("an explicit state file selects its log instead of the ambient state", async () => {
+  await withStatePath(async () => {
+    const file = join(dir, "explicit", "goals.json")
+    reportPluginError("explicit owner", new Error("owner failure"), file)
+
+    expect(diagnosticsLogPath(file)).toBe(join(dir, "explicit", "goal-plugin.log"))
+    expect(await Bun.file(join(dir, "explicit", "goal-plugin.log")).exists()).toBe(true)
+    expect(await readFile(join(dir, "explicit", "goal-plugin.log"), "utf8")).toContain("owner failure")
+    expect(await Bun.file(join(dir, "goal-plugin.log")).exists()).toBe(false)
+  })
+})
+
+test("state files in the same directory share the diagnostic log", async () => {
+  await withStatePath(async () => {
+    const first = join(dir, "shared", "first.json")
+    const second = join(dir, "shared", "second.json")
+    reportPluginError("first owner", undefined, first)
+    reportPluginError("second owner", undefined, second)
+
+    const contents = await readFile(join(dir, "shared", "goal-plugin.log"), "utf8")
+    expect(contents).toContain("first owner")
+    expect(contents).toContain("second owner")
+    expect(await Bun.file(join(dir, "goal-plugin.log")).exists()).toBe(false)
+  })
+})
+
+test("a rejected recovery listener logs beside its captured state after the environment changes", async () => {
+  await withStatePath(async () => {
+    const file = join(dir, "goals.json")
+    const otherFile = join(dir, "other", "goals.json")
+    await mkdir(join(dir, "other"))
+    await writeFile(file, "\0".repeat(32))
+    const stop = onStateRecovery(file, async () => {
+      await Promise.resolve()
+      process.env.OPENCODE_GOAL_STATE_PATH = otherFile
+      throw new Error("recovery listener failure")
+    })
+    try {
+      await createGoal("diagnostics-recovery", "Recover the isolated state", null)
+      await new Promise<void>((resolve) => setImmediate(resolve))
+
+      expect(await Bun.file(join(dir, "goal-plugin.log")).exists()).toBe(true)
+      const contents = await readFile(join(dir, "goal-plugin.log"), "utf8")
+      expect(contents).toContain("Failed to report quarantined state")
+      expect(contents).toContain("recovery listener failure")
+      expect(await Bun.file(join(dir, "other", "goal-plugin.log")).exists()).toBe(false)
+      expect(JSON.parse(await readFile(file, "utf8")).goals["diagnostics-recovery"].objective)
+        .toBe("Recover the isolated state")
+    } finally {
+      stop()
+    }
   })
 })
 

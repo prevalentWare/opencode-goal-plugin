@@ -15,8 +15,8 @@ const ErrorDetails = z.object({
   cause: z.unknown().optional(),
 })
 
-export function diagnosticsLogPath() {
-  return join(dirname(statePath()), "goal-plugin.log")
+export function diagnosticsLogPath(stateFile?: string) {
+  return join(dirname(stateFile ?? statePath()), "goal-plugin.log")
 }
 
 function clipped(text: string) {
@@ -72,9 +72,9 @@ export function describeError(error: unknown, depth = 0): string {
 }
 
 /** Best-effort diagnostics; failures must not change plugin control flow. */
-export function reportPluginError(message: string, error?: unknown) {
+export function reportPluginError(message: string, error?: unknown, stateFile?: string) {
   try {
-    const path = diagnosticsLogPath()
+    const path = diagnosticsLogPath(stateFile)
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 })
     const detail = error === undefined ? "" : ` | ${describeError(error)}`
     // Bound the entire record, including caller-supplied messages. Escaping
